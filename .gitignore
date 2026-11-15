@@ -11,3 +11,5 @@ qwen-raw.log
 # agent scratch
 .opencode/
 *_patch*.py
+*.bak*
+*.mhtml
