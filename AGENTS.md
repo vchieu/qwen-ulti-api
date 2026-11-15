@@ -48,6 +48,18 @@ Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` →
   heuristic DOM thấy tin nhắn), extension `/requeue` job rồi reload `/?temporary-chat=true`
   trước khi gửi để tránh lẫn context. `false` → chỉ `warn` khi trang thật sự có tin nhắn.
   Chế độ thường (`temporary_chat=false`) không bị ảnh hưởng, vẫn bấm New Chat.
+- `captcha_wait_seconds` (default `300`, `0` = tắt): khi tab đang hiện captcha, extension CHỜ
+  người dùng giải (không reload, tạm dừng timeout gửi) tối đa số giây này rồi chạy tiếp.
+  Qua `/status.captcha_wait`.
+- `bridge_select_mode` (default `true`, `qwen_fix_patch7`): chọn chế độ Thinking/Auto/Fast ở dropdown
+  cạnh ô prompt theo `reasoning_effort` (none/minimal/low → Fast, medium → Auto, high/xhigh/max →
+  Thinking; không gửi → không chạm UI; `model@think=1/0` → Thinking/Fast khi không có effort).
+- `bridge_force_request_model` (default `false`, thử nghiệm): extension ghi đè `model`/`models` trong
+  body completion bằng model của job (chỉ id hợp lệ) — không phụ thuộc dropdown/tab đang ẩn.
+- `prompt_max_bytes` (default `0` = không cắt; trước đây 262144). `file_prompt_max_chars` (tùy chọn,
+  không đặt = `130000`): trần ký tự file prompt; file > 131072 ký tự bỏ qua paste-file, upload qua `input[type=file]`.
+- Log `completion request:` có `model=` (model thật Qwen nhận), `want=`, `vis=`, `feature_config=`;
+  model request ≠ model job → warn `MODEL KHAC YEU CAU`. Nhãn dropdown chỉ là hiển thị.
 - `bridge_select_model` (default `true`): `false` → extension không đụng model
   picker; request vẫn chạy với model UI đang chọn.
 - `attachment_prompt`: text gửi kèm khi prompt dài được paste/attach thành document
@@ -170,6 +182,28 @@ Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` →
     `reloadFreshTemporary` kiểm tra `/requeue` trả `{ok:true}` (hàm `post()` không check HTTP
     status) — sai thì warn và chạy tiếp không reload, tránh mất job. Log `completion request`
     thêm `file0={...}` (tên/kích thước file đính kèm thật) để đối chiếu với file bridge đã gửi.
+
+12. **Picker model `.wms-*` + captcha (`qwen_fix_patch6`)**: picker có popup chính (3 model) và mục
+    "Expand more models" mở popup phụ `.wms-popup--secondary` (Qwen3.8-Omni-Flash, Qwen3.7-Max,
+    Qwen3.5-Omni-Plus). `pickWmsModel` khớp tên chính xác ở `.wms-list__name-text`, không thấy thì
+    hover+click `.wms-more-entry` rồi quét lại; chọn lỗi thì `closeModelPopup` (popup mở sót có thể
+    chặn Send) và log danh sách model đang thấy. `waitCaptchaClear` (`captchaSignal`: selector
+    captcha/baxia/turnstile/…, URL `_____tmd_____`, text trong dialog) chờ người dùng giải ở 3
+    chỗ: trước new-chat/reload, sau `waitPageReady`, lúc Send không bấm được. Selector captcha là
+    ĐOÁN — cần DOM thật để chỉnh. `pageDiag` thêm trạng thái UI vào warn Send/timeout.
+
+## Việc dự kiến (chưa làm)
+
+- **Chế độ UI (đã làm, `qwen_fix_patch7`)**: none/low → Fast, medium → Auto, high → Thinking. Nút mở
+  dropdown được tìm theo text Auto/Thinking/Fast (chưa có DOM thật của nút) — nếu log báo
+  `khong tim thay nut che do ... ung vien: ...` thì lấy DOM nút để chỉnh `findModeTrigger`.
+- **Thinking qua body request**: log `feature_config=` cho thấy key thật; có thể ép chế độ bằng body
+  thay vì bấm UI (giống `bridge_force_request_model`).
+- **Test JS cho extension**: thêm 1 file test riêng (Node, không dependency) cho hàm thuần như
+  `pageDirty`, chọn model, `captchaSignal`. Sẽ đổi quy ước "một file test" ở mục Quy ước test;
+  ưu tiên thấp, làm sau.
+- **Xác minh id model** của mục Expand more models với `/api/v2/models` (hiện id suy ra từ nhãn UI).
+- **Captcha**: lấy DOM thật khi nó xuất hiện để thay các selector đoán.
 
 ## Kiểm tra UI thủ công
 

@@ -82,6 +82,20 @@ def _remember_models(items):
             _models = clean
 
 
+def _captcha_wait():
+    """Giay cho giai captcha (config captcha_wait_seconds; sai/am -> mac dinh/0)."""
+    try:
+        return max(0, int(float(CONFIG.get("captcha_wait_seconds", 300))))
+    except (TypeError, ValueError):
+        return 300
+
+
+def _model_ids():
+    """Id upstream hop le (models.py) -> extension dung de ghi de model request."""
+    from .models import MODELS
+    return sorted({str(c.get("upstream", n)) for n, c in MODELS.items()})
+
+
 def status():
     with _lock:
         n = len(_jobs)
@@ -89,7 +103,11 @@ def status():
     return {"worker": worker_alive(), "pending": _pending.qsize(), "jobs": n,
             "temporary_chat": temporary_chat_enabled(),
             "select_model": bool(CONFIG.get("bridge_select_model", True)),
+            "select_mode": bool(CONFIG.get("bridge_select_mode", True)),
+            "force_model": bool(CONFIG.get("bridge_force_request_model", False)),
+            "model_ids": _model_ids(),
             "temporary_reload": bool(CONFIG.get("temporary_chat_reload", True)),
+            "captcha_wait": _captcha_wait(),
             "attachment_prompt": str(CONFIG.get("attachment_prompt", "Please read the text and action")),
             "debug": qwen.is_debug(),
             "models": n_models,
@@ -124,7 +142,7 @@ class _Tracker:
         return delta
 
 
-def generate_stream(prompt, model, think, usage_out=None, file_info=None):
+def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=None):
     """Yield (kind, text) -- interface server.py goi cho luong SSE.
 
     file_info (dict, optional): thông tin file tạm chứa prompt quá dài,
@@ -154,6 +172,7 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None):
         _debug_log(f"queueing job {jid} (model={model}, prompt_len={len(prompt or '')}, file={bool(file_info)})")
         _pending.put({"job_id": jid, "model": model, "prompt": prompt,
                       "think": bool(think), "ts": time.time(),
+                      "mode": mode if mode in ("auto", "thinking", "fast") else None,
                       "file_info": file_info,
                       "attachment_prompt": att_prompt,
                       "managed": True})
@@ -242,10 +261,12 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None):
     raise last_err
 
 
-def generate(prompt, model, think, file_info=None):
+def generate(prompt, model, think, file_info=None, mode=None):
     t0 = time.monotonic()
     usage, content, reasoning = {}, [], []
-    for kind, text in generate_stream(prompt, model, think, usage, file_info=file_info):
+    extra = {"mode": mode} if mode else {}
+    for kind, text in generate_stream(prompt, model, think, usage, file_info=file_info,
+                                      **extra):
         (reasoning if kind == "reasoning" else content).append(text)
     out = {"content": "".join(content), "reasoning": "".join(reasoning),
            "usage": usage}
@@ -325,7 +346,9 @@ class _Handler(BaseHTTPRequestHandler):
                 n_jobs = len(_jobs)
                 n_models = len(_models)
             safe_keys = ("debug", "log_requests", "temporary_chat", "temporary-chat",
-                         "bridge_select_model", "temporary_chat_reload", "default_model",
+                         "bridge_select_model", "temporary_chat_reload", "captcha_wait_seconds", "default_model",
+                         "bridge_select_mode", "bridge_force_request_model", "prompt_max_bytes",
+                         "file_prompt_max_chars",
                          "retry_attempts",
                          "bridge_job_timeout", "bridge_poll_wait", "bridge_worker_ttl",
                          "attachment_prompt", "log_file", "bridge_port", "port")

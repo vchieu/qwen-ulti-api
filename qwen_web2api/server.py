@@ -13,7 +13,7 @@ from socketserver import ThreadingMixIn
 
 from . import __version__
 from .config import CONFIG
-from .models import MODELS, resolve_model
+from .models import MODELS, resolve_model, ui_mode_for_effort
 from .qwen import QwenError, log, debug_log
 from . import bridge
 from .tools import (build_response_format_instruction, is_required_tool_choice,
@@ -28,6 +28,15 @@ SSE_PING_INTERVAL = 5
 # File prompt (paste -> document) phai <= 131072 ky tu, neu khong Qwen KHONG chuyen
 # thanh file dinh kem (log that: history file 147719 chars -> mat lich su).
 FILE_MAX_CHARS = 130000
+
+
+def _file_max_chars():
+    """Tran ky tu cua file prompt (config file_prompt_max_chars; sai/<=0 -> mac dinh)."""
+    try:
+        v = int(float(CONFIG.get("file_prompt_max_chars", FILE_MAX_CHARS)))
+    except (TypeError, ValueError):
+        return FILE_MAX_CHARS
+    return v if v > 0 else FILE_MAX_CHARS
 MAX_PROMPT_CHARS = 130000  # buffer an toàn dưới giới hạn 131072 ký tự của Qwen Web
 _MSG_PREVIEW_CHARS = 200   # Option B: số ký tự preview mỗi message trong log
 
@@ -174,7 +183,7 @@ def _render_fit(messages, tools=None, tool_choice=None, prefix="", limit=None):
 
     Vuot thi cat theo co che cua tools._join_parts (giu dau + tin nhan moi nhat,
     chen [...truncated...]). Gioi han la KY TU nen suy ra tran byte theo ti le."""
-    limit = limit or FILE_MAX_CHARS
+    limit = limit or _file_max_chars()
     budget = max(1000, limit - len(prefix))
     text = messages_to_prompt(messages, tools, tool_choice, max_bytes=1 << 30)
     orig = len(text)
@@ -575,9 +584,21 @@ class QwenHandler(BaseHTTPRequestHandler):
                 think = False
             elif e in ("medium", "high"):
                 think = True
+        # Che do UI Thinking/Auto/Fast: none/low -> fast, medium -> auto, high -> thinking;
+        # khong co reasoning_effort -> None (giu nguyen UI). (qwen_fix_patch7)
+        mode = ui_mode_for_effort(effort)
+        if mode is None and isinstance(raw, str) and "@think=" in raw:
+            mode = "thinking" if think else "fast"
+        self._ui_mode = mode
         echo = raw if isinstance(raw, str) and raw else name
-        log(f"[model] {echo} -> upstream={upstream} thinking={think}")
+        log(f"[model] {echo} -> upstream={upstream} thinking={think} "
+            f"ui_mode={mode or 'default'}")
         return echo, upstream, think
+
+    def _mode_kw(self):
+        """kwargs che do UI cho bridge; rong = khong dung toi UI."""
+        mode = getattr(self, "_ui_mode", None)
+        return {"mode": mode} if mode else {}
 
     # ---------------------------------------------------------- tool turn --
     def _run_turn(self, prompt, upstream, think, tools_active, allowed,
@@ -600,7 +621,8 @@ class QwenHandler(BaseHTTPRequestHandler):
                 reasoning_parts = []
                 usage = {}
                 for kind, delta in bridge.generate_stream(
-                        call_prompt, upstream, think, usage, file_info=file_info):
+                        call_prompt, upstream, think, usage, file_info=file_info,
+                        **self._mode_kw()):
                     if client_gone is not None and client_gone.is_set():
                         break
                     if kind == "reasoning":
@@ -611,7 +633,8 @@ class QwenHandler(BaseHTTPRequestHandler):
                 text = "".join(content_parts)
                 reasoning = "".join(reasoning_parts)
             else:
-                result = bridge.generate(call_prompt, upstream, think, file_info=file_info)
+                result = bridge.generate(call_prompt, upstream, think, file_info=file_info,
+                                         **self._mode_kw())
                 text, reasoning, usage = (result["content"], result["reasoning"],
                                           result["usage"])
             _elapsed = time.time() - _t0
@@ -884,7 +907,8 @@ class QwenHandler(BaseHTTPRequestHandler):
                         None, include_usage)
         full, finish, buf = "", "stop", ""
         hold = max((len(s) for s in stops), default=0)
-        gen = bridge.generate_stream(prompt, upstream, think, file_info=file_info)
+        gen = bridge.generate_stream(prompt, upstream, think, file_info=file_info,
+                                     **self._mode_kw())
         _t_start = time.time()
         full_reasoning = []
         try:

@@ -35,10 +35,161 @@
   let lastModelRefresh = 0;
   let lastModeCheck = 0;
   let selectModelEnabled = true;
+  let selectModeEnabled = true;    // config bridge_select_mode (qua /status)  /* qwen_fix_patch7:flags */
+  let forceRequestModel = false;   // config bridge_force_request_model (qua /status)
+  let uiModelIds = [];             // id model hop le (models.py) de ghi de request
   let attachmentPrompt = ATTACHMENT_COMPANION_PROMPT;
   /* qwen_fix_patch3:temp-reload */
   const FRESH_RELOAD_KEY = "qwenUIBridgeFreshReload";
   const FRESH_RELOAD_WINDOW_MS = 60000;
+  /* qwen_fix_patch6:captcha-model */
+  let captchaWaitMs = 300000;   // config captcha_wait_seconds (qua /status); 0 = tat
+  const CAPTCHA_SELECTORS = [
+    '#baxia-dialog-content', '.baxia-dialog', '[class*="baxia" i]', '#nocaptcha',
+    '.nc-container', '[class*="captcha" i]', '[id*="captcha" i]',
+    'iframe[src*="captcha" i]', 'iframe[src*="baxia" i]', 'iframe[src*="geetest" i]',
+    'iframe[src*="recaptcha" i]', 'iframe[src*="hcaptcha" i]',
+    'iframe[src*="challenges.cloudflare.com"]', '.cf-turnstile', '#px-captcha',
+  ].join(", ");
+  const CAPTCHA_TEXT_RX = /verify (that )?you are (a )?human|are you a robot|slide to verify|drag the slider|unusual traffic|captcha|xác minh|kéo thanh trượt|trượt để/i;
+
+  // Tra ve mo ta ngan neu trang dang hien captcha, "" neu khong. Khong bao gio throw.
+  function captchaSignal() {
+    try {
+      if (/_____tmd_____|\/punish(\/|$)/.test(location.pathname + location.search)) {
+        return "url:" + location.pathname;
+      }
+      for (const el of document.querySelectorAll(CAPTCHA_SELECTORS)) {
+        if (!visible(el)) continue;
+        const r = el.getBoundingClientRect();
+        if (r.width < 40 || r.height < 24) continue;   // iframe/badge an
+        return el.tagName.toLowerCase() + "#" + (el.id || "") + "." + String(el.className || "").slice(0, 50)
+          + " " + String(el.outerHTML || "").replace(/\s+/g, " ").slice(0, 160);
+      }
+      // Chi xet text trong dialog/modal (khong xet ca trang: noi dung chat co the nhac "captcha").
+      for (const el of document.querySelectorAll('[role="dialog"], [class*="modal" i]')) {
+        if (!visible(el)) continue;
+        const t = String(el.innerText || "").replace(/\s+/g, " ").slice(0, 300);
+        if (CAPTCHA_TEXT_RX.test(t)) return "dialog: " + t.slice(0, 100);
+      }
+    } catch (e) { /* best-effort */ }
+    return "";
+  }
+
+  // Cho nguoi dung giai captcha (KHONG reload). Tra ve true neu da biet mat captcha.
+  async function waitCaptchaClear(job, where) {
+    if (!(captchaWaitMs > 0)) return false;
+    const sig = captchaSignal();
+    if (!sig) return false;
+    if (job && job._clearSendTimer) job._clearSendTimer();   // timeout 90s khong duoc giet job luc dang cho
+    if (job) send(job.id, { kind: "warn",
+      message: "phat hien captcha (" + where + "): " + sig + " -> cho ban giai toi da "
+        + Math.round(captchaWaitMs / 1000) + "s, khong reload" });
+    const t0 = Date.now();
+    let clearSince = 0;
+    while (Date.now() - t0 < captchaWaitMs) {
+      await sleep(1000);
+      if (captchaSignal()) { clearSince = 0; continue; }
+      if (!clearSince) clearSince = Date.now();
+      if (Date.now() - clearSince >= 1500) break;   // mat on dinh 1.5s => da giai xong
+    }
+    const solved = !captchaSignal();
+    if (job) send(job.id, { kind: solved ? "debug" : "warn",
+      message: solved ? "captcha da het sau " + Math.round((Date.now() - t0) / 1000) + "s; tiep tuc"
+        : "het thoi gian cho captcha (" + Math.round(captchaWaitMs / 1000) + "s); tiep tuc" });
+    if (job && job._armSendTimer) job._armSendTimer();
+    return solved;
+  }
+
+  // Trang thai UI de chan doan khi Send khong bam duoc / timeout. Khong bao gio throw.
+  function pageDiag(composer) {
+    try {
+      const bits = [];
+      if (composer) {
+        bits.push("composer=" + composerText(composer).trim().length);
+        bits.push("sendBtn=" + !!findSendButton(composer));
+      }
+      bits.push("stopBtn=" + !!findStopButton());
+      const ov = Array.from(document.querySelectorAll(
+        '.wms-popup, [role="listbox"], [role="dialog"], [class*="modal" i]')).filter(visible);
+      bits.push("overlays=[" + ov.slice(0, 4).map((e) =>
+        String(e.className || e.getAttribute("role") || e.tagName).slice(0, 40) + ":"
+        + String(e.innerText || "").replace(/\s+/g, " ").slice(0, 50)).join(" ; ") + "]");
+      const ifr = Array.from(document.querySelectorAll("iframe")).filter(visible)
+        .map((f) => String(f.src || "").slice(0, 60));
+      if (ifr.length) bits.push("iframes=[" + ifr.slice(0, 3).join(", ") + "]");
+      const cs = captchaSignal();
+      if (cs) bits.push("captcha=" + cs.slice(0, 80));
+      if (composer) {
+        const scope = composer.closest("form") || document;
+        const btns = Array.from(scope.querySelectorAll('button, [role="button"]'))
+          .filter((b) => visible(b) && b.querySelector("svg")).slice(-3)
+          .map((b) => (b.disabled ? "disabled" : "enabled")
+            + (b.getAttribute("aria-disabled") === "true" ? "/aria-disabled" : "")
+            + ":" + String(b.className || "").slice(0, 30));
+        bits.push("btns=[" + btns.join(", ") + "]");
+      }
+      return bits.join(" ");
+    } catch (e) {
+      return "diag-error:" + ((e && e.message) || e);
+    }
+  }
+
+  function hoverEl(el) {
+    for (const t of ["pointerover", "mouseover", "pointerenter", "mouseenter", "mousemove"]) {
+      el.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
+    }
+  }
+
+  function visibleModelNames() {
+    return Array.from(document.querySelectorAll(".wms-list__name-text"))
+      .filter(visible).map((e) => String(e.textContent || "").trim());
+  }
+
+  // Picker moi cua Qwen (`.wms-*`): popup chinh + muc "Expand more models" (popup phu).
+  async function pickWmsModel(targets) {
+    const norms = (targets || []).map(normLabel).filter(Boolean);
+    const scan = () => {
+      for (const it of document.querySelectorAll(".wms-list__item")) {
+        if (!visible(it)) continue;
+        const nm = it.querySelector(".wms-list__name-text");
+        const n = normLabel(nm ? nm.textContent : "");
+        if (n && norms.includes(n)) return it;
+      }
+      return null;
+    };
+    let hit = scan();
+    if (!hit) {
+      const more = Array.from(document.querySelectorAll(".wms-more-entry")).find(visible);
+      if (!more) return false;
+      const host = more.closest(".ant-dropdown-trigger") || more;
+      hoverEl(host);
+      await sleep(500);
+      hit = scan();
+      if (!hit) {
+        more.click();
+        await sleep(600);
+        hit = scan();
+      }
+    }
+    if (!hit) return false;
+    hit.click();
+    return true;
+  }
+
+  async function closeModelPopup(trigger) {
+    const isOpen = () => Array.from(document.querySelectorAll(".wms-popup")).some(visible);
+    if (!isOpen()) return;
+    pressEscape();
+    document.dispatchEvent(new KeyboardEvent("keydown",
+      { key: "Escape", code: "Escape", keyCode: 27, which: 27, bubbles: true }));
+    await sleep(300);
+    if (isOpen() && trigger) {
+      trigger.click();
+      await sleep(300);
+    }
+    if (isOpen()) debugLog("popup model van mo sau khi dong");
+  }
   /* qwen_fix_patch4:inline-guard */
   const INLINE_LIMIT_KEY = "qwenUIBridgeInlineLimit";
   const INLINE_LIMIT_CAP = 32000;   // 32775 ky tu tung chay inline OK -> nguong an toan ban dau sau loi
@@ -279,6 +430,11 @@
   async function readStatus() {
     const st = await getJSON("/status");
     if (st && typeof st.select_model === "boolean") selectModelEnabled = st.select_model;
+    if (st && typeof st.select_mode === "boolean") selectModeEnabled = st.select_mode;
+    if (st && typeof st.force_model === "boolean") forceRequestModel = st.force_model;
+    if (st && Array.isArray(st.model_ids)) {
+      uiModelIds = st.model_ids.filter((x) => typeof x === "string");
+    }
     if (st && typeof st.attachment_prompt === "string" && st.attachment_prompt.trim()) {
       attachmentPrompt = st.attachment_prompt.trim();
     }
@@ -287,6 +443,9 @@
     }
     if (st && typeof st.temporary_reload === "boolean") {
       temporaryReloadEnabled = st.temporary_reload;
+    }
+    if (st && typeof st.captcha_wait === "number") {
+      captchaWaitMs = Math.max(0, st.captcha_wait) * 1000;
     }
     return st || {};
   }
@@ -395,6 +554,187 @@
     return bestScore >= 3 ? best : null;
   }
 
+  /* qwen_fix_patch7:mode-log */
+  // Forward ve Python log (debugLog chi in console cua tab -> khong thay trong /debug).
+  function fwd(job, kind, message) {
+    try { if (job) send(job.id, { kind: kind, message: message }); } catch (e) { /* best-effort */ }
+  }
+
+  function visState() {
+    try {
+      return document.visibilityState + (document.hasFocus() ? "/focus" : "/nofocus");
+    } catch (e) { return "?"; }
+  }
+
+  // Tab nen: React render cham -> cho nhan trigger doi toi ms thay vi mot lan sleep co dinh.
+  async function waitLabelMatches(targets, trigger, ms) {
+    const t0 = Date.now();
+    for (;;) {
+      if (labelMatches(targets, triggerLabel(trigger))) return true;
+      if (Date.now() - t0 >= ms) return false;
+      await sleep(200);
+    }
+  }
+
+  function modelUiSummary(job) {
+    try {
+      const t = findModelTrigger(modelTargets(job.model));
+      return "model UI='" + (t ? triggerLabel(t) : "?") + "' job.model=" + job.model
+        + " vis=" + visState();
+    } catch (e) { return "model UI=? (loi doc nhan)"; }
+  }
+
+  // Ghi de truong model/models trong body completion bang job.model (opt-in).
+  function rewriteRequestModel(job, init) {
+    try {
+      if (!job || !init || typeof init.body !== "string" || !init.body) return null;
+      const want = String(job.model || "").split("@think=")[0].trim();
+      if (!want) return null;
+      const valid = uiModelIds.includes(want) || knownModels.some((m) => m && m.id === want);
+      if (!valid) {
+        fwd(job, "warn", "force model: '" + want + "' khong nam trong danh sach hop le -> khong ghi de");
+        return null;
+      }
+      const req = JSON.parse(init.body);
+      if (!req || typeof req !== "object") return null;
+      let changed = false;
+      const was = typeof req.model === "string" ? req.model : "";
+      if (typeof req.model === "string" && req.model !== want) { req.model = want; changed = true; }
+      for (const m of Array.isArray(req.messages) ? req.messages : []) {
+        if (!m || typeof m !== "object") continue;
+        if (typeof m.model === "string" && m.model !== want) { m.model = want; changed = true; }
+        if (Array.isArray(m.models) && m.models.length
+            && !(m.models.length === 1 && m.models[0] === want)) {
+          m.models = [want];
+          changed = true;
+        }
+      }
+      if (!changed) return null;
+      fwd(job, "debug", "force model: ghi de request model '" + was + "' -> '" + want + "'");
+      return Object.assign({}, init, { body: JSON.stringify(req) });
+    } catch (e) { return null; }
+  }
+
+  // ---- Che do Thinking / Auto / Fast (dropdown canh o prompt) ----
+  const MODE_LABELS = ["auto", "thinking", "fast"];
+
+  function modeLabelOf(el) {
+    const t = normLabel(visibleText(el));
+    return MODE_LABELS.includes(t) ? t : "";
+  }
+
+  function clickModeEl(el) {
+    const t = (el.closest && el.closest('button, [role="button"]')) || el;
+    t.click();
+  }
+
+  function modeCandidates() {
+    try {
+      return Array.from(document.querySelectorAll('button, [role="button"], [aria-haspopup]'))
+        .filter(visible).map((e) => (visibleText(e) || textOf(e)).replace(/\s+/g, " ").slice(0, 22))
+        .filter(Boolean).slice(-12).join(" | ");
+    } catch (e) { return "?"; }
+  }
+
+  function findModeTrigger() {
+    const comps = findComposers();
+    const root = comps.length ? (comps[0].closest("form") || comps[0].parentElement) : null;
+    const nodes = Array.from(document.querySelectorAll(
+      'button, [role="button"], [aria-haspopup], [aria-expanded], [class*="dropdown" i], [class*="select" i]'));
+    let best = null, bestScore = 0;
+    for (const el of nodes) {
+      if (!visible(el) || el.closest('[role="menu"], [role="listbox"]')) continue;
+      const vt = visibleText(el);
+      if (vt.length > 24) continue;
+      let score = 0;
+      if (MODE_LABELS.includes(normLabel(vt))) score += 5;
+      else if (MODE_LABELS.includes(normLabel(el.getAttribute("aria-label") || ""))) score += 3;
+      else continue;
+      if (el.matches('button, [role="button"], [aria-haspopup]')) score += 2;
+      if (el.getAttribute("aria-haspopup") || el.hasAttribute("aria-expanded")) score += 2;
+      if (root && root.contains(el)) score += 3;
+      if (el.querySelectorAll("*").length > 12) score -= 2;
+      if (score > bestScore) { best = el; bestScore = score; }
+    }
+    return best;
+  }
+
+  function modeMenuItems() {
+    return Array.from(document.querySelectorAll('[role="menuitem"]')).filter(visible);
+  }
+
+  function modeItemLabel(it) {
+    const l = it.querySelector(".qwen-chat-v2-dropdown-menu-item-label");
+    return normLabel((l && l.textContent) || it.textContent || "");
+  }
+
+  async function closeModeMenu(trigger) {
+    const isOpen = () => Array.from(document.querySelectorAll('[role="menu"]')).some(visible);
+    if (!isOpen()) return;
+    pressEscape();
+    document.dispatchEvent(new KeyboardEvent("keydown",
+      { key: "Escape", code: "Escape", keyCode: 27, which: 27, bubbles: true }));
+    await sleep(300);
+    if (isOpen() && trigger) {
+      clickModeEl(trigger);
+      await sleep(300);
+    }
+  }
+
+  // job.mode: "auto" | "thinking" | "fast" (tu reasoning_effort). Rong = khong dung UI.
+  async function selectThinkingMode(job) {
+    try {
+      const want = String((job && job.mode) || "").toLowerCase();
+      if (!want || !MODE_LABELS.includes(want) || selectModeEnabled === false) return true;
+      let trig = null;
+      for (let i = 0; i < 4 && !trig; i++) {
+        trig = findModeTrigger();
+        if (!trig) await sleep(500);
+      }
+      if (!trig) {
+        fwd(job, "warn", "khong tim thay nut che do Thinking/Auto/Fast de chon '" + want
+          + "' | ung vien: " + modeCandidates());
+        return false;
+      }
+      const cur = modeLabelOf(trig);
+      if (cur === want) {
+        fwd(job, "debug", "mode UI da o '" + want + "' vis=" + visState());
+        return true;
+      }
+      clickModeEl(trig);
+      await sleep(500);
+      const item = modeMenuItems().find((it) => modeItemLabel(it) === want);
+      if (!item) {
+        const have = modeMenuItems().map(modeItemLabel).join(",");
+        await closeModeMenu(trig);
+        fwd(job, "warn", "khong thay muc '" + want + "' trong menu che do (menu: [" + have + "])");
+        return false;
+      }
+      item.click();
+      let after = "";
+      const t0 = Date.now();
+      while (Date.now() - t0 < 2000) {
+        await sleep(200);
+        after = modeLabelOf(trig);
+        if (after === want) break;
+      }
+      await closeModeMenu(trig);
+      if (after === want) {
+        fwd(job, "debug", "mode UI: '" + cur + "' -> '" + want + "' vis=" + visState());
+        return true;
+      }
+      if (!after) {
+        fwd(job, "debug", "mode UI: da bam '" + want + "' nhung khong doc duoc nhan nut (khong xac minh duoc)");
+        return true;
+      }
+      fwd(job, "warn", "UI chua hien che do '" + want + "' (hien tai: '" + after + "')");
+      return false;
+    } catch (e) {
+      fwd(job, "warn", "mode select error: " + ((e && e.message) || e));
+      return false;
+    }
+  }
+
   // Chon model theo job.model. Loi UI chi warn, request van chay tiep.
   async function selectModel(job) {
     try {
@@ -416,6 +756,19 @@
 
       trigger.click();
       await sleep(600);
+      /* qwen_fix_patch6:wms-model */
+      if (await pickWmsModel(targets)) {
+        await sleep(600);
+        if (await waitLabelMatches(targets, trigger, 2400)) {   /* qwen_fix_patch7:verify */
+          debugLog("selectModel: da chon '" + job.model + "' qua picker .wms");
+          return true;
+        }
+        await closeModelPopup(trigger);
+        send(job.id, { kind: "warn",
+          message: "UI chua hien model " + job.model + " sau khi chon (hien tai: '"
+            + triggerLabel(trigger) + "')" });
+        return false;
+      }
       const norms = targets.map(normLabel).filter(Boolean);
       const options = Array.from(document.querySelectorAll(
         '[role="option"], [role="menuitem"], [role="menuitemradio"], li, button, [role="button"]'
@@ -433,9 +786,10 @@
         if (score > bestScore) { best = el; bestScore = score; }
       }
       if (!best) {
-        pressEscape();
+        await closeModelPopup(trigger);
         send(job.id, { kind: "warn",
-          message: "khong chon duoc model " + job.model + " trong UI (hien tai: '" + currentModelLabel + "')" });
+          message: "khong chon duoc model " + job.model + " trong UI (hien tai: '" + currentModelLabel + "'; "
+            + "model dang thay: [" + visibleModelNames().join(", ") + "])" });
         return false;
       }
       best.click();
@@ -869,14 +1223,27 @@
       const msgs = Array.isArray(req.messages) ? req.messages : [];
       const chars = msgs.reduce((n, m) => n + partsText(m && m.content).length, 0);
       const last = msgs.length ? msgs[msgs.length - 1] : null;
-      const info = "completion request: keys=" + Object.keys(req).join(",")
+      const reqModel = typeof req.model === "string" ? req.model : "";
+      const msgModel = last && typeof last === "object"
+        ? (Array.isArray(last.models) ? last.models.join(",") : String(last.model || "")) : "";
+      const wantModel = String((job && job.model) || "").split("@think=")[0].trim();
+      const modelBad = selectModelEnabled !== false && !!(wantModel && reqModel
+        && normLabel(reqModel) !== normLabel(wantModel));
+      let fcTxt = "";
+      try { fcTxt = JSON.stringify((last && last.feature_config) || req.feature_config || null).slice(0, 220); }
+      catch (e) { /* bo qua */ }
+      const info = "completion request: model=" + reqModel + " msg_models=" + msgModel
+        + " want=" + wantModel + " vis=" + visState() + " feature_config=" + fcTxt
+        + " keys=" + Object.keys(req).join(",")
         + " messages=" + msgs.length + " content_chars=" + chars
         + " last_msg_keys=" + (last && typeof last === "object" ? Object.keys(last).join(",") : "-")
         + " attachments=[" + found.join(", ") + "]"
         + (fileSample ? " file0=" + JSON.stringify(fileSample) : "");
       const missing = !!(job && job.file_info) && !found.length;
-      send(job.id, { kind: missing ? "warn" : "debug",
-        message: missing ? "request gui di KHONG thay file/attachment: " + info : info });
+      const pre = modelBad ? "MODEL KHAC YEU CAU (request gui '" + reqModel
+        + "' != job '" + wantModel + "'): " : "";
+      send(job.id, { kind: (missing || modelBad) ? "warn" : "debug",
+        message: pre + (missing ? "request gui di KHONG thay file/attachment: " + info : info) });
     } catch (e) {
       debugLog("inspectCompletionRequest skipped:", (e && e.message) || e);
     }
@@ -894,9 +1261,13 @@
         settle(current, lostErr);
         throw lostErr;   // chan request hong, tranh tra loi sai cho client
       }
+      if (forceRequestModel) {   /* qwen_fix_patch7:force-model */
+        const forced = rewriteRequestModel(current, init);
+        if (forced) init = forced;
+      }
       inspectCompletionRequest(current, input, init);  // khong await: chi chan doan
     }
-    const resp = await origFetch.apply(this, arguments);
+    const resp = await origFetch.call(this, input, init);
     try {
       if (current && !current.attached && isCompletionURL(urlOf(input))) {
         current.attached = true;
@@ -1170,10 +1541,14 @@
     saveJobState(job, "submitting", "Waiting for send button");
     // Truoc day chi thu 1 lan sau 350ms: neu Send chua enable (UI con render hoac
     // dang generate) thi prompt dung luon trong composer. Dung vong lap co retry.
-    const sent = await sendPrompt(composer, 60000, null, job);
+    let sent = await sendPrompt(composer, 60000, null, job);
+    if (!sent && job && !job.settled && !job.attached
+        && (await waitCaptchaClear(job, "luc bam Send"))) {
+      sent = await sendPrompt(composer, 60000, null, job);   // captcha vua giai xong
+    }
     if (!sent && job && !job.settled && !job.attached) {
       send(job.id, { kind: "warn",
-        message: "khong xac nhan duoc da bam Send (nut Send khong san sang)" });
+        message: "khong xac nhan duoc da bam Send (nut Send khong san sang) | " + pageDiag(composer) });
     }
   }
 
@@ -1363,8 +1738,17 @@
       } },
     ];
 
+    /* qwen_fix_patch7:big-file */
+    // Paste > 131072 ky tu khong con duoc Qwen doi thanh file -> di thang input[type=file]/drop.
+    const PASTE_FILE_MAX = 131072;
+    const queue = text.length > PASTE_FILE_MAX
+      ? ["file-input", "drop-file"].map((n) => strategies.find((s) => s.name === n)).filter(Boolean)
+      : strategies;
+    if (queue !== strategies) {
+      fwd(job, "debug", "file " + text.length + " ky tu > " + PASTE_FILE_MAX + ": bo qua paste, upload qua file input");
+    }
     let attached = false, used = "";
-    for (const s of strategies) {
+    for (const s of queue) {
       if (job && job.settled) return;
       saveJobState(job, "attach_" + s.name, "Attaching " + fname + " via " + s.name);
       let pastedLen = 0;
@@ -1629,9 +2013,15 @@
         message: "prompt " + job.file_info.size + " ky tu >= nguong inline da hoc ("
           + inlineMaxChars + "): dung duong attach file" });
     }
-    let sendTimer = setTimeout(() => {
-      settle(job, new Error("UI send timeout: khong bat duoc completion response"));
-    }, job.file_info ? SEND_TIMEOUT_FILE_MS : SEND_TIMEOUT_MS);
+    let sendTimer = null;   /* qwen_fix_patch6:captcha-model */
+    job._armSendTimer = () => {
+      if (job.settled || job.attached) return;
+      if (sendTimer) clearTimeout(sendTimer);
+      sendTimer = setTimeout(() => {
+        settle(job, new Error("UI send timeout: khong bat duoc completion response | " + pageDiag(null)));
+      }, job.file_info ? SEND_TIMEOUT_FILE_MS : SEND_TIMEOUT_MS);
+    };
+    job._armSendTimer();
     job._clearSendTimer = () => {
       if (sendTimer) {
         clearTimeout(sendTimer);
@@ -1639,11 +2029,15 @@
       }
     };
     try {
+      await waitCaptchaClear(job, "truoc new-chat/reload");
       if ((await tryNewChat(job)) === false) return;  // dang reload temporary chat; job da duoc requeue
       saveJobState(job, "new_chat_done", "New chat step finished");
       if (!(await ensureMode(job))) return;
       await waitPageReady(job);
+      await waitCaptchaClear(job, "sau khi trang san sang");
       await selectModel(job);
+      fwd(job, "debug", "selectModel: " + modelUiSummary(job));   /* qwen_fix_patch7:call */
+      await selectThinkingMode(job);
       saveJobState(job, "model_selected", "Model " + job.model);
       send(job.id, { kind: "debug",
         message: "temporary evidence: " + JSON.stringify(temporaryEvidence()) });

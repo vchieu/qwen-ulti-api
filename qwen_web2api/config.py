@@ -27,13 +27,27 @@ DEFAULT_CONFIG = {
     # Temporary chat khong co New Chat: reload /?temporary-chat=true truoc
     # job khi trang da co tin nhan de tranh lan context. false = chi canh bao.
     "temporary_chat_reload": True,
+    # Khi tab dang hien captcha: cho nguoi dung giai (giay) thay vi reload/gui tiep.
+    # 0 = tat. (qwen_fix_patch6)
+    "captcha_wait_seconds": 300,
+    # Chon che do Thinking/Auto/Fast trong UI theo reasoning_effort (none/low=Fast,
+    # medium=Auto, high=Thinking; khong gui = giu nguyen UI). false = khong cham UI.
+    "bridge_select_mode": True,
+    # THU NGHIEM: extension ghi de `model` trong body completion bang model cua job
+    # (khong phu thuoc dropdown/tab nen). Mac dinh tat.
+    "bridge_force_request_model": False,
+    # Tuy chon (khong dat key = 130000): tran ky tu cua FILE prompt (paste->file).
+    # > 131072 ky tu thi extension upload qua input[type=file] thay vi paste.
+    # "file_prompt_max_chars": 130000,
     # Text prompt gui kem khi prompt dai duoc paste/attach thanh document trong UI.
     "attachment_prompt": "Please read the text and action",
 
     "retry_attempts": 3,
     "retry_delay_sec": 2,
     "max_body_bytes": 32 * 1024 * 1024,
-    "prompt_max_bytes": 262144,
+    # 0 = KHONG cat prompt (Qwen context lon; gioi han that la 131072 ky tu cua paste->file,
+    # xem file_prompt_max_chars). Dat so > 0 neu muon ep tran byte. (qwen_fix_patch7)
+    "prompt_max_bytes": 0,
 
     "tool_retry_on_miss": True,
     "tool_retry_attempts": 1,

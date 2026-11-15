@@ -1,55 +1,55 @@
-"""Model aliases for Qwen Chat.
+"""Model ids for Qwen Chat -- chi nhung model CO THAT trong dropdown cua UI.
 
-Ids verified live from GET /api/v2/models (Nov 2026):
-  qwen3.7-plus, qwen3.8-max, qwen4.0-max-preview
-Unknown ids pass through unchanged; GET /v1/models merges the live list.
+Popup chinh : Qwen3.7-Plus, Qwen4-Max-Preview, Qwen3.8-Max
+"Expand more models": Qwen3.8-Omni-Flash, Qwen3.7-Max, Qwen3.5-Omni-Plus
+(id cua 3 model sau suy ra tu nhan UI, chua doi chieu /api/v2/models.)
+
+Khong con alias / hau to -thinking / model legacy. Id la khong biet van di qua
+nguyen ban (neu strict_models=false). Che do Thinking/Auto/Fast cua UI chon qua
+reasoning_effort (xem ui_mode_for_effort), khong qua ten model.
 """
 
 MODELS = {
-    # --- current web lineup ---
     "qwen3.7-plus": {
         "upstream": "qwen3.7-plus",
-        "desc": "Qwen3.7-Plus (web default, multimodal, auto thinking/search)",
-    },
-    "qwen3.7-plus-thinking": {
-        "upstream": "qwen3.7-plus", "think": True,
-        "desc": "Qwen3.7-Plus with thinking forced on",
-    },
-    "qwen3.8-max": {
-        "upstream": "qwen3.8-max",
-        "desc": "Qwen3.8-Max (flagship, vision + reasoning)",
-    },
-    "qwen3.8-max-thinking": {
-        "upstream": "qwen3.8-max", "think": True,
-        "desc": "Qwen3.8-Max with thinking forced on",
+        "desc": "Qwen3.7-Plus (web default, multimodal)",
     },
     "qwen4.0-max-preview": {
         "upstream": "qwen4.0-max-preview",
-        "desc": "Qwen4-Max-Preview (agentic flagship preview)",
+        "desc": "Qwen4-Max-Preview (preview of the flagship Qwen4)",
     },
-    "qwen4-max-preview": {
-        "upstream": "qwen4.0-max-preview",
-        "desc": "Alias for qwen4.0-max-preview",
+    "qwen3.8-max": {
+        "upstream": "qwen3.8-max",
+        "desc": "Qwen3.8-Max (flagship Qwen3.8)",
     },
-    "qwen4.0-max-preview-thinking": {
-        "upstream": "qwen4.0-max-preview", "think": True,
-        "desc": "Qwen4-Max-Preview with thinking forced on",
+    "qwen3.8-omni-flash": {
+        "upstream": "qwen3.8-omni-flash",
+        "desc": "Qwen3.8-Omni-Flash (native multimodal: text, image, audio, video)",
     },
-
-    # --- legacy aliases (may be retired upstream) ---
-    "qwen3-max": {"upstream": "qwen3-max", "desc": "Legacy Qwen3 Max"},
-    "qwen3-plus": {"upstream": "qwen-plus-latest", "desc": "Qwen Plus"},
-    "qwen-plus": {"upstream": "qwen-plus-latest", "desc": "Alias for qwen3-plus"},
-    "qwen3-turbo": {"upstream": "qwen-turbo-latest", "desc": "Qwen Turbo"},
-    "qwen-turbo": {"upstream": "qwen-turbo-latest", "desc": "Alias for qwen3-turbo"},
-    "qwen3-coder-plus": {"upstream": "qwen3-coder-plus", "desc": "Qwen3 Coder Plus"},
-    "qwen3-coder-flash": {"upstream": "qwen3-coder-flash", "desc": "Qwen3 Coder Flash"},
-    "qwen3-235b-a22b": {"upstream": "qwen3-235b-a22b", "think": True,
-                        "desc": "Qwen3 235B A22B"},
-    "qwq-32b": {"upstream": "qwq-32b", "think": True, "desc": "QwQ 32B reasoning"},
-    "qwen3-vl-plus": {"upstream": "qwen3-vl-plus", "desc": "Qwen3 VL Plus"},
-    "qwen3-omni-flash": {"upstream": "qwen3-omni-flash", "desc": "Qwen3 Omni Flash"},
+    "qwen3.7-max": {
+        "upstream": "qwen3.7-max",
+        "desc": "Qwen3.7-Max (flagship Qwen3.7, text-only)",
+    },
+    "qwen3.5-omni-plus": {
+        "upstream": "qwen3.5-omni-plus",
+        "desc": "Qwen3.5-Omni-Plus (native multimodal)",
+    },
 }
+
+
+def ui_mode_for_effort(effort):
+    """reasoning_effort -> che do UI: none/minimal/low -> fast, medium -> auto,
+    high/xhigh/max -> thinking. Khong gui / khong nhan ra -> None (giu nguyen UI)."""
+    if not isinstance(effort, str):
+        return None
+    e = effort.strip().lower()
+    if e in ("none", "minimal", "low"):
+        return "fast"
+    if e == "medium":
+        return "auto"
+    if e in ("high", "xhigh", "max"):
+        return "thinking"
+    return None
 
 
 def resolve_model(model_name, default="qwen3.7-plus", thinking_default=False):

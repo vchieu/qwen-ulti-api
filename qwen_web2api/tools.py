@@ -213,7 +213,10 @@ def _join_parts(parts, max_bytes, pinned_head=None) -> str:
 
 def messages_to_prompt(messages, tools=None, tool_choice=None,
                        max_bytes=None) -> str:
-    max_bytes = int(max_bytes or CONFIG.get("prompt_max_bytes", 262144))
+    # prompt_max_bytes <= 0 / thieu = khong gioi han (qwen_fix_patch7)
+    max_bytes = int(max_bytes or CONFIG.get("prompt_max_bytes", 0) or 0)
+    if max_bytes <= 0:
+        max_bytes = 1 << 40
     parts, tool_block = [], None
     if tools and tool_choice != "none":
         defs = []

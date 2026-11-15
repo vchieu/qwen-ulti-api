@@ -782,11 +782,10 @@ class TestToolsParsing(_Sandbox):
 # ----------------------------------------------------------------- models ----
 class TestModels(_Sandbox):
 
-    def test_alias_with_thinking(self):
-        name, upstream, think, err = models.resolve_model(
-            "qwen3.7-plus-thinking")
-        self.assertEqual((name, upstream, think, err),
-                         ("qwen3.7-plus-thinking", "qwen3.7-plus", True, None))
+    def test_thinking_suffix_ids_are_not_aliases(self):
+        for mid in ("qwen3.7-plus-thinking", "qwen3.8-max-thinking", "qwen4-max-preview"):
+            self.assertNotIn(mid, models.MODELS)
+            self.assertEqual(models.resolve_model(mid), (mid, mid, False, None))
 
     def test_alias_without_thinking(self):
         name, upstream, think, err = models.resolve_model("qwen3.8-max")
@@ -802,7 +801,7 @@ class TestModels(_Sandbox):
     def test_think_override(self):
         self.assertEqual(models.resolve_model("qwen3.7-plus@think=1")[2], True)
         self.assertEqual(
-            models.resolve_model("qwen3.7-plus-thinking@think=0")[2], False)
+            models.resolve_model("qwen3.8-max@think=0")[2], False)
         self.assertEqual(
             models.resolve_model("qwen3.7-plus@think=off")[2], False)
 
@@ -1518,8 +1517,8 @@ class TestServerHelpers(_Sandbox):
     def test_resolve_model(self):
         CONFIG["strict_models"] = False
         h = _bare_handler()
-        self.assertEqual(h._resolve({"model": "qwen3.8-max-thinking"}),
-                         ("qwen3.8-max-thinking", "qwen3.8-max", True))
+        self.assertEqual(h._resolve({"model": "qwen3.8-max@think=1"}),
+                         ("qwen3.8-max@think=1", "qwen3.8-max", True))
         self.assertEqual(
             h._resolve({"model": "qwen3.7-plus", "reasoning_effort": "low"}),
             ("qwen3.7-plus", "qwen3.7-plus", False))
@@ -1925,6 +1924,121 @@ class TestTemporaryChatReload(_Sandbox):
     def test_missing_key_defaults_to_enabled(self):
         CONFIG.pop("temporary_chat_reload", None)
         self.assertTrue(bridge.status()["temporary_reload"])
+
+
+# ------------------------------------------------ captcha wait (config) ----
+class TestCaptchaWaitConfig(_Sandbox):
+
+    def test_default_and_in_status(self):
+        self.assertEqual(DEFAULT_CONFIG["captcha_wait_seconds"], 300)
+        CONFIG["captcha_wait_seconds"] = 300
+        self.assertEqual(bridge.status()["captcha_wait"], 300)
+
+    def test_zero_disables(self):
+        CONFIG["captcha_wait_seconds"] = 0
+        self.assertEqual(bridge.status()["captcha_wait"], 0)
+
+    def test_negative_clamped_and_invalid_falls_back(self):
+        CONFIG["captcha_wait_seconds"] = -5
+        self.assertEqual(bridge.status()["captcha_wait"], 0)
+        CONFIG["captcha_wait_seconds"] = "abc"
+        self.assertEqual(bridge.status()["captcha_wait"], 300)
+        CONFIG.pop("captcha_wait_seconds", None)
+        self.assertEqual(bridge.status()["captcha_wait"], 300)
+
+
+class TestExpandMoreModels(unittest.TestCase):
+
+    def test_ui_expand_more_models_resolve(self):
+        for name in ("qwen3.7-max", "qwen3.8-omni-flash", "qwen3.5-omni-plus"):
+            n, upstream, _think, err = models.resolve_model(name)
+            self.assertIsNone(err)
+            self.assertEqual(n, name)
+            self.assertEqual(upstream, name)
+
+
+# ------------------------------------------ ui mode / model list / prompt cap ----
+class TestUiModeAndModelList(_Sandbox):
+
+    def test_models_match_ui_dropdown(self):
+        self.assertEqual(set(models.MODELS), {
+            "qwen3.7-plus", "qwen4.0-max-preview", "qwen3.8-max",
+            "qwen3.8-omni-flash", "qwen3.7-max", "qwen3.5-omni-plus"})
+        for cfg in models.MODELS.values():
+            self.assertNotIn("think", cfg)
+
+    def test_ui_mode_for_effort(self):
+        f = models.ui_mode_for_effort
+        self.assertEqual([f(x) for x in ("none", "minimal", "low")], ["fast"] * 3)
+        self.assertEqual(f("medium"), "auto")
+        self.assertEqual([f(x) for x in ("high", "xhigh", "MAX")], ["thinking"] * 3)
+        for bad in (None, "", "weird", 5):
+            self.assertIsNone(f(bad))
+
+    def test_resolve_sets_ui_mode(self):
+        CONFIG["strict_models"] = False
+        cases = [({}, None),
+                 ({"reasoning_effort": "low"}, "fast"),
+                 ({"reasoning_effort": "none"}, "fast"),
+                 ({"reasoning_effort": "medium"}, "auto"),
+                 ({"reasoning_effort": "high"}, "thinking"),
+                 ({"reasoning": {"effort": "high"}}, "thinking")]
+        for extra, want in cases:
+            h = _bare_handler()
+            h._resolve(dict({"model": "qwen3.7-plus"}, **extra))
+            self.assertEqual(h._mode_kw(), {"mode": want} if want else {})
+        h = _bare_handler()
+        h._resolve({"model": "qwen3.7-plus@think=1"})
+        self.assertEqual(h._ui_mode, "thinking")
+        h = _bare_handler()
+        h._resolve({"model": "qwen3.7-plus@think=0"})
+        self.assertEqual(h._ui_mode, "fast")
+        h = _bare_handler()
+        h._resolve({"model": "qwen3.7-plus@think=0", "reasoning_effort": "high"})
+        self.assertEqual(h._ui_mode, "thinking")
+
+    def test_run_turn_passes_mode_only_when_set(self):
+        h = _bare_handler()
+        h._ui_mode = "thinking"
+        result = {"content": "hello", "reasoning": "", "usage": {}}
+        with mock.patch.object(bridge, "generate", return_value=result) as gen:
+            h._run_turn("prompt", "m", False, False, None, None, None, False)
+        gen.assert_called_once_with("prompt", "m", False, file_info=None, mode="thinking")
+
+    def test_job_carries_mode(self):
+        for mode, want in (("fast", "fast"), ("thinking", "thinking"), (None, None), ("bogus", None)):
+            pending = _fake_pending([{"kind": "delta", "text": "ok"}, {"kind": "done"}])
+            with mock.patch.object(bridge, "worker_alive", return_value=True), \
+                    mock.patch.object(bridge, "_pending", pending):
+                list(bridge.generate_stream("p", "m", False, mode=mode))
+            self.assertEqual(pending.jobs[0]["mode"], want)
+
+    def test_status_flags(self):
+        st = bridge.status()
+        self.assertTrue(st["select_mode"])
+        self.assertFalse(st["force_model"])
+        self.assertIn("qwen3.7-max", st["model_ids"])
+        CONFIG["bridge_select_mode"] = False
+        CONFIG["bridge_force_request_model"] = True
+        st = bridge.status()
+        self.assertFalse(st["select_mode"])
+        self.assertTrue(st["force_model"])
+
+    def test_prompt_cap_removed_by_default(self):
+        self.assertEqual(DEFAULT_CONFIG["prompt_max_bytes"], 0)
+        msgs = [{"role": "user", "content": "x" * 400000}]
+        p = tools.messages_to_prompt(msgs)
+        self.assertNotIn("[...truncated...]", p)
+        self.assertGreaterEqual(len(p), 400000)
+
+    def test_file_cap_configurable(self):
+        CONFIG.pop("file_prompt_max_chars", None)
+        self.assertEqual(server._file_max_chars(), server.FILE_MAX_CHARS)
+        CONFIG["file_prompt_max_chars"] = 200000
+        self.assertEqual(server._file_max_chars(), 200000)
+        for bad in ("abc", 0, -5, None):
+            CONFIG["file_prompt_max_chars"] = bad
+            self.assertEqual(server._file_max_chars(), server.FILE_MAX_CHARS)
 
 
 if __name__ == "__main__":
