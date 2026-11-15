@@ -136,7 +136,7 @@ Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` →
      (nút Stop; job trước settle sớm do native `tool_call`/`role=function`) thì bridge bấm Stop rồi mới gõ prompt mới.
      `submitPrompt` dùng vòng lặp `sendPrompt` (chờ nút Send, thử Enter, không click lại khi `job.attached`);
      `findSendButton` bỏ qua nút Stop.
-   - **Prompt lớn không thành attachment**: `attachLongPrompt` thử lần lượt paste-text → paste-file → `input[type=file]`
+   - **Prompt lớn không thành attachment**: `attachLongPrompt` thử lần lượt paste-file → paste-text → `input[type=file]`
      → drop-file, mỗi bước kiểm tra card; cả bốn thất bại và text thô > 125000 ký tự thì ném lỗi (Python retry)
      thay vì gửi text vượt giới hạn. Job có file dùng `SEND_TIMEOUT_FILE_MS` (240s).
    - **tab_reloaded**: Python `generate_stream` fail nhanh (502 → retry) khi extension báo `tab_reloaded`;

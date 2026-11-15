@@ -1186,14 +1186,15 @@
 
     // Moi cach deu duoc kiem tra card; that bai thi xoa composer roi thu cach tiep.
     const strategies = [
-      { name: "paste-text", wait: 15000, run: async () => {
-          await pasteLongText(composer, text);
-          return composerText(composer).trim().length;
-      } },
+      /* qwen_fix_patch2:file-first */
       { name: "paste-file", wait: 12000, run: async () => {
           pasteFileEvent(composer, fileInfo, text);
           await sleep(1500);
           return 0;
+      } },
+      { name: "paste-text", wait: 15000, run: async () => {
+          await pasteLongText(composer, text);
+          return composerText(composer).trim().length;
       } },
       { name: "file-input", wait: 15000, run: async () => {
           await uploadFileViaUI(fileInfo, text, job);
