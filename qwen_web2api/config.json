@@ -2,6 +2,7 @@
   "port": 8081,
   "bridge_port": 8083,
   "temporary_chat": true,
+  "temporary_chat_reload": true,
   "default_model": "qwen3.7-plus",
   "debug": true,
   "log_requests": true,

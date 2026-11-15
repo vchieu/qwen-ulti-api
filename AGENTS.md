@@ -43,6 +43,11 @@ Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` →
   `bridge_poll_wait` (20s).
 - `temporary_chat`: `true` → mọi job chạy ở `/?temporary-chat=true`.
   Chấp nhận cả spelling `temporary-chat` (hyphen) trong config file.
+- `temporary_chat_reload` (default `true`): temporary chat không có nút New Chat,
+  nên khi `temporary_chat=true` và trang đã có tin nhắn (đã chạy job trước trên trang đó, hoặc
+  heuristic DOM thấy tin nhắn), extension `/requeue` job rồi reload `/?temporary-chat=true`
+  trước khi gửi để tránh lẫn context. `false` → chỉ `warn` khi trang thật sự có tin nhắn.
+  Chế độ thường (`temporary_chat=false`) không bị ảnh hưởng, vẫn bấm New Chat.
 - `bridge_select_model` (default `true`): `false` → extension không đụng model
   picker; request vẫn chạy với model UI đang chọn.
 - `attachment_prompt`: text gửi kèm khi prompt dài được paste/attach thành document
@@ -142,6 +147,29 @@ Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` →
    - **tab_reloaded**: Python `generate_stream` fail nhanh (502 → retry) khi extension báo `tab_reloaded`;
      `tab_reloading` (beforeunload) vẫn chỉ là cảnh báo.
    - `findModelTrigger` không còn chọn nhầm nút profile ("QwenUser… Free").
+
+9. **Reload temporary chat (`temporary_chat_reload`)**: `tryNewChat` ở temporary mode không
+   tìm nút New Chat nữa. `pageDirty()` = `pageUsed` (trang này đã gửi job) hoặc, nếu trang không
+   phải do bridge vừa reload (`freshByBridge`, cờ `sessionStorage` `qwenUIBridgeFreshReload`),
+   heuristic `hasChatMessages()`. Dirty → `reloadFreshTemporary`: `/requeue` job kèm
+   `fresh_reloads` rồi `location.assign('/?temporary-chat=true')`; tối đa 1 lần/job, requeue lỗi
+   thì chạy tiếp không reload. Trang vừa reload được coi là sạch (bỏ qua heuristic) nên không
+   thể reload lặp. `/status.temporary_reload` mang cờ config; mỗi job tốn thêm vài giây tải trang.
+
+10. **Bảo vệ prompt inline (`qwen_fix_patch4`)**: Qwen đổi text dán/điền dài thành document card;
+    nếu card không đính kèm thật thì request chỉ mang `attachment_prompt` (log: `content_chars=119
+    attachments=[]`) và model trả lời "không thấy tài liệu". `submitPrompt` gửi event debug
+    `inline prompt: len/composerAfter/attachmentNodes/sendBtn`; composer rỗng sau khi điền > 2000
+    ký tự → `learnInlineLimit` (sessionStorage `qwenUIBridgeInlineLimit`, trần 32000) + ném lỗi để
+    Python retry; hook `fetch` chặn request có `content_chars` < 90% prompt (`checkInlineIntegrity`).
+    Prompt ≥ `inlineMaxChars` tự đi đường attach file (`file_info._inlineText`, không qua Python).
+    `waitPageReady` chờ model picker + 1s ở job đầu tiên của mỗi lần load trang (sau reload).
+
+11. **Chẩn đoán & độ cứng (`qwen_fix_patch5`)**: poll rỗng không còn ghi `_debug_log` (mỗi 20s
+    một dòng làm đầy `recent_log` 100 dòng trên `/debug` và che log quan trọng).
+    `reloadFreshTemporary` kiểm tra `/requeue` trả `{ok:true}` (hàm `post()` không check HTTP
+    status) — sai thì warn và chạy tiếp không reload, tránh mất job. Log `completion request`
+    thêm `file0={...}` (tên/kích thước file đính kèm thật) để đối chiếu với file bridge đã gửi.
 
 ## Kiểm tra UI thủ công
 

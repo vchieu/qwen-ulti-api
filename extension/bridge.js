@@ -36,6 +36,72 @@
   let lastModeCheck = 0;
   let selectModelEnabled = true;
   let attachmentPrompt = ATTACHMENT_COMPANION_PROMPT;
+  /* qwen_fix_patch3:temp-reload */
+  const FRESH_RELOAD_KEY = "qwenUIBridgeFreshReload";
+  const FRESH_RELOAD_WINDOW_MS = 60000;
+  /* qwen_fix_patch4:inline-guard */
+  const INLINE_LIMIT_KEY = "qwenUIBridgeInlineLimit";
+  const INLINE_LIMIT_CAP = 32000;   // 32775 ky tu tung chay inline OK -> nguong an toan ban dau sau loi
+  const PAGE_READY_MAX_MS = 8000;
+  let inlineMaxChars = Infinity;    // hoc duoc: prompt inline >= nguong nay di duong attach file
+  try {
+    const savedLimit = Number(sessionStorage.getItem(INLINE_LIMIT_KEY));
+    if (savedLimit > 0) inlineMaxChars = savedLimit;
+  } catch (e) { /* best-effort */ }
+
+  function learnInlineLimit(len) {
+    const n = Math.max(1000, Math.min(Number(len) - 1, INLINE_LIMIT_CAP));
+    if (!(n < inlineMaxChars)) return;
+    inlineMaxChars = n;
+    try { sessionStorage.setItem(INLINE_LIMIT_KEY, String(n)); } catch (e) { /* best-effort */ }
+    console.log("[qwen-ui-bridge] inline prompt limit learned:", n);
+  }
+
+  // Kiem tra body request completion cua app TRUOC khi gui: prompt inline ma noi
+  // dung bi mat (Qwen doi text dai thanh document nhung khong dinh kem) -> ly do.
+  function checkInlineIntegrity(job, init) {
+    try {
+      if (!job || job.file_info) return "";
+      const body = init && init.body;
+      if (typeof body !== "string" || !body) return "";
+      const req = JSON.parse(body);
+      const msgs = req && Array.isArray(req.messages) ? req.messages : [];
+      const chars = msgs.reduce((n, m) => n + partsText(m && m.content).length, 0);
+      const want = String(job.prompt || "").length;
+      if (want > 2000 && chars < want * 0.9) {
+        return "noi dung prompt bi mat truoc khi gui: prompt=" + want
+          + " ky tu nhung request chi co " + chars;
+      }
+    } catch (e) { /* loi chan doan khong duoc chan app */ }
+    return "";
+  }
+
+  // Lan dau tren moi lan load trang (nhat la ngay sau reload): DOM chua hydrate nen
+  // model picker/composer chua san sang -> doi truoc khi chon model va dien prompt.
+  async function waitPageReady(job) {
+    if (pageUsed) return;
+    const t0 = Date.now();
+    const targets = modelTargets(job && job.model);
+    let ok = false;
+    while (Date.now() - t0 < PAGE_READY_MAX_MS) {
+      if (selectModelEnabled === false || findModelTrigger(targets)) { ok = true; break; }
+      await sleep(300);
+    }
+    await sleep(1000);   // de app gan xong handler cho composer/paste
+    if (job) send(job.id, { kind: "debug",
+      message: "page ready: modelPicker=" + ok + " after " + (Date.now() - t0) + "ms" });
+  }
+
+  let temporaryReloadEnabled = true;  // config temporary_chat_reload (qua /status)
+  let pageUsed = false;               // trang nay da gui >= 1 prompt => co tin nhan cu
+  let freshByBridge = false;          // trang vua duoc bridge chu dong reload => sach
+  try {
+    const rawTs = sessionStorage.getItem(FRESH_RELOAD_KEY);
+    if (rawTs) {
+      sessionStorage.removeItem(FRESH_RELOAD_KEY);
+      freshByBridge = Date.now() - Number(rawTs) < FRESH_RELOAD_WINDOW_MS;
+    }
+  } catch (e) { /* best-effort */ }
   let debugEnabled = false;
   let lastModelRefreshWarnTs = 0;  // throttle warn về Python: 1 lần/60s
 
@@ -218,6 +284,9 @@
     }
     if (st && typeof st.debug === "boolean") {
       debugEnabled = st.debug;
+    }
+    if (st && typeof st.temporary_reload === "boolean") {
+      temporaryReloadEnabled = st.temporary_reload;
     }
     return st || {};
   }
@@ -772,6 +841,7 @@
       const req = JSON.parse(body);
       if (!req || typeof req !== "object") return;
       const found = [];
+      let fileSample = null;   // mau file dinh kem dau tien (qwen_fix_patch5:diag)
       const walk = (v, path, depth) => {
         if (depth > 5 || v === null || typeof v !== "object") return;
         if (Array.isArray(v)) {
@@ -783,6 +853,14 @@
           if (/^(files?|attachments?|file_ids?)$/i.test(k)
               && Array.isArray(val) && val.length) {
             found.push(path + "." + k + "=" + val.length);
+            if (!fileSample && val[0] && typeof val[0] === "object") {
+              fileSample = {};
+              for (const fk of Object.keys(val[0]).slice(0, 12)) {
+                const fv = val[0][fk];
+                if (typeof fv === "string") fileSample[fk] = fv.slice(0, 40);
+                else if (typeof fv === "number" || typeof fv === "boolean") fileSample[fk] = fv;
+              }
+            }
           }
           walk(val, path + "." + k, depth + 1);
         }
@@ -794,7 +872,8 @@
       const info = "completion request: keys=" + Object.keys(req).join(",")
         + " messages=" + msgs.length + " content_chars=" + chars
         + " last_msg_keys=" + (last && typeof last === "object" ? Object.keys(last).join(",") : "-")
-        + " attachments=[" + found.join(", ") + "]";
+        + " attachments=[" + found.join(", ") + "]"
+        + (fileSample ? " file0=" + JSON.stringify(fileSample) : "");
       const missing = !!(job && job.file_info) && !found.length;
       send(job.id, { kind: missing ? "warn" : "debug",
         message: missing ? "request gui di KHONG thay file/attachment: " + info : info });
@@ -807,6 +886,14 @@
   const origFetch = window.fetch;
   window.fetch = async function (input, init) {
     if (current && !current.attached && isCompletionURL(urlOf(input))) {
+      /* qwen_fix_patch4:inline-guard */
+      const lostMsg = checkInlineIntegrity(current, init);
+      if (lostMsg) {
+        learnInlineLimit(String(current.prompt || "").length);
+        const lostErr = new Error("Qwen UI " + lostMsg + " (se dung duong attach file o lan retry)");
+        settle(current, lostErr);
+        throw lostErr;   // chan request hong, tranh tra loi sai cho client
+      }
       inspectCompletionRequest(current, input, init);  // khong await: chi chan doan
     }
     const resp = await origFetch.apply(this, arguments);
@@ -932,9 +1019,24 @@
     if (!NEW_CHAT_EACH_JOB) return;
     const st = await readStatus();
     const wantTemp = st && st.temporary_chat;
+    /* qwen_fix_patch3:temp-reload */
+    if (wantTemp && temporaryReloadEnabled) {
+      // Temporary chat khong co nut New Chat: cach sach context la tai lai trang.
+      if (!isTemporaryPage(false)) return true;   // ensureMode se dua tab ve temporary
+      if (!pageDirty()) {
+        debugLog("temporary chat: trang sach, khong can reload");
+        return true;
+      }
+      if (((job && job.fresh_reloads) || 0) >= 1) {
+        if (job) send(job.id, { kind: "warn",
+          message: "da reload temporary chat nhung trang van co tin nhan; tiep tuc (context co the bi lan)" });
+        return true;
+      }
+      return !(await reloadFreshTemporary(job));   // false = dang navigate
+    }
     const btn = findNewChatButton();
     if (!btn) {
-      const hasMsg = hasChatMessages();
+      const hasMsg = pageDirty();
       const warnMsg = "khong tim thay nut New Chat" +
         (wantTemp ? " trong temporary chat mode" : "") +
         (hasMsg ? " (CANH BAO: cuoc tro chuyen hien tai DA CO tin nhan, context co the bi lan!)" : " (trang hien tai dang rong)");
@@ -955,7 +1057,7 @@
         await sleep(1200);
         return;
       }
-      const hasMsg = hasChatMessages();
+      const hasMsg = pageDirty();
       const warnMsg = "dang o temporary chat mode; bo qua nut New Chat co href=/ de tranh thoat temporary" +
         (hasMsg ? " (CANH BAO: cuoc tro chuyen hien tai DA CO tin nhan, context co the bi lan!)" : " (phien hien tai chua co tin nhan)");
       log(warnMsg);
@@ -965,6 +1067,43 @@
     debugLog("clicking New Chat button:", textOf(btn));
     btn.click();
     await sleep(1200);
+  }
+
+  /* qwen_fix_patch3:temp-reload */
+  // Trang hien tai co the con tin nhan cu khong? Khong tin mu heuristic DOM:
+  //  - da gui job tren trang nay  => chac chan co tin nhan
+  //  - trang vua duoc bridge reload => sach (bo qua heuristic, tranh reload lap)
+  //  - con lai: heuristic hasChatMessages() (nguoi dung co the da chat tay)
+  function pageDirty() {
+    if (pageUsed) return true;
+    if (freshByBridge) return false;
+    return hasChatMessages();
+  }
+
+  // Requeue job roi tai lai /?temporary-chat=true. Tra ve true neu da bat dau
+  // navigate (caller phai dung ngay), false neu khong reload duoc (chay tiep).
+  async function reloadFreshTemporary(job) {
+    const n = ((job && job.fresh_reloads) || 0) + 1;
+    try {
+      job.raw.fresh_reloads = n;
+      const rq = await post("/requeue", { job: job.raw });   // qwen_fix_patch5:diag
+      if (!rq || rq.ok !== true) {
+        throw new Error("bridge tu choi /requeue: " + JSON.stringify(rq).slice(0, 120));
+      }
+    } catch (e) {
+      send(job.id, { kind: "warn",
+        message: "khong requeue duoc job de reload temporary chat: "
+          + ((e && e.message) || e) + "; tiep tuc khong reload" });
+      return false;
+    }
+    job.fresh_reloads = n;
+    await send(job.id, { kind: "debug",
+      message: "reload temporary chat de lam sach context (pageUsed=" + pageUsed
+        + ", freshByBridge=" + freshByBridge + ")" });
+    try { sessionStorage.setItem(FRESH_RELOAD_KEY, String(Date.now())); } catch (e) { /* best-effort */ }
+    navigating = true;
+    location.assign(modeUrl(true));
+    return true;
   }
 
   function findSendButton(composer) {
@@ -1000,6 +1139,22 @@
     saveJobState(job, "typing_prompt", "Setting prompt text");
     setComposer(composer, prompt);
     await sleep(350);
+    /* qwen_fix_patch4:inline-guard */
+    {
+      const afterLen = composerText(composer).trim().length;
+      const nodes = findActiveAttachmentElements(composer).length;
+      if (job) send(job.id, { kind: "debug",
+        message: "inline prompt: len=" + String(prompt).length + " composerAfter=" + afterLen
+          + " attachmentNodes=" + nodes + " sendBtn=" + !!findSendButton(composer) });
+      if (afterLen === 0 && String(prompt).trim().length > 2000) {
+        // Qwen doi text thanh document card; gui companion-only se mat noi dung
+        // (log that: content_chars=119 attachments=[]). Fail de Python retry, lan
+        // sau di duong attach file.
+        learnInlineLimit(String(prompt).length);
+        throw new Error("Qwen UI da doi prompt inline (" + String(prompt).length
+          + " ky tu) thanh document; se dung duong attach file o lan retry");
+      }
+    }
     // UI tu doi text dai vua nhap thanh attachment card va lam rong composer:
     if (!composerText(composer).trim()) {
       const companion = attachmentPrompt || ATTACHMENT_COMPANION_PROMPT;
@@ -1125,6 +1280,7 @@
   }
 
   async function fetchPromptText(fileInfo) {
+    if (fileInfo && typeof fileInfo._inlineText === "string") return fileInfo._inlineText;
     const response = await fetch(`${BRIDGE}/file/${encodeURIComponent(fileInfo.filename)}`);
     if (!response.ok) {
       throw new Error("khong fetch duoc file tu bridge: " + response.status);
@@ -1459,6 +1615,20 @@
   async function runJobInner(job) {
     current = job;
     saveJobState(job, "started", "Job " + job.id + " started");
+    /* qwen_fix_patch4:inline-guard */
+    if (!job.file_info && String(job.prompt || "").length >= inlineMaxChars) {
+      // Prompt inline tung bi Qwen doi thanh document ma khong dinh kem: di duong
+      // attach file (co kiem tra card), noi dung lay thang tu job.prompt.
+      job.file_info = {
+        filename: "qwen_prompt_inline_" + job.id + ".txt",
+        size: String(job.prompt).length,
+        _inlineText: String(job.prompt),
+      };
+      job.attachment_prompt = job.attachment_prompt || attachmentPrompt || ATTACHMENT_COMPANION_PROMPT;
+      send(job.id, { kind: "debug",
+        message: "prompt " + job.file_info.size + " ky tu >= nguong inline da hoc ("
+          + inlineMaxChars + "): dung duong attach file" });
+    }
     let sendTimer = setTimeout(() => {
       settle(job, new Error("UI send timeout: khong bat duoc completion response"));
     }, job.file_info ? SEND_TIMEOUT_FILE_MS : SEND_TIMEOUT_MS);
@@ -1469,15 +1639,17 @@
       }
     };
     try {
-      await tryNewChat(job);
+      if ((await tryNewChat(job)) === false) return;  // dang reload temporary chat; job da duoc requeue
       saveJobState(job, "new_chat_done", "New chat step finished");
       if (!(await ensureMode(job))) return;
+      await waitPageReady(job);
       await selectModel(job);
       saveJobState(job, "model_selected", "Model " + job.model);
       send(job.id, { kind: "debug",
         message: "temporary evidence: " + JSON.stringify(temporaryEvidence()) });
       const composer = await waitComposer();
       saveJobState(job, "composer_ready", "Composer found");
+      pageUsed = true;  // tu day trang nay co tin nhan
 
       if (job.file_info) {
         // Large prompt: paste/upload de Qwen tao document, roi gui attachment.
@@ -1519,6 +1691,7 @@
             attachment_prompt: r.job.attachment_prompt || attachmentPrompt || ATTACHMENT_COMPANION_PROMPT,
             raw: r.job,
             mode_retries: r.job.mode_retries || 0,
+            fresh_reloads: r.job.fresh_reloads || 0,
             toolsActive: String(r.job.prompt || "").includes("# Tool Use")
               || String(r.job.attachment_prompt || "").includes("# Tool Use"),
             attached: false,
@@ -1546,6 +1719,7 @@
     console.log("send button:", c ? findSendButton(c) : null);
     console.log("active attachments:", findActiveAttachmentElements(c));
     console.log("has chat messages:", hasChatMessages());
+    console.log("temporary reload:", { enabled: temporaryReloadEnabled, pageUsed: pageUsed, freshByBridge: freshByBridge, dirty: pageDirty(), inlineMaxChars: inlineMaxChars });
     console.log("temporary chat page:", isTemporaryPage(), temporaryEvidence());
     console.log("debug enabled:", debugEnabled);
     console.log("active job in sessionStorage:", sessionStorage.getItem(ACTIVE_JOB_KEY));

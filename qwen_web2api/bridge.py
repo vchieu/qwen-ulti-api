@@ -89,6 +89,7 @@ def status():
     return {"worker": worker_alive(), "pending": _pending.qsize(), "jobs": n,
             "temporary_chat": temporary_chat_enabled(),
             "select_model": bool(CONFIG.get("bridge_select_model", True)),
+            "temporary_reload": bool(CONFIG.get("temporary_chat_reload", True)),
             "attachment_prompt": str(CONFIG.get("attachment_prompt", "Please read the text and action")),
             "debug": qwen.is_debug(),
             "models": n_models,
@@ -324,7 +325,8 @@ class _Handler(BaseHTTPRequestHandler):
                 n_jobs = len(_jobs)
                 n_models = len(_models)
             safe_keys = ("debug", "log_requests", "temporary_chat", "temporary-chat",
-                         "bridge_select_model", "default_model", "retry_attempts",
+                         "bridge_select_model", "temporary_chat_reload", "default_model",
+                         "retry_attempts",
                          "bridge_job_timeout", "bridge_poll_wait", "bridge_worker_ttl",
                          "attachment_prompt", "log_file", "bridge_port", "port")
             cfg_snapshot = {k: CONFIG[k] for k in safe_keys if k in CONFIG}
@@ -381,12 +383,12 @@ class _Handler(BaseHTTPRequestHandler):
             while True:
                 remaining = deadline - time.time()
                 if remaining <= 0:
-                    _debug_log(f"poll: no job after {CONFIG.get('bridge_poll_wait', 20)}s (queue empty)")
+                    pass  # poll rong khong log: se lap day recent_log (qwen_fix_patch5:diag)
                     return self._json({"job": None})
                 try:
                     job = _pending.get(timeout=remaining)
                 except queue.Empty:
-                    _debug_log(f"poll: no job after {CONFIG.get('bridge_poll_wait', 20)}s (queue empty)")
+                    pass  # poll rong khong log: se lap day recent_log (qwen_fix_patch5:diag)
                     return self._json({"job": None})
 
                 jid = job.get("job_id")

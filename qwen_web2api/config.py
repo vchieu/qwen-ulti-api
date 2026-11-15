@@ -24,6 +24,9 @@ DEFAULT_CONFIG = {
     "temporary_chat": False,
     # Cho phep extension chon model trong UI theo job.model.
     "bridge_select_model": True,
+    # Temporary chat khong co New Chat: reload /?temporary-chat=true truoc
+    # job khi trang da co tin nhan de tranh lan context. false = chi canh bao.
+    "temporary_chat_reload": True,
     # Text prompt gui kem khi prompt dai duoc paste/attach thanh document trong UI.
     "attachment_prompt": "Please read the text and action",
 

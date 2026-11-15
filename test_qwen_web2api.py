@@ -1910,5 +1910,22 @@ class TestServerLargePromptLog(_Sandbox):
         self.assertEqual(logged, [])
 
 
+# ------------------------------------------- temporary chat reload (config) ----
+class TestTemporaryChatReload(_Sandbox):
+
+    def test_default_enabled_and_in_status(self):
+        self.assertIs(DEFAULT_CONFIG["temporary_chat_reload"], True)
+        CONFIG["temporary_chat_reload"] = True
+        self.assertTrue(bridge.status()["temporary_reload"])
+
+    def test_status_reports_disabled(self):
+        CONFIG["temporary_chat_reload"] = False
+        self.assertFalse(bridge.status()["temporary_reload"])
+
+    def test_missing_key_defaults_to_enabled(self):
+        CONFIG.pop("temporary_chat_reload", None)
+        self.assertTrue(bridge.status()["temporary_reload"])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
