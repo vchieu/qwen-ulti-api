@@ -662,10 +662,11 @@ class TestToolsParsing(_Sandbox):
         text = f"```tool_call\n{j1}\n{j2}\n```"
         clean, calls, dropped = tools.parse_tool_calls(
             text, {"f", "g"}, {"f": {"a"}, "g": {"b"}})
-        # Phải lấy được ít nhất call đầu; call thứ 2 có thể vào dropped nếu
-        # lenient parse thất bại, nhưng không được im lặng drop không có reason.
-        self.assertGreaterEqual(len(calls) + len(dropped), 2,
-                                "call thứ 2 bị nuốt im lặng (không có dropped reason)")
+        # Thực tế lenient parse thành công → phải lấy được đúng 2 call, dropped rỗng.
+        self.assertEqual(len(calls), 2,
+                         "fence lenient fallback phải parse được cả 2 call")
+        self.assertEqual(dropped, [],
+                         "không có call nào được drop")
 
     def test_regression_d_standalone_function_tag_still_nudges(self):
         """Bug D: <function=...> standalone (không có <tool_call> wrapper) vẫn nudge.
