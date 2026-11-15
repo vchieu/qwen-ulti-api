@@ -450,6 +450,235 @@ class TestToolsParsing(_Sandbox):
         self.assertEqual(dropped, ["undeclared tool 'other'"])
         self.assertEqual(clean, text)
 
+    # --- Các định dạng mới: multiple calls + XML function/parameter ---
+
+    def test_multiple_json_in_one_xml_tag(self):
+        """Nhiều JSON object liên tiếp trong 1 <tool_call>...</tool_call>."""
+        text = ('<tool_call>\n'
+                '{"name": "read_file", "arguments": {"path": "a.py"}}\n'
+                '{"name": "read_file", "arguments": {"path": "b.py"}}\n'
+                '</tool_call>')
+        clean, calls, dropped = tools.parse_tool_calls(
+            text, {"read_file"}, {"read_file": {"path"}})
+        self.assertEqual(dropped, [])
+        self.assertEqual(len(calls), 2)
+        paths = {json.loads(c["function"]["arguments"])["path"] for c in calls}
+        self.assertEqual(paths, {"a.py", "b.py"})
+        self.assertEqual(clean, "")
+
+    def test_multiple_json_in_one_fence(self):
+        """Nhiều JSON object liên tiếp trong 1 ```tool_call fence."""
+        text = ('```tool_call\n'
+                '{"name": "read_file", "arguments": {"path": "a.py"}}\n'
+                '{"name": "read_file", "arguments": {"path": "b.py"}}\n'
+                '```')
+        clean, calls, dropped = tools.parse_tool_calls(
+            text, {"read_file"}, {"read_file": {"path"}})
+        self.assertEqual(dropped, [])
+        self.assertEqual(len(calls), 2)
+        paths = {json.loads(c["function"]["arguments"])["path"] for c in calls}
+        self.assertEqual(paths, {"a.py", "b.py"})
+        self.assertEqual(clean, "")
+
+    def test_multiple_json_xml_prose_before(self):
+        """Prose trước <tool_call> nhiều JSON được giữ lại trong clean text."""
+        prose = "Tôi sẽ đọc các file sau:"
+        text = (prose + '\n'
+                '<tool_call>\n'
+                '{"name": "read_file", "arguments": {"path": "a.py"}}\n'
+                '{"name": "read_file", "arguments": {"path": "b.py"}}\n'
+                '{"name": "read_file", "arguments": {"path": "c.py"}}\n'
+                '</tool_call>')
+        clean, calls, dropped = tools.parse_tool_calls(
+            text, {"read_file"}, {"read_file": {"path"}})
+        self.assertEqual(dropped, [])
+        self.assertEqual(len(calls), 3)
+        self.assertIn(prose, clean)
+        paths = {json.loads(c["function"]["arguments"])["path"] for c in calls}
+        self.assertEqual(paths, {"a.py", "b.py", "c.py"})
+
+    def test_xml_function_parameter_basic(self):
+        """<function=shell><parameter=command>...</parameter></function> cơ bản."""
+        text = ('<tool_call>\n'
+                '<function=shell>\n'
+                '<parameter=command>\ngit status --porcelain\n</parameter>\n'
+                '</function>\n'
+                '</tool_call>')
+        clean, calls, dropped = tools.parse_tool_calls(
+            text, {"shell"}, {"shell": {"command"}})
+        self.assertEqual(dropped, [])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "shell")
+        args = json.loads(calls[0]["function"]["arguments"])
+        self.assertEqual(args["command"], "git status --porcelain")
+        self.assertEqual(clean, "")
+
+    def test_xml_function_parameter_multiple_calls_adjacent(self):
+        """Nhiều <tool_call> liền kề nhau với format <function=...>."""
+        text = ('<tool_call>\n'
+                '<function=shell>\n'
+                '<parameter=command>\ngit status --porcelain\n</parameter>\n'
+                '</function>\n'
+                '</tool_call>'
+                '<tool_call>\n'
+                '<function=shell>\n'
+                '<parameter=command>\ngit diff --stat\n</parameter>\n'
+                '</function>\n'
+                '</tool_call>')
+        clean, calls, dropped = tools.parse_tool_calls(
+            text, {"shell"}, {"shell": {"command"}})
+        self.assertEqual(dropped, [])
+        self.assertEqual(len(calls), 2)
+        cmds = [json.loads(c["function"]["arguments"])["command"] for c in calls]
+        self.assertIn("git status --porcelain", cmds)
+        self.assertIn("git diff --stat", cmds)
+        self.assertEqual(clean, "")
+
+    def test_xml_function_parameter_prose_before(self):
+        """Prose phía trước XML function block được giữ lại."""
+        prose = "Tôi sẽ kiểm tra trạng thái git:"
+        text = (prose + '\n'
+                '<tool_call>\n'
+                '<function=shell>\n'
+                '<parameter=command>\ngit status\n</parameter>\n'
+                '</function>\n'
+                '</tool_call>')
+        clean, calls, dropped = tools.parse_tool_calls(
+            text, {"shell"}, {"shell": {"command"}})
+        self.assertEqual(dropped, [])
+        self.assertEqual(len(calls), 1)
+        self.assertIn(prose, clean)
+        self.assertEqual(calls[0]["function"]["name"], "shell")
+
+    def test_xml_function_multiple_params(self):
+        """<function=...> với nhiều <parameter> khác nhau."""
+        text = ('<tool_call>\n'
+                '<function=search>\n'
+                '<parameter=query>tool calling Qwen</parameter>\n'
+                '<parameter=limit>5</parameter>\n'
+                '</function>\n'
+                '</tool_call>')
+        clean, calls, dropped = tools.parse_tool_calls(
+            text, {"search"}, {"search": {"query", "limit"}})
+        self.assertEqual(dropped, [])
+        self.assertEqual(len(calls), 1)
+        args = json.loads(calls[0]["function"]["arguments"])
+        self.assertEqual(args["query"], "tool calling Qwen")
+        # limit=5 là JSON số → phải parse thành int
+        self.assertEqual(args["limit"], 5)
+
+    def test_xml_function_undeclared_is_dropped(self):
+        """<function=unknown> với tool không được khai báo → bị drop."""
+        text = ('<tool_call>\n'
+                '<function=unknown_tool>\n'
+                '<parameter=x>val</parameter>\n'
+                '</function>\n'
+                '</tool_call>')
+        clean, calls, dropped = tools.parse_tool_calls(
+            text, {"shell"}, {"shell": {"command"}})
+        self.assertEqual(calls, [])
+        self.assertEqual(len(dropped), 1)
+        self.assertIn("undeclared tool", dropped[0])
+
+    def test_looks_like_tool_call_xml_function(self):
+        """looks_like_tool_call nhận ra <function=...> format."""
+        self.assertTrue(tools.looks_like_tool_call(
+            '<tool_call>\n'
+            '<function=shell>\n'
+            '<parameter=command>ls</parameter>\n'
+            '</function>\n'
+            '</tool_call>'))
+
+    def test_looks_like_missed_tool_call_ignores_xml_function(self):
+        """looks_like_missed_tool_call không fire khi đã có <function=...>."""
+        text = "Let me run it\n<tool_call>\n<function=shell>\n<parameter=command>ls</parameter>\n</function>\n</tool_call>"
+        self.assertFalse(tools.looks_like_missed_tool_call(text))
+
+    # --- Regression tests (review lần 2) ---
+
+    def test_regression_a_close_tag_inside_json_string(self):
+        """Bug A: </tool_call> bên trong chuỗi JSON không làm sai biên.
+
+        HEAD: parse đúng calls=['f'], args giữ literal.
+        WORK trước fix: cắt raw_block tại </tool_call> đầu → JSON bị chặt → dropped.
+        """
+        payload = json.dumps({
+            "name": "f",
+            "arguments": {"x": "prefix</tool_call>suffix"},
+        })
+        text = f"<tool_call>{payload}</tool_call>"
+        clean, calls, dropped = tools.parse_tool_calls(
+            text, {"f"}, {"f": {"x"}})
+        self.assertEqual(dropped, [], f"unexpected dropped: {dropped}")
+        self.assertEqual(len(calls), 1)
+        args = json.loads(calls[0]["function"]["arguments"])
+        self.assertIn("</tool_call>", args.get("x", ""))
+        self.assertEqual(clean, "")
+
+    def test_regression_e_function_tag_inside_json_string(self):
+        """Bug E: <function=evil> trong chuỗi JSON không gây false-positive XML path.
+
+        HEAD: parse đúng JSON tool 'f', 'evil' là literal trong args.
+        WORK trước fix: _XML_FUNC_OPEN.search(raw_block) trúng → đi vào XML path
+        → sinh call 'evil' (undeclared) thay vì call 'f'.
+        """
+        payload = json.dumps({
+            "name": "f",
+            "arguments": {"example": "<function=evil><parameter=x>v</parameter></function>"},
+        })
+        text = f"<tool_call>{payload}</tool_call>"
+        clean, calls, dropped = tools.parse_tool_calls(
+            text, {"f"}, {"f": {"example"}})
+        self.assertEqual(dropped, [], f"unexpected dropped: {dropped}")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "f")
+        self.assertEqual(clean, "")
+
+    def test_regression_b_backtick_in_second_json_string_fence(self):
+        """Bug B: ``` trong chuỗi JSON thứ 2 của fence không rò rỉ ra clean.
+
+        Trước fix: _FENCE_CLOSE.search() trúng ``` trong string → block_end sai
+        → đuôi fence rò rỉ ra clean text.
+        """
+        j1 = json.dumps({"name": "f", "arguments": {"a": 1}})
+        j2 = json.dumps({"name": "f", "arguments": {"b": "has```backtick"}})
+        text = f"```tool_call\n{j1}\n{j2}\n```"
+        clean, calls, dropped = tools.parse_tool_calls(
+            text, {"f"}, {"f": {"a", "b"}})
+        self.assertEqual(dropped, [], f"unexpected dropped: {dropped}")
+        self.assertEqual(len(calls), 2, f"expected 2 calls, got {calls}")
+        # clean phải không còn rò rỉ ``` hay đuôi fence
+        self.assertNotIn("```", clean)
+        self.assertEqual(clean.strip(), "")
+
+    def test_regression_c_fence_lenient_fallback_after_first_json(self):
+        """Bug C: fence branch có lenient fallback cho object thứ 2 (single-quote).
+
+        XML branch xử lý đúng case này; fence branch bị break ngay tại ValueError
+        mà không thử lenient → call thứ 2 bị nuốt im lặng.
+        """
+        j1 = json.dumps({"name": "f", "arguments": {"a": 1}})
+        j2 = "{'name': 'g', 'arguments': {'b': 2}}"  # single-quote → lenient
+        text = f"```tool_call\n{j1}\n{j2}\n```"
+        clean, calls, dropped = tools.parse_tool_calls(
+            text, {"f", "g"}, {"f": {"a"}, "g": {"b"}})
+        # Phải lấy được ít nhất call đầu; call thứ 2 có thể vào dropped nếu
+        # lenient parse thất bại, nhưng không được im lặng drop không có reason.
+        self.assertGreaterEqual(len(calls) + len(dropped), 2,
+                                "call thứ 2 bị nuốt im lặng (không có dropped reason)")
+
+    def test_regression_d_standalone_function_tag_still_nudges(self):
+        """Bug D: <function=...> standalone (không có <tool_call> wrapper) vẫn nudge.
+
+        looks_like_missed_tool_call phải trả True khi text có intent nhưng tool call
+        là <function=...> không được wrap bởi <tool_call> (không parse được),
+        để server.py có cơ hội nudge-retry.
+        """
+        # Có intent "let me run" + <function=> standalone → vẫn trả True
+        text = "Let me run this for you\n<function=shell>\n<parameter=command>ls</parameter>\n</function>"
+        self.assertTrue(tools.looks_like_missed_tool_call(text),
+                        "standalone <function=> không có <tool_call> phải trả True để nudge")
+
     def test_shorthand_tool_name_without_key_is_parsed(self):
         """Model sinh '{"grep", "arguments": {...}}' thiếu key 'name'."""
         text = ('```tool_call\n'

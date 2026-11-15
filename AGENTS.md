@@ -26,7 +26,7 @@ Cần mở https://chat.qwen.ai (đã đăng nhập), giữ tab mở và bật e
 | `qwen_web2api/server.py` | HTTP OpenAI-compatible: `/v1/chat/completions`, `/v1/responses`, `/v1/models`, auth, CORS, SSE, `_run_turn` (tool retry/nudge) |
 | `qwen_web2api/qwen.py` | `QwenError` + logger `log()`, `debug_log()`, `is_debug()`, `get_recent_log()` dùng chung; không còn transport/token |
 | `qwen_web2api/bridge.py` | Server 8083 cho extension: `/poll`, `/event`, `/status`, `/debug`, `/requeue`, `/file/*`; queue job, stream event, `known_models()`, `temporary_chat_enabled()` |
-| `qwen_web2api/tools.py` | Flatten messages → prompt, chèn `# Tool Use`, parse fence `tool_call`, truncate theo byte |
+| `qwen_web2api/tools.py` | Flatten messages → prompt, chèn `# Tool Use`, parse tool_call (fence, XML tag, XML function/parameter), truncate theo byte |
 | `qwen_web2api/models.py` | Alias model + `@think=0/1` |
 | `qwen_web2api/config.py` | `DEFAULT_CONFIG` + `CONFIG` (global mutable), load/find config |
 | `qwen_web2api/__main__.py` | CLI, `_guard_bind` tự sinh API key khi bind ra ngoài loopback |
@@ -169,6 +169,19 @@ Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` →
   (shorthand `{"<tool_name>", "arguments": ...}`, single-key dict `{"<tool_name>": ...}`,
   trailing comma, single quotes). Khi response có cả prose và tool_call, prose được giữ lại
   ở `content` để client hiển thị cho user thay vì bị xóa hay chuyển sang reasoning.
+  Ngoài fence, parser còn nhận diện và chuẩn hoá thêm 2 biến thể Qwen hay sinh ra:
+  (A) **XML tag + JSON**: `<tool_call>{"name":...}</tool_call>` — hỗ trợ nhiều JSON object
+  liên tiếp trong cùng 1 tag và nhiều tag `<tool_call>` liền kề nhau. Parser dùng
+  `raw_decode` trên **full text** (không slice) nên `</tool_call>` hoặc `<function=...>`
+  bên trong chuỗi JSON không làm sai biên — XML-function path chỉ được thử khi
+  JSON decode thất bại hoàn toàn;
+  (B) **XML function/parameter** (Qwen-Agent style): `<tool_call><function=tool_name>
+  <parameter=key>value</parameter></function></tool_call>` — parse tên tool và từng
+  tham số riêng, tự động detect kiểu dữ liệu (số, bool, list, dict JSON), hỗ trợ nhiều
+  `<function>` trong 1 tag và nhiều tag liền kề. Cả hai dạng đều cắt sạch khỏi text,
+  giữ lại prose trước block trong `content`.
+  Lưu ý: `<function=...>` **standalone** (không có wrapper `<tool_call>`) không được
+  parse; `looks_like_missed_tool_call` trả `True` để server nudge-retry trong trường hợp này.
 - `extension/bridge.js` là một content script MV3 duy nhất, chạy MAIN world
   (phải override được `window.fetch`). Không thêm file/build step. Mọi lỗi UI
   mới phải `warn` (hoặc log) rồi chạy tiếp, không throw làm hỏng request.
@@ -206,6 +219,7 @@ chạm vào bất kỳ điều nào dưới đây:
 | Thêm global state mới (`_xxx`) | **Điểm dễ vỡ** + **Quy ước test** (`_Sandbox`) |
 | Thêm file test hoặc script debug | **Quy ước test** |
 | Phát hiện điểm dễ vỡ mới | **Điểm dễ vỡ** |
+| Thêm/đổi định dạng tool_call parser nhận diện | **Quy ước code** (Tool protocol) |
 
 > Nếu thay đổi nhỏ (rename biến nội bộ, refactor không đổi hành vi),
 > không cần cập nhật AGENTS.md — chỉ cập nhật khi **interface hoặc hành vi

@@ -301,6 +301,59 @@ _ARGUMENT_KEYS = ("arguments", "args", "input", "parameters", "params", "action_
 _META_KEYS = {"name", "id", "type", "description", "tool", "tool_name", "action", "function"}
 _NOTHING = object()
 
+# XML function/parameter format:
+#   <function=tool_name>  hoặc  <function name="tool_name">
+#   <parameter=key>value</parameter>
+# Qwen-Agent và một số checkpoint Qwen 2.5/3 tự sinh ra dạng này.
+_XML_FUNC_OPEN = re.compile(
+    r"<function[= ](?:name=)?[\"']?(?P<name>[\w.:-]+)[\"']?>[ \t]*\n?",
+    re.IGNORECASE,
+)
+_XML_FUNC_CLOSE = re.compile(r"\s*</function>", re.IGNORECASE)
+_XML_PARAM = re.compile(
+    r"<parameter[= ](?:name=)?[\"']?(?P<key>[\w.-]+)[\"']?>(?P<val>.*?)(?:</parameter>|(?=<parameter\b)|(?=</function>)|(?=</tool_call>)|$)",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _parse_xml_function_block(block_text: str) -> list:
+    """Parse dạng XML function/parameter bên trong <tool_call>:
+
+      <function=tool_name>
+        <parameter=key>value</parameter>
+      </function>
+
+    Hỗ trợ nhiều <function> trong cùng một block và cả cú pháp
+    <function name="tool_name"> (khoảng trắng thay cho dấu =).
+    Trả về list dict {"name": ..., "arguments": {...}}.
+    Trả về [] nếu không tìm thấy bất kỳ <function> nào.
+    """
+    results = []
+    for m_fn in _XML_FUNC_OPEN.finditer(block_text):
+        fn_name = m_fn.group("name").strip()
+        if not fn_name:
+            continue
+        # Tìm phần thân: từ sau <function=...> đến </function> hoặc hết block
+        body_start = m_fn.end()
+        close_m = _XML_FUNC_CLOSE.search(block_text, body_start)
+        body = block_text[body_start: close_m.start() if close_m else len(block_text)]
+        params: dict = {}
+        for m_p in _XML_PARAM.finditer(body):
+            key = m_p.group("key").strip()
+            val = (m_p.group("val") or "").strip()
+            # Cố gắng parse literal JSON (số, bool, list, dict) giữ nguyên;
+            # nếu không parse được thì giữ kiểu str.
+            try:
+                parsed_val = json.loads(val)
+                if isinstance(parsed_val, (dict, list, int, float, bool)):
+                    params[key] = parsed_val
+                    continue
+            except (ValueError, json.JSONDecodeError):
+                pass
+            params[key] = val
+        results.append({"name": fn_name, "arguments": params})
+    return results
+
 
 def _parse_lenient_json(raw: str):
     """Cố gắng parse JSON từ chuỗi thô bên trong fence/tag tool_call.
@@ -361,9 +414,15 @@ def _parse_lenient_json(raw: str):
 def _iter_blocks(text):
     """Yield (start, end, data, kind); raw_decode so ``` inside strings is safe.
 
-    Hỗ trợ cả hai dạng:
+    Hỗ trợ ba dạng:
       1. ```tool_call / ```function_call / ```tool_code / ```json  ... ```
-      2. <tool_call> ... </tool_call>  (XML-style Qwen thỉnh thoảng sinh ra)
+      2. <tool_call>{"name":...}</tool_call>  (XML tag bọc JSON)
+      3. <tool_call><function=name><parameter=key>val</parameter></function></tool_call>
+         (XML function/parameter — Qwen-Agent style)
+
+    Mỗi block có thể chứa NHIỀU JSON object hoặc NHIỀU <function> liên tiếp:
+    parser gom hết tất cả rồi yield từng item riêng lẻ, giữ nguyên
+    span [block_start, block_end] chung cho tất cả item trong block.
     """
     dec = json.JSONDecoder(strict=False)
 
@@ -389,34 +448,166 @@ def _iter_blocks(text):
     for cand in candidates:
         if cand.start < consumed_up_to:
             continue  # nằm trong block đã xử lý trước
-        j = cand.end_open
-        while j < len(text) and text[j] in " \t\r\n":
-            j += 1
-        try:
-            data, end = dec.raw_decode(text, j)
-            if cand.is_xml:
-                c = _XML_TAG_CLOSE.match(text, end)
-            else:
-                c = _FENCE_CLOSE.match(text, end)
-            if c:
-                end = c.end()
-            yield cand.start, end, data, cand.kind
-            consumed_up_to = end
-        except ValueError:
-            # Không raw_decode được JSON chuẩn: tìm đến thẻ đóng và thử parse linh hoạt
-            if cand.is_xml:
-                close = _XML_TAG_CLOSE.search(text, cand.end_open)
-                close_start = close.start() if close else len(text)
-                close_end = close.end() if close else len(text)
-            else:
+
+        # --- Với XML: thử JSON trước (trên full text), XML function/parameter sau ---
+        if cand.is_xml:
+            # Tìm close tag để biết biên block; raw_block chỉ dùng cho XML-function path.
+            close_m = _XML_TAG_CLOSE.search(text, cand.end_open)
+            block_end = close_m.end() if close_m else len(text)
+            raw_block = text[cand.end_open:(close_m.start() if close_m else len(text))]
+
+            # --- Nhánh A: thử decode JSON trực tiếp trên full text (không slice) ---
+            # Dùng raw_decode trên `text` thay vì `raw_block` để ``` và </tool_call>
+            # nằm trong chuỗi JSON không làm sai biên (giống nhánh fence).
+            j = cand.end_open
+            while j < len(text) and text[j] in " \t\r\n":
+                j += 1
+
+            any_decoded = False
+            if j < len(text) and text[j] == "{":
+                # Chỉ thử JSON khi ký tự đầu trông như JSON object
+                _j = j
+                while _j < len(text):
+                    while _j < len(text) and text[_j] in " \t\r\n":
+                        _j += 1
+                    if _j >= len(text):
+                        break
+                    try:
+                        data, rel_end = dec.raw_decode(text, _j)
+                    except ValueError:
+                        # Phần còn lại không decode được → thử lenient trên phần đó
+                        # (chỉ khi đã lấy được ít nhất 1 object trước đó)
+                        if any_decoded:
+                            end_of_block = close_m.start() if close_m else len(text)
+                            remainder = text[_j:end_of_block].strip()
+                            if remainder:
+                                data = _parse_lenient_json(remainder)
+                                yield cand.start, block_end, data, cand.kind
+                        break
+                    # Kiểm tra close tag ngay sau JSON object
+                    close_after = _XML_TAG_CLOSE.match(text, rel_end)
+                    if close_after:
+                        # Tìm thấy </tool_call> thật ngay sau JSON → đây là biên thực
+                        this_block_end = close_after.end()
+                        block_end = this_block_end
+                        yield cand.start, block_end, data, cand.kind
+                        any_decoded = True
+                        break
+                    # Chưa gặp close tag → còn JSON tiếp theo, nhưng kiểm tra không
+                    # vượt quá block đã biết
+                    end_of_block = close_m.start() if close_m else len(text)
+                    if rel_end > end_of_block:
+                        # rel_end đã vượt biên block → chấp nhận data, dừng
+                        yield cand.start, block_end, data, cand.kind
+                        any_decoded = True
+                        break
+                    yield cand.start, block_end, data, cand.kind
+                    any_decoded = True
+                    _j = rel_end
+
+            # --- Nhánh B: XML function/parameter (Qwen-Agent style) ---
+            # Chỉ thử khi JSON không decode được — tránh false-positive khi
+            # <function=...> xuất hiện bên trong chuỗi JSON.
+            if not any_decoded and _XML_FUNC_OPEN.search(raw_block):
+                xml_calls = _parse_xml_function_block(raw_block)
+                if xml_calls:
+                    for item in xml_calls:
+                        yield cand.start, block_end, item, cand.kind
+                    consumed_up_to = block_end
+                    continue
+                # Không tìm thấy <function> hợp lệ → fall through sang lenient JSON
+
+            # --- Nhánh C: fallback lenient JSON (khi cả hai nhánh trên thất bại) ---
+            if not any_decoded:
+                data = _parse_lenient_json(raw_block)
+                yield cand.start, block_end, data, cand.kind
+
+            consumed_up_to = block_end
+
+        else:
+            # --- Fence block: dùng raw_decode trên toàn `text` để ``` trong
+            # chuỗi JSON không bị hiểu nhầm là thẻ đóng. ---
+            j = cand.end_open
+            while j < len(text) and text[j] in " \t\r\n":
+                j += 1
+
+            any_decoded = False
+            block_end = None  # xác định sau khi gặp close fence thật
+            # Buffer các object chưa yield (chưa biết block_end xác thực)
+            pending_items = []
+
+            while j <= len(text):
+                while j < len(text) and text[j] in " \t\r\n":
+                    j += 1
+                if j >= len(text):
+                    break
+
+                # Nếu đã biết block_end và j vượt qua → dừng
+                if block_end is not None and j >= block_end:
+                    break
+
+                try:
+                    data, rel_end = dec.raw_decode(text, j)
+                except ValueError:
+                    # JSON decode thất bại — thử lenient cho phần còn lại nếu
+                    # đã lấy được ít nhất 1 object (Bug C fix).
+                    if any_decoded:
+                        # Tìm close fence để xác định biên
+                        peek = _FENCE_CLOSE.search(text, j)
+                        end_of_fence = peek.start() if peek else len(text)
+                        remainder = text[j:end_of_fence].strip()
+                        this_block_end = peek.end() if peek else len(text)
+                        block_end = block_end or this_block_end
+                        if remainder:
+                            ldata = _parse_lenient_json(remainder)
+                            pending_items.append((cand.start, ldata, cand.kind))
+                        # Flush pending với block_end đã biết
+                        for _ps, _pd, _pk in pending_items:
+                            yield _ps, block_end, _pd, _pk
+                        pending_items = []
+                    break
+
+                # Kiểm tra close fence NGAY SAU JSON (dùng match, không search —
+                # search sẽ trúng ``` bên trong chuỗi JSON tiếp theo → Bug B).
+                close_m = _FENCE_CLOSE.match(text, rel_end)
+                if close_m:
+                    this_block_end = close_m.end()
+                    block_end = this_block_end
+                    # Flush tất cả object pending trước, rồi yield object này
+                    for _ps, _pd, _pk in pending_items:
+                        yield _ps, block_end, _pd, _pk
+                    pending_items = []
+                    yield cand.start, block_end, data, cand.kind
+                    any_decoded = True
+                    j = this_block_end
+                    break
+                else:
+                    # Chưa gặp close fence ngay sau → còn JSON tiếp theo.
+                    # Giữ trong pending, block_end sẽ cập nhật khi gặp close thật.
+                    pending_items.append((cand.start, data, cand.kind))
+                    any_decoded = True
+                    j = rel_end
+
+            # Nếu còn pending mà chưa flush (unclosed fence / EOF)
+            if pending_items:
+                block_end = block_end or len(text)
+                for _ps, _pd, _pk in pending_items:
+                    yield _ps, block_end, _pd, _pk
+                pending_items = []
+
+            if not any_decoded:
+                # JSON decode thất bại hoàn toàn → thử parse linh hoạt
                 close_idx = text.find("```", cand.end_open)
                 close_start = close_idx if close_idx != -1 else len(text)
                 close_end = (close_idx + 3) if close_idx != -1 else len(text)
+                raw_fallback = text[cand.end_open:close_start]
+                data = _parse_lenient_json(raw_fallback)
+                yield cand.start, close_end, data, cand.kind
+                block_end = close_end
 
-            raw_block = text[cand.end_open:close_start]
-            data = _parse_lenient_json(raw_block)
-            yield cand.start, close_end, data, cand.kind
-            consumed_up_to = close_end
+            consumed_up_to = block_end or len(text)
+
+
 
 
 def _normalize_name(name, allowed):
@@ -489,6 +680,8 @@ def _args_json(args):
 def parse_tool_calls(text, allowed_names=None, tool_schemas=None):
     """Returns (clean_text, tool_calls, dropped_reasons)."""
     calls, dropped, clean_parts, last_end = [], [], [], 0
+    # prev_block_start: theo dõi để tránh chèn prose giữa các item trong cùng block
+    prev_block_start = -1
     for start, end, data, kind in _iter_blocks(text or ""):
         if kind == "json":
             if (not isinstance(data, dict) or not allowed_names
@@ -501,7 +694,10 @@ def parse_tool_calls(text, allowed_names=None, tool_schemas=None):
                 continue
         else:
             line_start = text.rfind("\n", 0, start) + 1
-            if text[line_start:start].strip():
+            # Bỏ qua các thẻ XML đóng như </tool_call> trước block tiếp theo
+            # (không phải prose thực sự, không được coi là mid-sentence)
+            prefix = re.sub(r"</?\w[\w:.-]*(?:\s[^>]*)?>", "", text[line_start:start]).strip()
+            if prefix:
                 continue  # quoted mid-sentence: explanation, not a call
         parsed, reason = None, ""
         if isinstance(data, dict):
@@ -549,7 +745,11 @@ def parse_tool_calls(text, allowed_names=None, tool_schemas=None):
             dropped.append(reason)
             log(f"Dropping tool_call block: {reason}: {text[start:end][:200]}")
             continue
-        clean_parts.append(text[last_end:start])
+        # Chỉ cắt prose trước block lần đầu gặp block này;
+        # các item tiếp theo trong cùng block (cùng start) không chèn thêm text.
+        if start != prev_block_start:
+            clean_parts.append(text[last_end:start])
+            prev_block_start = start
         last_end = end
         calls.append(parsed)
     clean_parts.append(text[last_end:])
@@ -584,9 +784,13 @@ _MISS_RE = re.compile(
 def looks_like_missed_tool_call(text) -> bool:
     if not text or len(text) >= 1200:
         return False
+    tl = text.lower()
     if ("```tool_call" in text or "```function_call" in text
-            or "<tool_call>" in text.lower()):
+            or "<tool_call>" in tl):
         return False
+    # <function=...> standalone (không có <tool_call>) vẫn cần nudge vì
+    # _iter_blocks không parse được dạng thiếu wrapper → retry có ích.
+    # Chỉ suppress khi <function=...> đi kèm <tool_call> (đã handled trên).
     return bool(_MISS_RE.search(text))
 
 
