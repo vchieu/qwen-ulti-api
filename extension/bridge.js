@@ -636,7 +636,24 @@
     } catch (e) { return "?"; }
   }
 
+  // Nut that su bat click cua dropdown che do (DOM Qwen):
+  // .qwen-thinking-selector > .qwen-chat-v2-dropdown-menu > -trigger > -select
+  // (.qwen-thinking-selector chi la wrapper; "selector" chua "select" nen de bi
+  //  heuristic cu chon nham wrapper -> click khong mo menu.)
+  function modeSelectButton() {
+    let nodes = Array.from(document.querySelectorAll(
+      ".qwen-thinking-selector .qwen-chat-v2-dropdown-menu-select"));
+    if (!nodes.length) {
+      nodes = Array.from(document.querySelectorAll(
+        ".qwen-chat-v2-dropdown-menu-select, .qwen-chat-v2-dropdown-menu-select-button"));
+    }
+    return nodes.find((el) => visible(el)
+      && MODE_LABELS.includes(normLabel(visibleText(el).replace(/\s+/g, " ")))) || null;
+  }
+
   function findModeTrigger() {
+    const direct = modeSelectButton();
+    if (direct) return direct;
     const comps = findComposers();
     const root = comps.length ? (comps[0].closest("form") || comps[0].parentElement) : null;
     const nodes = Array.from(document.querySelectorAll(
@@ -654,13 +671,31 @@
       if (el.getAttribute("aria-haspopup") || el.hasAttribute("aria-expanded")) score += 2;
       if (root && root.contains(el)) score += 3;
       if (el.querySelectorAll("*").length > 12) score -= 2;
+      // Uu tien phan tu sau nhat (wrapper khong phai nut bam).
+      if (Array.from(el.querySelectorAll("*")).some((c) => MODE_LABELS.includes(normLabel(visibleText(c))))) {
+        score -= 4;
+      }
       if (score > bestScore) { best = el; bestScore = score; }
     }
     return best;
   }
 
   function modeMenuItems() {
-    return Array.from(document.querySelectorAll('[role="menuitem"]')).filter(visible);
+    const sel = '[role="menuitem"], [role="menuitemradio"], .qwen-chat-v2-dropdown-menu-item';
+    const out = [];
+    for (const it of document.querySelectorAll(sel)) {
+      if (visible(it) && !out.includes(it)) out.push(it);
+    }
+    return out;
+  }
+
+  function modeMenuDiag() {
+    try {
+      const menus = Array.from(document.querySelectorAll(
+        '[role="menu"], .qwen-chat-v2-dropdown-menu-popup')).filter(visible).length;
+      return "menus=" + menus + " items=["
+        + modeMenuItems().map(modeItemLabel).join(",") + "]";
+    } catch (e) { return "mode-diag-error:" + ((e && e.message) || e); }
   }
 
   function modeItemLabel(it) {
@@ -685,7 +720,11 @@
   async function selectThinkingMode(job) {
     try {
       const want = String((job && job.mode) || "").toLowerCase();
-      if (!want || !MODE_LABELS.includes(want) || selectModeEnabled === false) return true;
+      if (!want || !MODE_LABELS.includes(want) || selectModeEnabled === false) {
+        fwd(job, "debug", "bo qua chon mode (job.mode='" + ((job && job.mode) || "")
+          + "' select_mode=" + selectModeEnabled + ")");
+        return true;
+      }
       let trig = null;
       for (let i = 0; i < 4 && !trig; i++) {
         trig = findModeTrigger();
@@ -702,10 +741,24 @@
         return true;
       }
       clickModeEl(trig);
-      await sleep(500);
-      const item = modeMenuItems().find((it) => modeItemLabel(it) === want);
+      let items = [];
+      const tOpen = Date.now();
+      while (Date.now() - tOpen < 2500) {
+        await sleep(150);
+        items = modeMenuItems();
+        if (items.length) break;
+      }
+      if (!items.length) {
+        await closeModeMenu(trig);
+        fwd(job, "warn", "menu che do khong mo sau khi click nut (" + modeMenuDiag()
+          + "; trigger=<div class='" + String(trig.className || "").slice(0, 40)
+          + "' label='" + triggerLabel(trig) + "'>)");
+        return false;
+      }
+      const have = items.map(modeItemLabel).join(",");
+      fwd(job, "debug", "mode menu mo (" + have + ")");
+      const item = items.find((it) => modeItemLabel(it) === want);
       if (!item) {
-        const have = modeMenuItems().map(modeItemLabel).join(",");
         await closeModeMenu(trig);
         fwd(job, "warn", "khong thay muc '" + want + "' trong menu che do (menu: [" + have + "])");
         return false;
@@ -714,9 +767,12 @@
       let after = "";
       const t0 = Date.now();
       while (Date.now() - t0 < 2000) {
-        await sleep(200);
+        await sleep(150);
         after = modeLabelOf(trig);
         if (after === want) break;
+        const sel = modeMenuItems().find((it) =>
+          /dropdown-menu-item-selected/.test(String(it.className || "")));
+        if (sel && modeItemLabel(sel) === want) { after = want; break; }
       }
       await closeModeMenu(trig);
       if (after === want) {
@@ -2079,6 +2135,7 @@
           const job = {
             id: r.job.job_id,
             model: r.job.model,
+            mode: r.job.mode,          /* qwen_fix_patch7:mode-map — truoc day bi bo sot */
             prompt: r.job.prompt,
             think: r.job.think,
             file_info: r.job.file_info,

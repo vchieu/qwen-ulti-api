@@ -54,6 +54,13 @@ Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` →
 - `bridge_select_mode` (default `true`, `qwen_fix_patch7`): chọn chế độ Thinking/Auto/Fast ở dropdown
   cạnh ô prompt theo `reasoning_effort` (none/minimal/low → Fast, medium → Auto, high/xhigh/max →
   Thinking; không gửi → không chạm UI; `model@think=1/0` → Thinking/Fast khi không có effort).
+  Job do `/poll` trả về có key `mode`; vòng poll của extension phải copy `mode` vào object `job`
+  (từng bị bỏ sót → `selectThinkingMode` im lặng bỏ qua, log không có dòng mode nào). Khi bỏ qua
+  chọn mode, extension gửi `debug` `bo qua chon mode (job.mode=... select_mode=...)`.
+  Nút thật sự bắt click là `.qwen-chat-v2-dropdown-menu-select` (deeper trong
+  `.qwen-thinking-selector`); wrapper `.qwen-thinking-selector` từng bị heuristic chọn nhầm vì
+  class chứa chuỗi `select` → click wrapper không mở menu. Menu mở bằng click thường; code poll
+  item `role="menuitem"` / `.qwen-chat-v2-dropdown-menu-item` tới ~2.5s rồi mới báo lỗi.
 - `bridge_force_request_model` (default `false`, thử nghiệm): extension ghi đè `model`/`models` trong
   body completion bằng model của job (chỉ id hợp lệ) — không phụ thuộc dropdown/tab đang ẩn.
 - `prompt_max_bytes` (default `0` = không cắt; trước đây 262144). `file_prompt_max_chars` (tùy chọn,
