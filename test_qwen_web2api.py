@@ -66,11 +66,16 @@ class _Sandbox(unittest.TestCase):
             "_jobs": bridge._jobs,
             "_pending": bridge._pending,
             "_models": list(bridge._models),
+            # qwen_findings_patch1
+            "_cancelled": bridge._cancelled.copy(),
+            "_managed_jobs": bridge._managed_jobs.copy(),
         }
         self._recent_log_snapshot = list(qwen._recent_log)
         CONFIG["log_requests"] = False
         CONFIG["retry_attempts"] = 1
         CONFIG["retry_delay_sec"] = 0
+        bridge._cancelled.clear()      # qwen_findings_patch1
+        bridge._managed_jobs.clear()   # qwen_findings_patch1
 
     def tearDown(self):
         CONFIG.clear()
@@ -380,8 +385,25 @@ class TestToolsParsing(_Sandbox):
                          {"q": "x"})
 
     def test_unusable_arguments_degrade_to_empty_object(self):
-        text = ('```tool_call\n{"name": "f", "arguments": "not json"}\n```')
+        """qwen_findings_patch1 (finding 6): arguments hong -> TU CHOI call."""
+        text = '```tool_call\n{"name": "f", "arguments": "not json"}\n```'
+        clean, calls, dropped = tools.parse_tool_calls(text, {"f"}, None)
+        self.assertEqual(calls, [])
+        self.assertEqual(dropped, ["unusable arguments (not a JSON object)"])
+        self.assertIn("```tool_call", clean)
+
+    def test_unusable_arguments_legacy_mode_keeps_empty_object(self):
+        """tool_reject_bad_arguments=false -> hanh vi cu ({})."""
+        CONFIG["tool_reject_bad_arguments"] = False
+        text = '```tool_call\n{"name": "f", "arguments": "not json"}\n```'
         _c, calls, dropped = tools.parse_tool_calls(text, {"f"}, None)
+        self.assertEqual(dropped, [])
+        self.assertEqual(calls[0]["function"]["arguments"], "{}")
+
+    def test_no_param_tool_accepts_missing_arguments(self):
+        """Tool khong co tham so: arguments null van hop le."""
+        text = '```tool_call\n{"name": "f", "arguments": null}\n```'
+        _c, calls, dropped = tools.parse_tool_calls(text, {"f"}, {"f": set()})
         self.assertEqual(dropped, [])
         self.assertEqual(calls[0]["function"]["arguments"], "{}")
 
@@ -1141,7 +1163,8 @@ class TestBridgeHttp(_Sandbox):
         self.assertEqual(json.loads(body), {"job": None})
 
     def test_event_handles_tab_reloaded_warning(self):
-        # Gui event canh bao tab reload ma khong co active job van thanh cong va duoc ghi log
+        # qwen_findings_patch1: orphan event them stale/cancelled de extension
+        # biet phai dung UI (finding 2/8/9).
         status, body = self._req("POST", "/event", body={
             "job_id": "job_reloaded",
             "kind": "warn",
@@ -1150,7 +1173,9 @@ class TestBridgeHttp(_Sandbox):
             "message": "Browser/Tab da tu reload khi dang xu ly job"
         })
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body), {"ok": True})
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertTrue(data["stale"])
 
     def test_event_handles_none_job_id_warning(self):
         status, body = self._req("POST", "/event", body={
@@ -1159,7 +1184,9 @@ class TestBridgeHttp(_Sandbox):
             "message": "model refresh fail: connection error"
         })
         self.assertEqual(status, 200)
-        self.assertEqual(json.loads(body), {"ok": True})
+        data = json.loads(body)
+        self.assertTrue(data["ok"])
+        self.assertTrue(data["stale"])
 
     def test_event_routes_to_job_queue(self):
         q = queue.Queue()
@@ -1414,8 +1441,8 @@ class TestServerHelpers(_Sandbox):
             server._remove_prompt_file(file_info)
 
     def test_prepare_large_prompt_history_file_fits_paste_limit(self):
-        # Qwen khong chuyen paste > 131072 ky tu thanh file: file lich su phai bi
-        # cat (giu tin moi nhat) de <= FILE_MAX_CHARS.
+        """qwen_findings_patch1: cat chi xay ra khi file_prompt_truncate=true."""
+        CONFIG["file_prompt_truncate"] = True
         msgs = [{"role": "system", "content": "SYS"}]
         msgs += [{"role": "user" if i % 2 == 0 else "assistant",
                   "content": f"m{i:02d}-" + "x" * 300} for i in range(20)]
@@ -2039,6 +2066,255 @@ class TestUiModeAndModelList(_Sandbox):
         for bad in ("abc", 0, -5, None):
             CONFIG["file_prompt_max_chars"] = bad
             self.assertEqual(server._file_max_chars(), server.FILE_MAX_CHARS)
+
+
+# --- qwen_findings_patch1: regression tests -------------------------------
+class TestFindingsPatch1(_Sandbox):
+    def test_no_attachment_prompt_without_file(self):
+        """finding 3: khong co file -> khong duoc co cau fallback."""
+        pending = _fake_pending([{"kind": "delta", "text": "ok"},
+                                 {"kind": "done"}])
+        with mock.patch.object(bridge, "worker_alive", return_value=True), \
+                mock.patch.object(bridge, "_pending", pending):
+            list(bridge.generate_stream("hi", "m", False))
+        self.assertEqual(pending.jobs[0]["attachment_prompt"], "")
+
+    def test_client_gone_before_queue_raises_499(self):
+        """finding 1: khong queue job khi client da di."""
+        ev = threading.Event()
+        ev.set()
+        pending = _fake_pending([{"kind": "done"}])
+        with mock.patch.object(bridge, "worker_alive", return_value=True), \
+                mock.patch.object(bridge, "_pending", pending):
+            with self.assertRaises(qwen.QwenError) as ctx:
+                list(bridge.generate_stream("hi", "m", False, cancel_event=ev))
+        self.assertEqual(ctx.exception.status, 499)
+        self.assertEqual(pending.jobs, [])
+
+    def test_cancel_event_stops_retry(self):
+        """finding 1: khong retry job da bi huy."""
+        CONFIG["retry_attempts"] = 3
+        ev = threading.Event()
+        pending = _fake_pending([{"kind": "error", "message": "boom"}])
+        orig_put = pending.put
+
+        def put(job):
+            orig_put(job)
+            ev.set()
+
+        pending.put = put
+        with mock.patch.object(bridge, "worker_alive", return_value=True), \
+                mock.patch.object(bridge, "_pending", pending):
+            with self.assertRaises(qwen.QwenError):
+                list(bridge.generate_stream("hi", "m", False, cancel_event=ev))
+        self.assertEqual(len(pending.jobs), 1)
+        self.assertTrue(bridge.job_cancelled(pending.jobs[0]["job_id"]))
+
+    def test_cancel_job_wakes_caller(self):
+        pending = _fake_pending([{"kind": "delta", "text": "a"}])
+        orig_put = pending.put
+
+        def put(job):
+            orig_put(job)
+            bridge.cancel_job(job["job_id"], "test")
+
+        pending.put = put
+        with mock.patch.object(bridge, "worker_alive", return_value=True), \
+                mock.patch.object(bridge, "_pending", pending):
+            with self.assertRaises(qwen.QwenError) as ctx:
+                list(bridge.generate_stream("hi", "m", False))
+        self.assertEqual(ctx.exception.status, 499)
+
+    def test_warn_model_mismatch_strict(self):
+        """finding 4: require_model=true -> loi + retry."""
+        CONFIG["bridge_require_model"] = True
+        pending = _fake_pending([
+            {"kind": "warn", "model_mismatch": True, "message": "picker loi"},
+            {"kind": "delta", "text": "ok"}, {"kind": "done"}])
+        with mock.patch.object(bridge, "worker_alive", return_value=True), \
+                mock.patch.object(bridge, "_pending", pending):
+            with self.assertRaises(qwen.QwenError) as ctx:
+                list(bridge.generate_stream("hi", "qwen3.8-max", False))
+        self.assertEqual(ctx.exception.status, 502)
+
+    def test_warn_mode_mismatch_lenient_by_default(self):
+        pending = _fake_pending([
+            {"kind": "warn", "mode_mismatch": True, "message": "mode loi"},
+            {"kind": "delta", "text": "ok"}, {"kind": "done"}])
+        with mock.patch.object(bridge, "worker_alive", return_value=True), \
+                mock.patch.object(bridge, "_pending", pending):
+            out = list(bridge.generate_stream("hi", "m", False))
+        self.assertEqual(out, [("content", "ok")])
+
+    def test_unusable_arguments_are_dropped(self):
+        """finding 6."""
+        text = '```tool_call\n{"name": "f", "arguments": "{oops"}\n```'
+        _c, calls, dropped = tools.parse_tool_calls(text, {"f"}, {"f": {"q"}})
+        self.assertEqual(calls, [])
+        self.assertTrue(dropped and dropped[0].startswith("unusable arguments"))
+
+    def test_run_turn_retries_unusable_arguments(self):
+        """finding 6: server phai nudge lai thay vi tra call {}."""
+        h = _bare_handler()
+        bad = '```tool_call\n{"name": "f", "arguments": "khong phai json"}\n```'
+        good = '```tool_call\n{"name": "f", "arguments": {"q": "x"}}\n```'
+        results = [{"content": bad, "reasoning": "", "usage": {}},
+                   {"content": good, "reasoning": "", "usage": {}}]
+        with mock.patch.object(bridge, "generate", side_effect=results) as gen:
+            _t, _r, calls, _u = h._run_turn(
+                "p", "m", False, True, {"f"}, {"f": {"q"}}, None, False)
+        self.assertEqual(gen.call_count, 2)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("unusable", gen.call_args_list[1][0][0])
+
+    def test_native_concatenated_arguments_are_split(self):
+        """finding 7 (mitigation): 2 arguments dinh nhau -> 2 call."""
+        pending = _fake_pending([
+            {"kind": "tool_call", "name": "read_file",
+             "arguments": '{"path": "a.py"}{"path": "b.py"}'},
+            {"kind": "done"}])
+        with mock.patch.object(bridge, "worker_alive", return_value=True), \
+                mock.patch.object(bridge, "_pending", pending):
+            out = list(bridge.generate_stream("# Tool Use\n...", "m", False))
+        text = "".join(t for _k, t in out)
+        _c, calls, dropped = tools.parse_tool_calls(
+            text, {"read_file"}, {"read_file": {"path"}})
+        self.assertEqual(dropped, [])
+        self.assertEqual(
+            [json.loads(c["function"]["arguments"])["path"] for c in calls],
+            ["a.py", "b.py"])
+
+    def test_native_split_parts_with_same_id_are_kept(self):
+        """finding 7: part tach tu 1 native call giu cung id nhung khac
+        arguments -> khong bi dedupe nham."""
+        pending = _fake_pending([
+            {"kind": "tool_call", "name": "read_file", "id": "call_1",
+             "arguments": '{"path": "a.py"}'},
+            {"kind": "tool_call", "name": "read_file", "id": "call_1",
+             "arguments": '{"path": "b.py"}'},
+            {"kind": "tool_call", "name": "read_file", "id": "call_1",
+             "arguments": '{"path": "a.py"}'},
+            {"kind": "done"}])
+        with mock.patch.object(bridge, "worker_alive", return_value=True), \
+                mock.patch.object(bridge, "_pending", pending):
+            out = list(bridge.generate_stream("# Tool Use\n...", "m", False))
+        text = "".join(t for _k, t in out)
+        _c, calls, dropped = tools.parse_tool_calls(
+            text, {"read_file"}, {"read_file": {"path"}})
+        self.assertEqual(dropped, [])
+        self.assertEqual(
+            [json.loads(c["function"]["arguments"])["path"] for c in calls],
+            ["a.py", "b.py"])
+    def test_large_prompt_keeps_full_content_by_default(self):
+        """finding 5: khong cat file prompt."""
+        msgs = [{"role": "user", "content": "HEAD" + "x" * 3000},
+                {"role": "user", "content": "tail question"}]
+        with mock.patch.object(server, "MAX_PROMPT_CHARS", 1000), \
+                mock.patch.object(server, "FILE_MAX_CHARS", 2000):
+            fi, _short = server.prepare_large_prompt(msgs)
+        try:
+            with open(fi["path"], encoding="utf-8") as f:
+                content = f.read()
+            self.assertNotIn("[...truncated...]", content)
+            self.assertGreater(len(content), 2000)
+            self.assertTrue(fi["over_paste_limit"])
+        finally:
+            server._remove_prompt_file(fi)
+
+    def test_prompt_hard_limit_raises_413(self):
+        """finding 5: vuot hard limit -> bao loi, khong cat."""
+        CONFIG["prompt_hard_max_chars"] = 100
+        with self.assertRaises(qwen.QwenError) as ctx:
+            server.prepare_large_prompt([{"role": "user",
+                                          "content": "y" * 200}])
+        self.assertEqual(ctx.exception.status, 413)
+
+
+class TestFindingsPatch1Http(_Sandbox):
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = bridge._Server(("127.0.0.1", 0), bridge._Handler)
+        cls.port = cls.srv.server_address[1]
+        cls.thread = threading.Thread(target=cls.srv.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+        cls.thread.join(2)
+
+    def _req(self, method, path, body=None):
+        conn = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        headers = {"Origin": "chrome-extension://x"}
+        payload = None
+        if body is not None:
+            payload = json.dumps(body).encode()
+            headers["Content-Type"] = "application/json"
+        try:
+            conn.request(method, path, body=payload, headers=headers)
+            r = conn.getresponse()
+            return r.status, json.loads(r.read() or b"{}")
+        finally:
+            conn.close()
+
+    def test_cancel_then_alive_and_requeue(self):
+        jid = "patch1_live"
+        bridge._jobs[jid] = queue.Queue()
+        st, data = self._req("GET", "/alive?job_id=" + jid)
+        self.assertEqual(st, 200)
+        self.assertTrue(data["alive"])
+        st, data = self._req("POST", "/cancel", {"job_id": jid})
+        self.assertEqual(st, 200)
+        self.assertTrue(data["ok"])
+        st, data = self._req("GET", "/alive?job_id=" + jid)
+        self.assertFalse(data["alive"])
+        self.assertTrue(data["cancelled"])
+        st, data = self._req("POST", "/requeue",
+                             {"job": {"job_id": jid, "managed": True}})
+        self.assertEqual(st, 409)
+        self.assertFalse(data["ok"])
+
+    def test_requeue_refuses_dead_managed_job(self):
+        bridge._managed_jobs["patch1_dead"] = time.time()
+        st, data = self._req("POST", "/requeue",
+                             {"job": {"job_id": "patch1_dead",
+                                      "managed": True}})
+        self.assertEqual(st, 409)
+        self.assertTrue(data["cancelled"])
+
+    def test_requeue_cap(self):
+        CONFIG["bridge_max_requeues"] = 1
+        jid = "patch1_cap"
+        bridge._jobs[jid] = queue.Queue()
+        st, _d = self._req("POST", "/requeue", {"job": {"job_id": jid}})
+        self.assertEqual(st, 200)
+        st, _d = self._req("POST", "/requeue",
+                           {"job": {"job_id": jid, "requeues": 1}})
+        self.assertEqual(st, 409)
+
+    def test_poll_skips_cancelled_job(self):
+        CONFIG["bridge_poll_wait"] = 0.05
+        bridge._pending.put({"job_id": "patch1_c", "ts": time.time()})
+        bridge.cancel_job("patch1_c")
+        st, data = self._req("POST", "/poll", {})
+        self.assertEqual(st, 200)
+        self.assertIsNone(data["job"])
+
+    def test_event_marks_stale_for_dead_job(self):
+        st, data = self._req("POST", "/event",
+                             {"job_id": "patch1_none", "kind": "delta",
+                              "text": "x"})
+        self.assertEqual(st, 200)
+        self.assertTrue(data["ok"])
+        self.assertTrue(data["stale"])
+
+    def test_status_exposes_require_flags(self):
+        st, data = self._req("GET", "/status")
+        self.assertEqual(st, 200)
+        self.assertIn("require_model", data)
+        self.assertIn("require_mode", data)
+        self.assertFalse(data["require_model"])
 
 
 if __name__ == "__main__":

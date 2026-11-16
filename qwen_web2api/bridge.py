@@ -43,6 +43,91 @@ def _debug_log(msg):
         _log("[debug] " + msg)
 
 
+# --- qwen_findings_patch1: finding 1 -------------------------------------
+# Truoc day client ngat ket noi chi xoa _jobs[jid]; extension van dang giu
+# job va /requeue (khong kiem tra gi) co the hoi sinh job da chet -> prompt
+# cu tu duoc go lai vao UI. Registry nay cho huy job xuyen suot.
+_cancelled = collections.OrderedDict()      # job_id -> ts bi huy
+_managed_jobs = collections.OrderedDict()   # job_id -> ts queue (job Python tao)
+_CANCEL_TTL = 900.0
+_CANCEL_MAX = 4096
+
+
+def _as_num(v, default):
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _prune_job_registry(now=None):
+    now = time.time() if now is None else now
+    with _lock:
+        for reg in (_cancelled, _managed_jobs):
+            for jid in list(reg):
+                if now - reg[jid] > _CANCEL_TTL:
+                    reg.pop(jid, None)
+            while len(reg) > _CANCEL_MAX:
+                reg.popitem(last=False)
+
+
+def job_cancelled(jid):
+    with _lock:
+        return jid in _cancelled
+
+
+def job_alive(jid):
+    """Job con song = caller con cho (_jobs) VA chua bi huy."""
+    with _lock:
+        return jid in _jobs and jid not in _cancelled
+
+
+def cancel_job(jid, reason="client disconnected"):
+    """Huy job: danh dau + tha caller + de extension biet qua /alive, /event."""
+    if not isinstance(jid, str) or not jid.strip():
+        return False
+    jid = jid.strip()
+    with _lock:
+        _cancelled[jid] = time.time()
+        q = _jobs.pop(jid, None)
+    if q is not None:
+        try:
+            q.put_nowait({"kind": "error", "cancelled": True,
+                          "message": "job cancelled: " + str(reason)})
+        except Exception:
+            pass
+    _prune_job_registry()
+    _log(f"cancelled job {jid} ({reason})")
+    return True
+
+
+def _native_fence(name, args, call_id=None):
+    obj = {"name": name, "arguments": args}
+    if call_id:
+        obj["id"] = str(call_id)
+    return "\n```tool_call\n" + json.dumps(obj, ensure_ascii=False) + "\n```\n"
+
+
+def _split_json_objects(s):
+    """finding 7: tach nhieu JSON object lien tiep trong 1 chuoi arguments.
+    Tra ve [] neu khong tach duoc >= 2 object (de tools.py tu choi call)."""
+    dec = json.JSONDecoder(strict=False)
+    out, i, n = [], 0, len(s)
+    while i < n:
+        while i < n and s[i] in " \t\r\n,":
+            i += 1
+        if i >= n or s[i] != "{":
+            break
+        try:
+            obj, end = dec.raw_decode(s, i)
+        except ValueError:
+            break
+        if not isinstance(obj, dict):
+            break
+        out.append(obj)
+        i = end
+    return out if len(out) > 1 else []
+
 def worker_alive():
     return (time.time() - _last_seen) < float(CONFIG.get("bridge_worker_ttl", 20))
 
@@ -105,6 +190,9 @@ def status():
             "select_model": bool(CONFIG.get("bridge_select_model", True)),
             "select_mode": bool(CONFIG.get("bridge_select_mode", True)),
             "force_model": bool(CONFIG.get("bridge_force_request_model", False)),
+            # qwen_findings_patch1 (finding 4): extension phai doc 2 co nay.
+            "require_model": bool(CONFIG.get("bridge_require_model", False)),
+            "require_mode": bool(CONFIG.get("bridge_require_mode", False)),
             "model_ids": _model_ids(),
             "temporary_reload": bool(CONFIG.get("temporary_chat_reload", True)),
             "captcha_wait": _captcha_wait(),
@@ -142,16 +230,30 @@ class _Tracker:
         return delta
 
 
-def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=None):
+def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=None,
+                    cancel_event=None):
     """Yield (kind, text) -- interface server.py goi cho luong SSE.
 
-    file_info (dict, optional): thông tin file tạm chứa prompt quá dài,
-    bridge.js sẽ upload file này qua UI trước khi gửi message ngắn.
+    qwen_findings_patch1:
+      finding 1 -- cancel_event (threading.Event): client ngat ket noi thi
+      khong queue job moi, khong retry, huy job dang chay (ke ca GeneratorExit).
+      finding 3 -- khong co file dinh kem -> attachment_prompt = "" (khong
+      duoc phep co cau fallback de thay the prompt that cua user).
+      finding 4 -- warn model_mismatch/mode_mismatch + config strict -> loi.
+      finding 6/7 -- arguments hong giu nguyen de tools.py tu choi; chuoi
+      nhieu JSON lien tiep thi tach thanh nhieu fence.
     """
     attempts = max(1, int(CONFIG.get("retry_attempts", 2)))
-    timeout = float(CONFIG.get("bridge_job_timeout", 300))
+    timeout = max(0.05, float(CONFIG.get("bridge_job_timeout", 300)))
     last_err = None
+
+    def _client_gone():
+        return cancel_event is not None and cancel_event.is_set()
+
     for attempt in range(attempts):
+        if _client_gone():
+            raise qwen.QwenError(
+                "browser bridge: client da ngat ket noi, job bi huy", status=499)
         if not worker_alive():
             raise qwen.QwenError(
                 "browser bridge: chua co tab chat.qwen.ai ket noi. Mo "
@@ -160,34 +262,55 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=N
                 f"{CONFIG.get('bridge_port', 8083)}/status", status=503)
         jid = uuid.uuid4().hex
         q = queue.Queue()
+        now = time.time()
         with _lock:
             _jobs[jid] = q
+            _managed_jobs[jid] = now
         if file_info and file_info.get("attachment_prompt"):
-            # Lượt cuối của user được tách riêng ra: dùng prompt (chứa tin nhắn cuối + tool/rf/nudge nếu có)
+            # Luot cuoi cua user tach rieng: dung prompt (tin nhan cuoi + tool/rf).
             att_prompt = str(prompt or file_info["attachment_prompt"])
+        elif file_info:
+            # Fallback: khong dung prompt vi no chua "[Attached file: ...]".
+            att_prompt = str(CONFIG.get("attachment_prompt",
+                                        "Please read the text and action"))
         else:
-            # Fallback (tin nhắn đơn quá dài hoặc không phải user): dùng attachment_prompt cấu hình,
-            # không dùng prompt vì prompt fallback chứa "[Attached file: ...]" dễ khiến model gọi nhầm tool đọc file.
-            att_prompt = str(CONFIG.get("attachment_prompt", "Please read the text and action"))
-        _debug_log(f"queueing job {jid} (model={model}, prompt_len={len(prompt or '')}, file={bool(file_info)})")
+            att_prompt = ""
+        _debug_log(f"queueing job {jid} (model={model}, "
+                   f"prompt_len={len(prompt or '')}, file={bool(file_info)})")
         _pending.put({"job_id": jid, "model": model, "prompt": prompt,
-                      "think": bool(think), "ts": time.time(),
+                      "think": bool(think), "ts": now,
+                      "deadline": now + timeout, "attempt": attempt,
                       "mode": mode if mode in ("auto", "thinking", "fast") else None,
                       "file_info": file_info,
                       "attachment_prompt": att_prompt,
                       "managed": True})
         tracker = _Tracker()
         emitted = False
+        seen_native = set()
+        deadline = time.monotonic() + timeout
         try:
             while True:
-                try:
-                    ev = q.get(timeout=timeout)
-                except queue.Empty:
-                    _log(f"[orphan] job {jid} timed out after {timeout}s without response from browser tab")
+                if _client_gone():
+                    cancel_job(jid, "client disconnected")
                     raise qwen.QwenError(
-                        "browser bridge: tab khong tra ket qua (timeout)",
-                        status=504)
+                        "browser bridge: client da ngat ket noi, job bi huy",
+                        status=499)
+                try:
+                    ev = q.get(timeout=min(1.0, max(0.05, deadline - time.monotonic())))
+                except queue.Empty:
+                    if _client_gone():
+                        continue
+                    if time.monotonic() >= deadline:
+                        cancel_job(jid, "job timeout")
+                        _log(f"[orphan] job {jid} timed out after {timeout}s "
+                             "without response from browser tab")
+                        raise qwen.QwenError(
+                            "browser bridge: tab khong tra ket qua (timeout)",
+                            status=504)
+                    continue
                 kind = ev.get("kind")
+                if ev.get("cancelled"):
+                    raise qwen.QwenError("browser bridge: job da bi huy", status=499)
                 if kind == "delta":
                     text = ev.get("text") or ""
                     k = "reasoning" if ev.get("phase") == "reasoning" else "content"
@@ -197,45 +320,66 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=N
                             emitted = True
                             yield k, d
                 elif kind == "tool_call":
-                    # Native function_call từ Qwen (extension bắt được) ->
-                    # chuyển thành text fence để server.parse_tool_calls xử lý.
                     if "# Tool Use" not in (prompt or ""):
                         continue
                     name = ev.get("name") or ""
+                    if not name:
+                        continue
+                    key = ev.get("id") or ev.get("call_id") or ev.get("index")
+                    if key is not None:
+                        # args trong key: 1 native call bi tach thanh nhieu
+                        # JSON (finding 7) dung chung id nhung arguments khac.
+                        key = (str(name), str(key), str(ev.get("arguments")))
+                        if key in seen_native:
+                            continue
+                        seen_native.add(key)
                     args = ev.get("arguments")
+                    if args is None:
+                        args = {}
                     if isinstance(args, str):
-                        try:
-                            args = json.loads(args, strict=False)
-                        except ValueError:
-                            pass
-                    if not isinstance(args, (dict, str)):
-                        args = "{}"
-                    if isinstance(args, str) and not args.strip():
-                        args = "{}"
-                    if name:
-                        block = json.dumps({"name": name, "arguments": args},
-                                           ensure_ascii=False)
-                        d = tracker.feed("content", f"\n```tool_call\n{block}\n```\n")
-                        if d:
-                            emitted = True
-                            yield "content", d
+                        s = args.strip()
+                        if not s:
+                            args = {}
+                        else:
+                            try:
+                                args = json.loads(s, strict=False)
+                            except ValueError:
+                                parts = _split_json_objects(s)
+                                if len(parts) > 1:
+                                    _debug_log(f"native tool_call '{name}': tach "
+                                               f"{len(parts)} arguments bi gop")
+                                    for p in parts:
+                                        d = tracker.feed(
+                                            "content",
+                                            _native_fence(name, p, ev.get("id")))
+                                        if d:
+                                            emitted = True
+                                            yield "content", d
+                                    continue
+                                args = s
+                    d = tracker.feed("content", _native_fence(name, args, ev.get("id")))
+                    if d:
+                        emitted = True
+                        yield "content", d
                 elif kind == "usage":
                     if usage_out is not None and isinstance(ev.get("usage"), dict):
                         usage_out.update(ev["usage"])
                 elif kind in ("debug", "log"):
                     _debug_log("extension: " + str(ev.get("message") or ""))
                 elif kind == "warn":
-                    # Extension khong lam duoc thu gi do (model picker...) nhung
-                    # request van chay tiep; chi ghi log de debug.
                     _log("extension warn: " + str(ev.get("message") or ""))
                     if ev.get("tab_reloaded"):
-                        # Tab da reload giua job (file paste/upload mat, completion
-                        # khong bao gio toi): fail nhanh de retry thay vi cho het
-                        # bridge_job_timeout. ("tab_reloading" = beforeunload, khi
-                        # tab tu navigate doi mode: chi la canh bao, KHONG fail.)
                         raise qwen.QwenError(
                             "browser bridge: tab reload giua chung job (buoc: "
                             + str(ev.get("stage") or "?") + ")", status=502)
+                    if ev.get("model_mismatch") and CONFIG.get("bridge_require_model"):
+                        raise qwen.QwenError(
+                            "browser bridge: khong chon duoc model yeu cau ("
+                            + str(ev.get("message") or model) + ")", status=502)
+                    if ev.get("mode_mismatch") and CONFIG.get("bridge_require_mode"):
+                        raise qwen.QwenError(
+                            "browser bridge: khong chon duoc che do UI yeu cau ("
+                            + str(ev.get("message") or mode) + ")", status=502)
                 elif kind == "error":
                     raise qwen.QwenError(
                         "browser bridge: " + str(ev.get("message") or "unknown"),
@@ -245,28 +389,48 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=N
                         raise qwen.QwenError(
                             "browser bridge: upstream khong tra ve text nao",
                             status=502)
-                    _debug_log(f"job {jid} completed successfully ({len(tracker.total['content'])} content, {len(tracker.total['reasoning'])} reasoning)")
+                    _debug_log(f"job {jid} completed successfully "
+                               f"({len(tracker.total['content'])} content, "
+                               f"{len(tracker.total['reasoning'])} reasoning)")
                     return
+        except GeneratorExit:
+            # Client dong stream: phai danh dau huy, neu khong extension
+            # /requeue la job chet song lai (finding 1).
+            cancel_job(jid, "caller closed stream")
+            raise
         except Exception as e:
             last_err = e if isinstance(e, qwen.QwenError) else qwen.QwenError(str(e))
+            if getattr(last_err, "status", None) == 499 or _client_gone():
+                cancel_job(jid, "client disconnected")
+                _debug_log(f"job {jid} cancelled, khong retry")
+                raise last_err
             if emitted:
                 _debug_log(f"job {jid} raising after partial stream: {last_err}")
                 raise last_err
             if attempt < attempts - 1:
                 _log(f"retry {attempt + 1}/{attempts}: {last_err}")
-                time.sleep(CONFIG.get("retry_delay_sec", 2))
+                delay = max(0.0, _as_num(CONFIG.get("retry_delay_sec"), 2))
+                if cancel_event is not None:
+                    cancel_event.wait(delay)
+                else:
+                    time.sleep(delay)
         finally:
             with _lock:
                 _jobs.pop(jid, None)
     raise last_err
 
 
-def generate(prompt, model, think, file_info=None, mode=None):
+def generate(prompt, model, think, file_info=None, mode=None, cancel_event=None):
+    """qwen_findings_patch1: nhan cancel_event (finding 1); join bang ""."""
     t0 = time.monotonic()
     usage, content, reasoning = {}, [], []
-    extra = {"mode": mode} if mode else {}
-    for kind, text in generate_stream(prompt, model, think, usage, file_info=file_info,
-                                      **extra):
+    extra = {}
+    if mode:
+        extra["mode"] = mode
+    if cancel_event is not None:
+        extra["cancel_event"] = cancel_event
+    for kind, text in generate_stream(prompt, model, think, usage,
+                                      file_info=file_info, **extra):
         (reasoning if kind == "reasoning" else content).append(text)
     out = {"content": "".join(content), "reasoning": "".join(reasoning),
            "usage": usage}
@@ -337,6 +501,16 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"error": "not found"}, 404)
             return
 
+        # qwen_findings_patch1 (finding 1/2/8/9): extension hoi job con song
+        # khong TRUOC moi thao tac UI. GET /alive?job_id=<jid>
+        if path == "/alive":
+            qs = self.path.split("?", 1)[1] if "?" in self.path else ""
+            jid = ""
+            for pair in qs.split("&"):
+                if pair.startswith("job_id="):
+                    jid = pair[7:]
+            return self._json({"job_id": jid, "alive": job_alive(jid),
+                               "cancelled": job_cancelled(jid)})
         if path == "/status":
             return self._json(status())
         if path == "/debug":
@@ -383,22 +557,58 @@ class _Handler(BaseHTTPRequestHandler):
             data = json.loads(raw or b"{}")
         except ValueError:
             return self._json({"error": "invalid JSON"}, 400)
+        if not isinstance(data, dict):
+            return self._json({"error": "invalid JSON object"}, 400)
         _last_seen = time.time()
-
         if isinstance(data.get("models"), list):
             _remember_models(data["models"])
-
+        # --- qwen_findings_patch1: finding 1 ---
+        if path == "/cancel":
+            jid = data.get("job_id")
+            if not isinstance(jid, str) or not jid.strip():
+                return self._json({"error": "invalid job"}, 400)
+            cancel_job(jid, data.get("reason") or "extension cancel")
+            return self._json({"ok": True, "cancelled": True})
         if path == "/requeue":
             job = data.get("job")
             if not isinstance(job, dict) or not isinstance(job.get("job_id"), str) \
                     or not job["job_id"].strip():
                 return self._json({"error": "invalid job"}, 400)
             job = dict(job)
-            job["ts"] = time.time()
+            jid = job["job_id"].strip()
+            job["job_id"] = jid
+            if job_cancelled(jid):
+                _log(f"refuse requeue: job {jid} da bi huy")
+                return self._json({"ok": False, "cancelled": True,
+                                   "error": "job cancelled"}, 409)
+            with _lock:
+                known = jid in _managed_jobs
+                active = jid in _jobs
+            if (known or job.get("managed")) and not active:
+                _log(f"refuse requeue: job {jid} khong con caller (orphan)")
+                return self._json({"ok": False, "cancelled": True,
+                                   "error": "job no longer active"}, 409)
+            now = time.time()
+            job.setdefault("first_ts", now)
+            rq = _as_num(job.get("requeues"), 0) + 1
+            max_rq = _as_num(CONFIG.get("bridge_max_requeues"), 8)
+            ttl = _as_num(CONFIG.get("bridge_job_timeout"), 300)
+            age = now - _as_num(job.get("first_ts"), now)
+            if max_rq > 0 and rq > max_rq:
+                cancel_job(jid, "too many requeues")
+                return self._json({"ok": False, "cancelled": True,
+                                   "error": "too many requeues"}, 409)
+            if ttl > 0 and age > ttl:
+                cancel_job(jid, "requeue ttl exceeded")
+                return self._json({"ok": False, "cancelled": True,
+                                   "error": "job expired"}, 409)
+            job["requeues"] = int(rq)
+            job["ts"] = now
+            if known:
+                job["managed"] = True
             _pending.put(job)
-            _log(f"requeued job {job['job_id']}")
+            _log(f"requeued job {jid} (#{int(rq)})")
             return self._json({"ok": True})
-
         if path == "/poll":
             worker = data.get("worker", "unknown")
             deadline = time.time() + float(CONFIG.get("bridge_poll_wait", 20))
@@ -406,51 +616,51 @@ class _Handler(BaseHTTPRequestHandler):
             while True:
                 remaining = deadline - time.time()
                 if remaining <= 0:
-                    pass  # poll rong khong log: se lap day recent_log (qwen_fix_patch5:diag)
                     return self._json({"job": None})
                 try:
                     job = _pending.get(timeout=remaining)
                 except queue.Empty:
-                    pass  # poll rong khong log: se lap day recent_log (qwen_fix_patch5:diag)
                     return self._json({"job": None})
-
                 jid = job.get("job_id")
                 age = time.time() - job.get("ts", 0)
                 if age > ttl:
-                    _log(f"[orphan] dropping expired job {jid} (queued {age:.1f}s > ttl {ttl}s)")
+                    _log(f"[orphan] dropping expired job {jid} "
+                         f"(queued {age:.1f}s > ttl {ttl}s)")
                     continue
-
-                if job.get("managed"):
-                    with _lock:
-                        is_active = jid in _jobs
-                    if not is_active:
-                        _log(f"[orphan] dropping orphan job {jid} (caller disconnected or cancelled)")
-                        continue
-
-                _debug_log(f"worker '{worker}' polled job {jid} (model={job.get('model')}, age={age:.1f}s)")
+                with _lock:
+                    is_active = jid in _jobs
+                    is_cancelled = jid in _cancelled
+                if is_cancelled:
+                    _log(f"[orphan] dropping cancelled job {jid}")
+                    continue
+                if job.get("managed") and not is_active:
+                    _log(f"[orphan] dropping orphan job {jid} "
+                         "(caller disconnected or cancelled)")
+                    continue
+                _debug_log(f"worker '{worker}' polled job {jid} "
+                           f"(model={job.get('model')}, age={age:.1f}s)")
                 return self._json({"job": job})
-
         if path == "/event":
             jid = data.get("job_id")
             kind = data.get("kind")
             with _lock:
                 q = _jobs.get(jid)
-            if q is not None:
+                dead = jid in _cancelled
+            if q is not None and not dead:
                 q.put(data)
-            else:
-                # Job khong con trong _jobs (da ket thuc hoac tab reload sau khi job da settled/timed out)
-                if kind not in ("ping",):
-                    msg = data.get("message") or ""
-                    if jid in (None, "", "none"):
-                        _log(f"extension warn: {msg}")
-                    elif data.get("tab_reloaded") or data.get("tab_reloading"):
-                        _log(f"extension warn: {msg}")
-                    elif kind == "warn":
-                        _log(f"extension warn (orphan job {jid}): {msg}")
-                    else:
-                        _debug_log(f"event '{kind}' for unknown/orphan job {jid}: {msg}")
-            return self._json({"ok": True})
-
+                return self._json({"ok": True})
+            if kind not in ("ping",):
+                msg = data.get("message") or ""
+                if jid in (None, "", "none"):
+                    _log(f"extension warn: {msg}")
+                elif data.get("tab_reloaded") or data.get("tab_reloading"):
+                    _log(f"extension warn: {msg}")
+                elif kind == "warn":
+                    _log(f"extension warn (orphan job {jid}): {msg}")
+                else:
+                    _debug_log(f"event '{kind}' for unknown/orphan job {jid}: {msg}")
+            # finding 2/8/9: stale=true -> extension phai dung UI va bo response cu.
+            return self._json({"ok": True, "stale": True, "cancelled": bool(dead)})
         self._json({"error": "not found"}, 404)
 
 

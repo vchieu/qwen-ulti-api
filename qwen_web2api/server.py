@@ -53,9 +53,16 @@ def _usage(prompt, text, upstream=None):
 
 
 def _map_error(e):
+    """qwen_findings_patch1: giu nguyen 413/499/504 thay vi don ve 503."""
     status = getattr(e, "status", None)
     if status == 429:
         return 429, f"upstream rate limited: {e}", ERR_RATE, "rate_limit_exceeded"
+    if status == 413:
+        return 413, f"request too large: {e}", ERR_INVALID, "context_length_exceeded"
+    if status == 499:
+        return 499, f"client cancelled request: {e}", ERR_INVALID, "client_cancelled"
+    if status == 504:
+        return 504, f"upstream timeout: {e}", ERR_API, "upstream_timeout"
     return 503, f"upstream error: {e}", ERR_API, None
 
 
@@ -179,14 +186,23 @@ def _log_turn_result(cid, text, reasoning, calls, usage, elapsed):
 
 
 def _render_fit(messages, tools=None, tool_choice=None, prefix="", limit=None):
-    """Render messages -> prompt sao cho len(prefix + prompt) <= limit ky tu.
+    """qwen_findings_patch1 (finding 5): MAC DINH KHONG CAT.
 
-    Vuot thi cat theo co che cua tools._join_parts (giu dau + tin nhan moi nhat,
-    chen [...truncated...]). Gioi han la KY TU nen suy ra tran byte theo ti le."""
+    Qwen chi chuyen paste <= 131072 ky tu thanh file, nhung extension co
+    duong upload input[type=file] cho file lon hon. Cat o day = mat evidence
+    (log loi thuong nam o CUOI message). Chi cat khi
+    CONFIG["file_prompt_truncate"] = true.
+    """
     limit = limit or _file_max_chars()
-    budget = max(1000, limit - len(prefix))
     text = messages_to_prompt(messages, tools, tool_choice, max_bytes=1 << 30)
     orig = len(text)
+    if not CONFIG.get("file_prompt_truncate"):
+        if len(prefix) + orig > limit:
+            log(f"[bridge] file prompt {len(prefix) + orig} chars > paste limit "
+                f"{limit}: giu nguyen noi dung, extension phai upload qua "
+                "input[type=file] (khong cat)")
+        return prefix + text
+    budget = max(1000, limit - len(prefix))
     if orig > budget:
         max_bytes = int(len(text.encode("utf-8")) * budget / orig * 0.98)
         for _ in range(8):
@@ -196,70 +212,76 @@ def _render_fit(messages, tools=None, tool_choice=None, prefix="", limit=None):
                 break
             max_bytes = int(max_bytes * 0.9)
         log(f"[bridge] file prompt {orig} chars > {limit}: truncated to "
-            f"{len(text)} chars (Qwen khong chuyen paste > 131072 thanh file)")
+            f"{len(text)} chars (file_prompt_truncate=true)")
     return prefix + text
 
 
 def prepare_large_prompt(messages, tools=None, tool_choice=None):
-    """Nếu prompt đã render (gồm cả tool block) vượt MAX_PROMPT_CHARS,
-    tách history sang file .txt tạm và giữ tin nhắn user cuối cùng làm prompt.
-    Nếu không thể tách (chỉ có 1 message, message cuối không phải user,
-    hoặc bản thân message cuối vượt MAX_PROMPT_CHARS), ghi nguyên prompt vào file.
-    Nếu không vượt, trả về (None, messages gốc).
+    """Prompt vuot MAX_PROMPT_CHARS -> tach history sang file .txt tam.
 
-    Dùng đúng prompt mà bridge sẽ gửi (messages_to_prompt) để không bỏ sót
-    tool definitions/instructions khi tách sang attachment."""
+    qwen_findings_patch1 (finding 5):
+      - KHONG cat noi dung (tru khi file_prompt_truncate=true).
+      - file_info them paste_limit / over_paste_limit de extension chon
+        duong upload input[type=file] thay vi paste.
+      - prompt_hard_max_chars > 0 va vuot -> QwenError 413, khong cat im lang.
+    """
     full_prompt = messages_to_prompt(messages, tools, tool_choice)
+    hard = 0
+    try:
+        hard = int(float(CONFIG.get("prompt_hard_max_chars", 0) or 0))
+    except (TypeError, ValueError):
+        hard = 0
+    if hard > 0 and len(full_prompt) > hard:
+        raise QwenError(f"prompt too large: {len(full_prompt)} chars > "
+                        f"prompt_hard_max_chars={hard}", status=413)
     if len(full_prompt) <= MAX_PROMPT_CHARS:
         return None, messages
-
-    # Dọn file tạm cũ trước khi tạo file mới
     _cleanup_old_temp_files()
-
+    paste_limit = _file_max_chars()
     can_split = False
-    if len(messages) > 1 and isinstance(messages[-1], dict) and messages[-1].get("role") == "user":
+    companion_prompt = ""
+    last_msg = None
+    if len(messages) > 1 and isinstance(messages[-1], dict) \
+            and messages[-1].get("role") == "user":
         last_msg = messages[-1]
         companion_prompt = messages_to_prompt([last_msg], tools, tool_choice)
         if len(companion_prompt) <= MAX_PROMPT_CHARS:
             can_split = True
-
     if can_split:
         history = messages[:-1]
         file_content = _render_fit(history, prefix="[Conversation History]\n\n")
-
         fd, path = tempfile.mkstemp(suffix=".txt", prefix="qwen_prompt_")
         with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
             f.write(file_content)
-
         file_info = {
             "path": path,
             "filename": os.path.basename(path),
             "size": len(file_content),
             "attachment_prompt": companion_prompt,
+            "paste_limit": paste_limit,
+            "over_paste_limit": len(file_content) > paste_limit,
         }
-        debug_log(f"large prompt split: history → file ({len(file_content)} chars), "
-                  f"companion prompt {len(companion_prompt)} chars")
+        debug_log(f"large prompt split: history -> file ({len(file_content)} chars), "
+                  f"companion prompt {len(companion_prompt)} chars, "
+                  f"over_paste_limit={file_info['over_paste_limit']}")
         return file_info, [last_msg]
-
-    # Fallback: Không thể tách (chỉ có 1 message, hoặc message cuối không phải user,
-    # hoặc bản thân message cuối vượt MAX_PROMPT_CHARS). Ghi toàn bộ vào file.
-    last_role = (messages[-1].get("role") if messages else None) if messages else None
+    last_role = messages[-1].get("role") if messages and isinstance(messages[-1], dict) else None
     reason = ("only 1 message" if len(messages) <= 1
               else f"last msg role={last_role!r}, not user"
               if last_role != "user"
               else f"last msg itself > MAX_PROMPT_CHARS ({len(companion_prompt)} chars)")
     log(f"[bridge] large prompt: cannot split ({reason}), writing full prompt to file")
-    fd, path = tempfile.mkstemp(suffix=".txt", prefix="qwen_prompt_")
     full_prompt = _render_fit(messages, tools, tool_choice)
+    fd, path = tempfile.mkstemp(suffix=".txt", prefix="qwen_prompt_")
     with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
         f.write(full_prompt)
-
     file_info = {
         "path": path,
         "filename": os.path.basename(path),
         "size": len(full_prompt),
+        "paste_limit": paste_limit,
+        "over_paste_limit": len(full_prompt) > paste_limit,
     }
-
     short_messages = [{
         "role": "user",
         "content": (
@@ -601,86 +623,137 @@ class QwenHandler(BaseHTTPRequestHandler):
         return {"mode": mode} if mode else {}
 
     # ---------------------------------------------------------- tool turn --
+    def _watch_disconnect(self):
+        """qwen_findings_patch1 (finding 1): phat hien client ngat ket noi cho
+        request NON-STREAM (khong co heartbeat SSE). Tra ve (event, stop_fn);
+        khong co socket that -> (None, None) de unit test khong bi anh huong."""
+        sock = getattr(self, "connection", None)
+        if sock is None or not CONFIG.get("bridge_cancel_on_disconnect", True):
+            return None, None
+        gone = threading.Event()
+        stop = threading.Event()
+
+        def _run():
+            import select
+            import socket as _socket
+            while not stop.wait(0.5):
+                try:
+                    r, _w, _x = select.select([sock], [], [], 0)
+                    if not r:
+                        continue
+                    if not sock.recv(1, _socket.MSG_PEEK):
+                        gone.set()
+                        return
+                except Exception:
+                    return
+
+        threading.Thread(target=_run, daemon=True).start()
+        return gone, stop.set
+
     def _run_turn(self, prompt, upstream, think, tools_active, allowed,
                   schemas, required_params, required_tool, client_gone=None,
                   file_info=None, on_reasoning_delta=None):
+        """qwen_findings_patch1: finding 1 (huy job) + finding 6 (arguments hong)."""
+        stop_watch = None
+        if client_gone is None:
+            client_gone, stop_watch = self._watch_disconnect()
+        extra = dict(self._mode_kw())
+        if client_gone is not None:
+            extra["cancel_event"] = client_gone
         attempts = 1
         if required_tool or (tools_active and CONFIG.get("tool_retry_on_miss")):
             attempts = 1 + max(0, int(CONFIG.get("tool_retry_attempts", 1)))
         text = reasoning = ""
         calls, usage, nudge = None, {}, ""
-        for attempt in range(attempts):
-            if attempt and client_gone is not None and client_gone.is_set():
-                log("tool retry skipped: client disconnected")
-                break
-            call_prompt = prompt + nudge if nudge else prompt
-            debug_log(f"run_turn attempt {attempt + 1}/{attempts} (tools_active={tools_active}, required_tool={bool(required_tool)})")
-            _t0 = time.time()
-            if on_reasoning_delta:
-                content_parts = []
-                reasoning_parts = []
-                usage = {}
-                for kind, delta in bridge.generate_stream(
-                        call_prompt, upstream, think, usage, file_info=file_info,
-                        **self._mode_kw()):
-                    if client_gone is not None and client_gone.is_set():
-                        break
-                    if kind == "reasoning":
-                        reasoning_parts.append(delta)
-                        on_reasoning_delta(delta)
-                    else:
-                        content_parts.append(delta)
-                text = "".join(content_parts)
-                reasoning = "".join(reasoning_parts)
-            else:
-                result = bridge.generate(call_prompt, upstream, think, file_info=file_info,
-                                         **self._mode_kw())
-                text, reasoning, usage = (result["content"], result["reasoning"],
-                                          result["usage"])
-            _elapsed = time.time() - _t0
-            debug_log(f"run_turn elapsed={_elapsed:.1f}s text={len(text)}c reasoning={len(reasoning)}c")
-            calls = None
-            if tools_active and text:
-                # Log raw fence trước khi parse để debug parse lỗi
-                import re as _re
-                _fences = _re.findall(r"```tool_call\b.*?```", text, _re.DOTALL)
-                if _fences:
-                    debug_log(f"raw tool fence(s) ({len(_fences)}):\n" +
-                              "\n---\n".join(f[:400] for f in _fences))
-                text, calls, _dropped = parse_tool_calls(text, allowed, schemas)
-            if calls:
-                debug_log(f"parsed {len(calls)} tool call(s): {[c['function']['name'] for c in calls]}")
-                missing = missing_required_params(calls, required_params)
-                if missing and attempt + 1 < attempts:
-                    nudge = ("\n\nIMPORTANT: Your previous tool call was missing "
-                             "required parameter(s): " + ", ".join(missing)
-                             + ". Emit the tool_call again with every required "
-                             "parameter.")
+        try:
+            for attempt in range(attempts):
+                if client_gone is not None and client_gone.is_set():
+                    raise QwenError("client disconnected; job cancelled", status=499)
+                call_prompt = prompt + nudge if nudge else prompt
+                debug_log(f"run_turn attempt {attempt + 1}/{attempts} "
+                          f"(tools_active={tools_active}, required_tool={bool(required_tool)})")
+                _t0 = time.time()
+                if on_reasoning_delta:
+                    content_parts, reasoning_parts, usage = [], [], {}
+                    for kind, delta in bridge.generate_stream(
+                            call_prompt, upstream, think, usage,
+                            file_info=file_info, **extra):
+                        if client_gone is not None and client_gone.is_set():
+                            break
+                        if kind == "reasoning":
+                            reasoning_parts.append(delta)
+                            on_reasoning_delta(delta)
+                        else:
+                            content_parts.append(delta)
+                    text = "".join(content_parts)
+                    reasoning = "".join(reasoning_parts)
+                else:
+                    result = bridge.generate(call_prompt, upstream, think,
+                                             file_info=file_info, **extra)
+                    text, reasoning, usage = (result["content"], result["reasoning"],
+                                              result["usage"])
+                if client_gone is not None and client_gone.is_set():
+                    raise QwenError("client disconnected; job cancelled", status=499)
+                debug_log(f"run_turn elapsed={time.time() - _t0:.1f}s "
+                          f"text={len(text)}c reasoning={len(reasoning)}c")
+                calls, dropped = None, []
+                if tools_active and text:
+                    import re as _re
+                    _fences = _re.findall(r"```tool_call\b.*?```", text, _re.DOTALL)
+                    if _fences:
+                        debug_log(f"raw tool fence(s) ({len(_fences)}):\n" +
+                                  "\n---\n".join(f[:400] for f in _fences))
+                    text, calls, dropped = parse_tool_calls(text, allowed, schemas)
+                bad_args = [d for d in dropped
+                            if str(d).startswith("unusable arguments")]
+                if calls and not bad_args:
+                    debug_log(f"parsed {len(calls)} tool call(s): "
+                              f"{[c['function']['name'] for c in calls]}")
+                    missing = missing_required_params(calls, required_params)
+                    if missing and attempt + 1 < attempts:
+                        nudge = ("\n\nIMPORTANT: Your previous tool call was missing "
+                                 "required parameter(s): " + ", ".join(missing)
+                                 + ". Emit the tool_call again with every required "
+                                 "parameter.")
+                        continue
+                    if missing:
+                        raise QwenError("model emitted invalid tool call; missing: "
+                                        + ", ".join(missing))
+                    if text:
+                        text = text.strip()
+                    return text, reasoning, calls, usage
+                if bad_args:
+                    # finding 6: KHONG tra call voi arguments {} gia tao.
+                    if attempt + 1 < attempts:
+                        debug_log(f"unusable tool arguments, nudge retry: {bad_args}")
+                        nudge = ("\n\nIMPORTANT: Your previous tool_call had unusable "
+                                 "arguments (" + "; ".join(bad_args) + "). Emit the "
+                                 'tool_call again as valid JSON: {"name": "<tool_name>", '
+                                 '"arguments": {<parameters>}} with every parameter '
+                                 "inside the arguments object.")
+                        continue
+                    raise QwenError("model emitted tool_call with unusable arguments: "
+                                    + "; ".join(bad_args))
+                if required_tool:
+                    nudge = "\n\nIMPORTANT: Respond with a tool_call block ONLY."
                     continue
-                if missing:
-                    raise QwenError("model emitted invalid tool call; missing: "
-                                    + ", ".join(missing))
-                # Giữ lại prose (text sạch đã tách tool_call) để hiển thị cho user.
-                if text:
-                    text = text.strip()
-                return text, reasoning, calls, usage
-            if required_tool:
-                nudge = "\n\nIMPORTANT: Respond with a tool_call block ONLY."
-                continue
-            if attempt + 1 >= attempts:
+                if attempt + 1 >= attempts:
+                    break
+                if tools_active and (looks_like_missed_tool_call(text)
+                                     or not text.strip()):
+                    debug_log("detected missed tool call; sending nudge retry")
+                    nudge = ("\n\nIMPORTANT: Do not describe a tool call -- make it. "
+                             "If answering requires reading or changing something, "
+                             "call the tool now; otherwise give your final answer.")
+                    continue
                 break
-            if tools_active and (looks_like_missed_tool_call(text)
-                                 or not text.strip()):
-                debug_log("detected missed tool call; sending nudge retry")
-                nudge = ("\n\nIMPORTANT: Do not describe a tool call -- make it. "
-                         "If answering requires reading or changing something, "
-                         "call the tool now; otherwise give your final answer.")
-                continue
-            break
-        if required_tool and not calls:
-            raise QwenError("model did not emit a usable required tool call; "
-                            "please retry")
-        return text, reasoning, calls, usage
+            if required_tool and not calls:
+                raise QwenError("model did not emit a usable required tool call; "
+                                "please retry")
+            return text, reasoning, calls, usage
+        finally:
+            if stop_watch:
+                stop_watch()
 
     # ------------------------------------------------------------- routes --
     def do_OPTIONS(self):
@@ -748,6 +821,9 @@ class QwenHandler(BaseHTTPRequestHandler):
                 self._handle_responses(body)
             else:
                 self.send_api_error(404, f"not found: {path}", ERR_INVALID)
+        except QwenError as e:
+            # qwen_findings_patch1: prepare_large_prompt co the raise 413
+            self.send_api_error(*_map_error(e))
         except ValueError as e:
             self.send_api_error(413 if "too large" in str(e) else 400,
                                 str(e), ERR_INVALID)
@@ -902,13 +978,13 @@ class QwenHandler(BaseHTTPRequestHandler):
 
     def _stream_chat(self, cid, model, prompt, upstream, think,
                      stops, max_tokens, include_usage, file_info=None):
-        stop_ping, _gone, _hb = self._start_sse()
+        stop_ping, gone, _hb = self._start_sse()
         self._sse_chunk(cid, model, {"role": "assistant", "content": ""},
                         None, include_usage)
         full, finish, buf = "", "stop", ""
         hold = max((len(s) for s in stops), default=0)
         gen = bridge.generate_stream(prompt, upstream, think, file_info=file_info,
-                                     **self._mode_kw())
+                                     cancel_event=gone, **self._mode_kw())
         _t_start = time.time()
         full_reasoning = []
         try:
@@ -959,6 +1035,7 @@ class QwenHandler(BaseHTTPRequestHandler):
                     self._sse_chunk(cid, model, {"content": buf},
                                     None, include_usage)
         except (BrokenPipeError, ConnectionResetError):
+            gone.set()   # qwen_findings_patch1 (finding 1)
             return
         except Exception as e:
             log(f"stream error [{model}, prompt_len={len(prompt)}]: {e}")

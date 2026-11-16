@@ -654,6 +654,8 @@ def _extract_args(data, props=None):
     else:
         rest = {k: v for k, v in data.items()
                 if k not in _META_KEYS or k in props}
+    # arguments: null = khong co tham so; khong de lot {"arguments": null}
+    rest = {k: v for k, v in rest.items() if v is not None}
     if len(rest) == 1:
         k, v = next(iter(rest.items()))
         if k in ("parameters", "params") and isinstance(v, dict):
@@ -738,10 +740,17 @@ def parse_tool_calls(text, allowed_names=None, tool_schemas=None):
                 props = (tool_schemas or {}).get(name)
                 args, degraded = _args_json(_extract_args(data, props))
                 if degraded:
-                    log(f"tool_call '{name}': arguments unusable ({degraded})")
-                parsed = {"id": f"call_{uuid.uuid4().hex[:8]}",
-                          "type": "function",
-                          "function": {"name": name, "arguments": args}}
+                    # qwen_findings_patch1 (finding 6): tu choi call co
+                    # arguments hong thay vi bien thanh {} roi tra cho client.
+                    harmless = degraded in ("missing", "empty string") and not props
+                    if CONFIG.get("tool_reject_bad_arguments", True) and not harmless:
+                        reason = f"unusable arguments ({degraded})"
+                    else:
+                        log(f"tool_call '{name}': arguments unusable ({degraded})")
+                if not reason:
+                    parsed = {"id": f"call_{uuid.uuid4().hex[:8]}",
+                              "type": "function",
+                              "function": {"name": name, "arguments": args}}
         else:
             reason = "body is not valid JSON"
         if parsed is None:

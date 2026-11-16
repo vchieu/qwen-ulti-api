@@ -273,8 +273,51 @@
 
   async function send(jobId, ev) {
     try {
-      await post("/event", Object.assign({ job_id: jobId }, ev));
+      const r = await post("/event", Object.assign({ job_id: jobId }, ev));
+      /* qwen_js_patch1 (finding 2/8/9): proxy bao job da chet -> dung UI ngay.
+         Day la duong huy nhanh nhat: moi event cua job cu deu tra stale=true. */
+      if (r && r.stale && current && current.id === jobId && !current.settled) {
+        current.cancelled = true;
+        settle(current, new Error("proxy bao job " + jobId + " da het hieu luc (stale)"));
+      }
     } catch (e) { /* proxy chet */ }
+  }
+
+  /* qwen_js_patch1 (finding 1/2/4): liveness + strict model/mode ------------ */
+  let requireModel = false;   // config bridge_require_model (qua /status)
+  let requireMode = false;    // config bridge_require_mode  (qua /status)
+  let navSince = 0;           // N1: watchdog cho co `navigating`
+  const ALIVE_CACHE_MS = 1500;
+
+  function jobDead(job) {
+    return !job || job.settled || job.cancelled;
+  }
+
+  // Con song = chua settle/cancel, chua qua deadline, va proxy con cho caller.
+  async function jobAlive(job) {
+    if (jobDead(job)) return false;
+    if (job.deadline && Date.now() > job.deadline) { job.cancelled = true; return false; }
+    const now = Date.now();
+    if (job._aliveAt && now - job._aliveAt < ALIVE_CACHE_MS) return job._alive !== false;
+    job._aliveAt = now;
+    try {
+      const r = await getJSON("/alive?job_id=" + encodeURIComponent(job.id));
+      job._alive = !!(r && r.alive);
+      if (!job._alive) job.cancelled = true;
+    } catch (e) {
+      // Khong noi duoc bridge (hoac chua co /alive): khong ket luan job chet.
+      return !jobDead(job);
+    }
+    return job._alive && !jobDead(job);
+  }
+
+  async function ensureAlive(job, stage) {
+    if (await jobAlive(job)) return true;
+    if (job && !job.settled) {
+      job.cancelled = true;
+      settle(job, new Error("job het hieu luc o buoc '" + stage + "' (caller da ngat/huy)"));
+    }
+    throw new Error("job cancelled at " + stage);
   }
 
   function saveJobState(job, stage, details) {
@@ -432,6 +475,9 @@
     if (st && typeof st.select_model === "boolean") selectModelEnabled = st.select_model;
     if (st && typeof st.select_mode === "boolean") selectModeEnabled = st.select_mode;
     if (st && typeof st.force_model === "boolean") forceRequestModel = st.force_model;
+    /* qwen_js_patch1 (finding 4) */
+    if (st && typeof st.require_model === "boolean") requireModel = st.require_model;
+    if (st && typeof st.require_mode === "boolean") requireMode = st.require_mode;
     if (st && Array.isArray(st.model_ids)) {
       uiModelIds = st.model_ids.filter((x) => typeof x === "string");
     }
@@ -992,6 +1038,20 @@
   // Qwen đôi khi gọi tool bằng native function_call thay vì text fence.
   // Gom name + arguments (Qwen stream cumulative) rồi trả cho proxy để client
   // tự chạy tool, KHÔNG để Qwen tự chạy tool trong sandbox của nó.
+  function nativeIdOf(fc) {
+    for (const k of ["id", "call_id", "tool_call_id", "index"]) {
+      const v = fc[k];
+      if (v !== undefined && v !== null && v !== "") return String(v);
+    }
+    return "";
+  }
+
+  function jsonComplete(s) {
+    const t = String(s || "").trim();
+    if (!t.startsWith("{")) return false;
+    try { JSON.parse(t); return true; } catch (e) { return false; }
+  }
+
   function collectNativeCall(job, fc) {
     if (!fc) return;
     const name = typeof fc.name === "string" ? fc.name : "";
@@ -999,19 +1059,57 @@
       ? fc.arguments
       : (fc.arguments ? JSON.stringify(fc.arguments) : "");
     if (!Array.isArray(job._nativeCalls)) job._nativeCalls = [];
-    let call = job._nativeCalls[job._nativeCalls.length - 1];
-    // Tên mới => call mới (Qwen stream tuần tự từng call)
-    if (!call || (name && call.name && call.name !== name)) {
-      call = { name: name, arguments: "" };
-      job._nativeCalls.push(call);
-    } else if (name) {
-      call.name = name;
+    /* qwen_js_patch1 (finding 7): tach theo id/index neu co; neu khong, tach
+       khi arguments truoc da la 1 JSON HOAN CHINH va chunk moi mo dau '{'
+       (khong phai cumulative) -> do la call MOI, du cung ten. */
+    const cid = nativeIdOf(fc);
+    let call = null;
+    if (cid) {
+      call = job._nativeCalls.find((c) => c.cid === cid) || null;
+      if (!call) {
+        call = { cid: cid, name: name, arguments: "" };
+        job._nativeCalls.push(call);
+      }
+    } else {
+      call = job._nativeCalls[job._nativeCalls.length - 1] || null;
+      const newByName = !!(name && call && call.name && call.name !== name);
+      const boundary = !!(call && raw && jsonComplete(call.arguments)
+        && String(raw).trim().startsWith("{")
+        && !String(raw).startsWith(call.arguments));
+      if (!call || newByName || boundary) {
+        call = { cid: "", name: name, arguments: "" };
+        job._nativeCalls.push(call);
+      }
     }
+    if (name) call.name = name;
     if (!raw) return;
     const prev = call.arguments || "";
     if (!prev) call.arguments = raw;
     else if (raw.startsWith(prev)) call.arguments = raw;   // cumulative
     else call.arguments = prev + raw;                      // incremental
+  }
+
+  // Quet can ngoac de tach nhieu JSON object dinh nhau (an toan voi string).
+  function splitJsonObjects(s) {
+    const out = [];
+    const t = String(s || "");
+    let depth = 0, start = -1, inStr = false, esc = false;
+    for (let i = 0; i < t.length; i++) {
+      const ch = t[i];
+      if (inStr) {
+        if (esc) esc = false;
+        else if (ch === "\\") esc = true;
+        else if (ch === '"') inStr = false;
+        continue;
+      }
+      if (ch === '"') { inStr = true; continue; }
+      if (ch === "{") { if (depth === 0) start = i; depth++; }
+      else if (ch === "}") {
+        depth--;
+        if (depth === 0 && start >= 0) { out.push(t.slice(start, i + 1)); start = -1; }
+      }
+    }
+    return out;
   }
 
   async function flushNativeCalls(job) {
@@ -1020,11 +1118,30 @@
     const ready = calls.filter((c) => c && c.name);
     if (!ready.length) return false;
     for (const c of ready) {
-      await send(job.id, {
-        kind: "tool_call",
-        name: c.name,
-        arguments: c.arguments || "{}",
-      });
+      const args = String(c.arguments || "").trim();
+      let parts;
+      if (!args) {
+        parts = ["{}"];
+      } else {
+        try { JSON.parse(args); parts = [args]; }
+        catch (e) {
+          parts = splitJsonObjects(args);
+          if (parts.length > 1) {
+            fwd(job, "warn", "native tool_call '" + c.name + "': arguments la "
+              + parts.length + " JSON dinh nhau -> tach thanh call rieng (finding 7)");
+          } else {
+            /* finding 6: giu nguyen chuoi hong de proxy TU CHOI call,
+               khong bien thanh {} roi tra cho client. */
+            parts = [args];
+            fwd(job, "warn", "native tool_call '" + c.name
+              + "': arguments khong phai JSON hop le -> proxy se tu choi");
+          }
+        }
+      }
+      for (const p of parts) {
+        await send(job.id, { kind: "tool_call", name: c.name, arguments: p,
+          id: c.cid || undefined });
+      }
     }
     settle(job, null);
     return true;
@@ -1225,6 +1342,10 @@
       }
     } finally {
       if (idleTimer) clearTimeout(idleTimer);
+      /* qwen_js_patch1 (N2): job da settle ma stream con treo -> nhả reader */
+      if (job && job.settled) {
+        try { await reader.cancel(); } catch (e) { /* best-effort */ }
+      }
     }
     settle(job, null);
   }
@@ -1308,31 +1429,36 @@
   // Hook fetch: bat response cua chinh app, khong can doc DOM.
   const origFetch = window.fetch;
   window.fetch = async function (input, init) {
-    if (current && !current.attached && isCompletionURL(urlOf(input))) {
-      /* qwen_fix_patch4:inline-guard */
-      const lostMsg = checkInlineIntegrity(current, init);
+    /* qwen_js_patch1 (finding 8): giu jobRef TU LUC gui request. Truoc day
+       `current` bi doc lai SAU await -> response cua job A gan nham cho job B. */
+    const jobRef = current;
+    const isCompletion = isCompletionURL(urlOf(input));
+    if (jobRef && !jobRef.attached && !jobRef.settled && isCompletion) {
+      const lostMsg = checkInlineIntegrity(jobRef, init);
       if (lostMsg) {
-        learnInlineLimit(String(current.prompt || "").length);
+        learnInlineLimit(String(jobRef.prompt || "").length);
         const lostErr = new Error("Qwen UI " + lostMsg + " (se dung duong attach file o lan retry)");
-        settle(current, lostErr);
-        throw lostErr;   // chan request hong, tranh tra loi sai cho client
+        settle(jobRef, lostErr);
+        throw lostErr;
       }
-      if (forceRequestModel) {   /* qwen_fix_patch7:force-model */
-        const forced = rewriteRequestModel(current, init);
+      if (forceRequestModel) {
+        const forced = rewriteRequestModel(jobRef, init);
         if (forced) init = forced;
       }
-      inspectCompletionRequest(current, input, init);  // khong await: chi chan doan
+      inspectCompletionRequest(jobRef, input, init);
     }
     const resp = await origFetch.call(this, input, init);
     try {
-      if (current && !current.attached && isCompletionURL(urlOf(input))) {
-        current.attached = true;
-        if (typeof current._clearSendTimer === "function") {
-          current._clearSendTimer();
-        }
+      if (jobRef && isCompletion && !jobRef.attached && !jobRef.settled
+          && current === jobRef) {
+        jobRef.attached = true;
+        if (typeof jobRef._clearSendTimer === "function") jobRef._clearSendTimer();
         const clone = resp.clone();
-        const jobRef = current;  // `current` co the da doi khi stream loi muon
         pumpFetch(jobRef, clone).catch((e) => settle(jobRef, e));
+      } else if (jobRef && isCompletion) {
+        debugLog("bo response completion cua job cu " + jobRef.id
+          + " (settled=" + jobRef.settled + ", current="
+          + ((current && current.id) || "null") + ")");
       }
     } catch (e) { /* khong anh huong app */ }
     return resp;
@@ -1346,14 +1472,59 @@
     return origOpen.apply(this, arguments);
   };
   XMLHttpRequest.prototype.send = function (body) {
-    if (current && !current.attached && isCompletionURL(this.__qwenURL)) {
-      current.attached = true;
-      if (typeof current._clearSendTimer === "function") {
-        current._clearSendTimer();
-      }
-      const job = current;
+    const job = current;   // giu job tu luc gui (finding 8)
+    if (job && !job.attached && !job.settled && isCompletionURL(this.__qwenURL)) {
+      job.attached = true;
+      if (typeof job._clearSendTimer === "function") job._clearSendTimer();
+      /* qwen_js_patch1 (finding 9): send timer DA bi clear o tren, nen neu
+         khong xu ly error/abort/timeout thi job treo vinh vien -> active
+         khong giam -> worker khong nhan job moi du ping van bao song. */
+      let done = false;
+      let gotLoad = false;   /* load da nhan response hop le (parseSSEText se settle) */
+      const clearWatchdog = () => {
+        if (job._xhrTimer) { clearTimeout(job._xhrTimer); job._xhrTimer = null; }
+      };
+      const finish = (err) => {
+        if (done || job.settled || !err) return;
+        done = true;
+        clearWatchdog();
+        settle(job, err);
+      };
+      const armWatchdog = () => {
+        clearWatchdog();
+        job._xhrTimer = setTimeout(() => {
+          finish(new Error("XHR completion timeout: khong co du lieu sau "
+            + (STREAM_IDLE_TIMEOUT_MS / 1000) + "s"));
+        }, STREAM_IDLE_TIMEOUT_MS);
+      };
+      armWatchdog();
+      this.addEventListener("progress", armWatchdog);
       this.addEventListener("load", () => {
-        parseSSEText(job, this.responseText).catch((e) => settle(job, e));
+        clearWatchdog();
+        try {
+          const txt = String(this.responseText || "");
+          const ct = String(this.getResponseHeader("content-type") || "");
+          if (this.status >= 400) {
+            finish(new Error("XHR completion HTTP " + this.status + ": " + txt.slice(0, 300)));
+            return;
+          }
+          if (ct && !ct.includes("event-stream")) {
+            finish(new Error("XHR non-SSE (" + this.status + "): " + txt.slice(0, 300)));
+            return;
+          }
+          gotLoad = true;
+          parseSSEText(job, txt).catch((e) => finish(e));
+        } catch (e) { finish(e); }
+      });
+      this.addEventListener("error", () => finish(new Error("XHR completion loi mang (error)")));
+      this.addEventListener("abort", () => finish(new Error("XHR completion bi abort")));
+      this.addEventListener("timeout", () => finish(new Error("XHR completion timeout")));
+      this.addEventListener("loadend", () => {
+        /* loadend luon chay ngay sau load; parseSSEText la async nen KHONG
+           duoc bao loi o day khi response da hop le (truoc day no giet job
+           thanh cong truoc khi SSE duoc parse xong). */
+        if (gotLoad) return;
+        finish(new Error("XHR completion ket thuc ma khong tra du lieu hop le"));
       });
     }
     return origSend.apply(this, arguments);
@@ -1563,9 +1734,16 @@
 
   async function submitPrompt(composer, prompt, job) {
     /* qwen_fix_patch:submit */
+    await ensureAlive(job, "truoc khi dien prompt");   /* qwen_js_patch1 (finding 2) */
     saveJobState(job, "typing_prompt", "Setting prompt text");
     setComposer(composer, prompt);
     await sleep(350);
+    /* qwen_js_patch1 (finding 3): thu lai 1 lan bang setComposerClean truoc
+       khi ket luan nhap that bai; KHONG duoc thay bang cau mac dinh. */
+    if (!composerText(composer).trim() && String(prompt || "").trim()) {
+      setComposerClean(composer, prompt);
+      await sleep(350);
+    }
     /* qwen_fix_patch4:inline-guard */
     {
       const afterLen = composerText(composer).trim().length;
@@ -1584,12 +1762,22 @@
     }
     // UI tu doi text dai vua nhap thanh attachment card va lam rong composer:
     if (!composerText(composer).trim()) {
-      const companion = attachmentPrompt || ATTACHMENT_COMPANION_PROMPT;
-      log("composer empty after setting prompt; inserting companion prompt:", companion);
+      /* qwen_js_patch1 (finding 3): chi duoc dien companion khi CO file
+         dinh kem that. Khong co file -> bao loi de Python retry, tuyet doi
+         khong gui "Please read the text and action" thay prompt cua user. */
+      const hasAtt = !!(job && job.file_info)
+        && findActiveAttachmentElements(composer).length > 0;
+      if (!hasAtt) {
+        throw new Error("khong dien duoc prompt vao composer (UI khong nhan text); "
+          + "khong co attachment -> khong gui thay bang cau mac dinh");
+      }
+      const companion = (job && job.attachment_prompt) || attachmentPrompt
+        || ATTACHMENT_COMPANION_PROMPT;
+      log("composer empty after attaching file; inserting companion prompt:", companion);
       setComposerClean(composer, companion);
       await sleep(350);
       if (!composerText(composer).trim()) {
-        const warnMsg = "CANH BAO: Composer bi rong khi submit prompt nhung thieu paste companion prompt!";
+        const warnMsg = "CANH BAO: Composer bi rong sau khi attach file va dien companion!";
         log(warnMsg);
         if (job) send(job.id, { kind: "warn", message: warnMsg });
       }
@@ -1805,7 +1993,8 @@
     }
     let attached = false, used = "";
     for (const s of queue) {
-      if (job && job.settled) return;
+      /* qwen_js_patch1 (finding 2): dung ngay khi job het hieu luc */
+      if (!(await jobAlive(job))) return;
       saveJobState(job, "attach_" + s.name, "Attaching " + fname + " via " + s.name);
       let pastedLen = 0;
       try {
@@ -1823,6 +2012,7 @@
     }
 
     if (attached) {
+      if (!(await jobAlive(job))) return;   /* qwen_js_patch1 (finding 2) */
       saveJobState(job, "file_uploaded", "File attached via " + used + ": " + fname);
       if (job) send(job.id, { kind: "debug", message: "large prompt attached via " + used });
       await sleep(800);
@@ -1868,12 +2058,18 @@
   // Nếu UI chưa nhận, thử lại vài lần.
   async function sendPrompt(composer, timeoutMs = 45000, fallbackPrompt = null, job = null) {
     /* qwen_fix_patch:send-loop */
-    const companion = fallbackPrompt || attachmentPrompt || ATTACHMENT_COMPANION_PROMPT;
+    /* qwen_js_patch1 (finding 3): companion chi ton tai khi job co file. */
+    const companion = (job && job.file_info)
+      ? (fallbackPrompt || job.attachment_prompt || attachmentPrompt
+         || ATTACHMENT_COMPANION_PROMPT)
+      : "";
     if (job && job.file_info) timeoutMs = Math.max(timeoutMs, 90000);  // doi upload xong
     const deadline = Date.now() + timeoutMs;
     let clicks = 0, enters = 0, noBtnSince = 0, lastEnter = 0;
     while (Date.now() < deadline) {
       if (job && (job.attached || job.settled)) return !!job.attached;
+      /* qwen_js_patch1 (finding 2): job het hieu luc -> dung, khong bam Send */
+      if (job && !(await jobAlive(job))) return false;
       const btn = findSendButton(composer);
       if (!btn) {
         // Khong co nut Send: UI dang generate/upload. Neu UI da ranh ma van khong
@@ -1893,11 +2089,19 @@
 
       // Composer rong truoc khi gui: chen companion prompt (tranh loi "content is empty")
       if (!composerText(composer).trim()) {
+        /* qwen_js_patch1 (finding 3): khong co attachment that -> khong dien
+           cau mac dinh, bao loi de Python retry. */
+        const hasAtt = !!(job && job.file_info)
+          && findActiveAttachmentElements(composer).length > 0;
+        if (!hasAtt || !companion) {
+          throw new Error("composer rong truoc khi gui va khong co attachment; "
+            + "khong gui cau mac dinh thay prompt that");
+        }
         log("composer is empty before sending; inserting companion prompt:", companion);
         setComposerClean(composer, companion);
         await sleep(350);
         if (!composerText(composer).trim()) {
-          const warnMsg = "CANH BAO: Chuan bi gui nhung thieu paste attachment_prompt vao composer (composer van dang rong)!";
+          const warnMsg = "CANH BAO: Chuan bi gui nhung composer van rong sau khi dien companion!";
           log(warnMsg);
           if (job) send(job.id, { kind: "warn", message: warnMsg });
         }
@@ -2085,15 +2289,37 @@
       }
     };
     try {
+      /* qwen_js_patch1 (finding 1/2/4): kiem tra job con song truoc MOI thao
+         tac UI, va khong gui khi chon model/mode that bai neu config strict. */
+      await ensureAlive(job, "truoc new-chat");
       await waitCaptchaClear(job, "truoc new-chat/reload");
-      if ((await tryNewChat(job)) === false) return;  // dang reload temporary chat; job da duoc requeue
+      if (!(await jobAlive(job))) return;
+      if ((await tryNewChat(job)) === false) return;  // dang reload; job da requeue
       saveJobState(job, "new_chat_done", "New chat step finished");
       if (!(await ensureMode(job))) return;
+      await ensureAlive(job, "sau ensureMode");
       await waitPageReady(job);
       await waitCaptchaClear(job, "sau khi trang san sang");
-      await selectModel(job);
-      fwd(job, "debug", "selectModel: " + modelUiSummary(job));   /* qwen_fix_patch7:call */
-      await selectThinkingMode(job);
+      await ensureAlive(job, "truoc selectModel");
+      const modelOk = await selectModel(job);
+      fwd(job, "debug", "selectModel: " + modelUiSummary(job));
+      if (!modelOk && requireModel) {
+        send(job.id, { kind: "warn", model_mismatch: true,
+          message: "require_model=true: khong chon duoc model " + job.model
+            + " -> huy job, khong gui voi model UI cu" });
+        throw new Error("khong chon duoc model yeu cau (" + job.model
+          + "); bridge_require_model=true");
+      }
+      await ensureAlive(job, "truoc selectMode");
+      const modeOk = await selectThinkingMode(job);
+      if (!modeOk && requireMode) {
+        send(job.id, { kind: "warn", mode_mismatch: true,
+          message: "require_mode=true: khong chon duoc che do " + job.mode
+            + " -> huy job, khong gui voi che do UI cu" });
+        throw new Error("khong chon duoc che do UI yeu cau (" + job.mode
+          + "); bridge_require_mode=true");
+      }
+      await ensureAlive(job, "truoc composer");
       saveJobState(job, "model_selected", "Model " + job.model);
       send(job.id, { kind: "debug",
         message: "temporary evidence: " + JSON.stringify(temporaryEvidence()) });
@@ -2114,6 +2340,8 @@
       settle(job, e);
     } finally {
       if (typeof job._clearSendTimer === "function") job._clearSendTimer();
+      /* qwen_js_patch1 (finding 9): watchdog XHR khong duoc song qua job. */
+      if (job._xhrTimer) { clearTimeout(job._xhrTimer); job._xhrTimer = null; }
       clearJobState();
       current = null;
     }
@@ -2124,7 +2352,18 @@
   async function loop() {
     log("started on", BASE, "->", BRIDGE);
     for (;;) {
-      if (navigating) { await sleep(500); continue; }
+      /* qwen_js_patch1 (N1): navigation that bai -> khong ket poll vinh vien */
+      if (navigating) {
+        if (!navSince) navSince = Date.now();
+        if (Date.now() - navSince > 20000) {
+          log("navigation khong xay ra sau 20s; bo co navigating de poll lai");
+          navigating = false;
+          navSince = 0;
+        }
+        await sleep(500);
+        continue;
+      }
+      navSince = 0;
       if (active >= MAX_JOBS) { await sleep(400); continue; }
       try {
         await refreshModels(false);
@@ -2139,7 +2378,8 @@
             prompt: r.job.prompt,
             think: r.job.think,
             file_info: r.job.file_info,
-            attachment_prompt: r.job.attachment_prompt || attachmentPrompt || ATTACHMENT_COMPANION_PROMPT,
+            attachment_prompt: r.job.attachment_prompt || "",   /* qwen_js_patch1 (finding 3) */
+            deadline: r.job.deadline ? r.job.deadline * 1000 : 0,
             raw: r.job,
             mode_retries: r.job.mode_retries || 0,
             fresh_reloads: r.job.fresh_reloads || 0,
@@ -2152,6 +2392,7 @@
             job.resolve = resolve;
             job.reject = reject;
           });
+          job.promise.catch(() => {});   /* qwen_js_patch1 (N3) */
           runJob(job).finally(() => { active--; });
         }
       } catch (e) {

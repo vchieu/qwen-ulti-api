@@ -54,6 +54,23 @@ DEFAULT_CONFIG = {
 
     "log_requests": True,
     "log_file": None,
+    # --- qwen_findings_patch1 -------------------------------------------
+    # finding 4: true = chon model / che do UI that bai -> bao loi + retry,
+    # khong chay tiep voi model/mode cu cua UI. false = chi warn (cu).
+    "bridge_require_model": False,
+    "bridge_require_mode": False,
+    # finding 5: false = KHONG cat file prompt (mat evidence o cuoi log).
+    # File > tran paste thi extension phai upload qua input[type=file].
+    "file_prompt_truncate": False,
+    # finding 5: 0 = khong gioi han. > 0 -> vuot thi tra 413, khong cat im lang.
+    "prompt_hard_max_chars": 0,
+    # finding 6: true = tu choi tool_call co arguments hong (nudge retry),
+    # false = hanh vi cu (bien thanh {} van tra call cho client).
+    "tool_reject_bad_arguments": True,
+    # finding 1: phat hien client ngat ket noi (non-stream) de huy job.
+    "bridge_cancel_on_disconnect": True,
+    # finding 1: so lan /requeue toi da cho 1 job (chong job zombie).
+    "bridge_max_requeues": 8,
     # Bat/tat log debug chi tiet (co the dat "debug": true hoac "debug_log": true trong config.json)
     "debug": False,
 }

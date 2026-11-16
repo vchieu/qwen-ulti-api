@@ -25,7 +25,7 @@ Cần mở https://chat.qwen.ai (đã đăng nhập), giữ tab mở và bật e
 | --- | --- |
 | `qwen_web2api/server.py` | HTTP OpenAI-compatible: `/v1/chat/completions`, `/v1/responses`, `/v1/models`, auth, CORS, SSE, `_run_turn` (tool retry/nudge) |
 | `qwen_web2api/qwen.py` | `QwenError` + logger `log()`, `debug_log()`, `is_debug()`, `get_recent_log()` dùng chung; không còn transport/token |
-| `qwen_web2api/bridge.py` | Server 8083 cho extension: `/poll`, `/event`, `/status`, `/debug`, `/requeue`, `/file/*`; queue job, stream event, `known_models()`, `temporary_chat_enabled()` |
+| `qwen_web2api/bridge.py` | Server 8083 cho extension: `/poll`, `/event`, `/status`, `/debug`, `/requeue`, `/file/*`, `/alive`, `/cancel`; queue job, stream event, `known_models()`, `temporary_chat_enabled()`, `job_cancelled()`, `job_alive()`, `cancel_job()` |
 | `qwen_web2api/tools.py` | Flatten messages → prompt, chèn `# Tool Use`, parse tool_call (fence, XML tag, XML function/parameter), truncate theo byte |
 | `qwen_web2api/models.py` | Alias model + `@think=0/1` |
 | `qwen_web2api/config.py` | `DEFAULT_CONFIG` + `CONFIG` (global mutable), load/find config |
@@ -65,6 +65,20 @@ Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` →
   body completion bằng model của job (chỉ id hợp lệ) — không phụ thuộc dropdown/tab đang ẩn.
 - `prompt_max_bytes` (default `0` = không cắt; trước đây 262144). `file_prompt_max_chars` (tùy chọn,
   không đặt = `130000`): trần ký tự file prompt; file > 131072 ký tự bỏ qua paste-file, upload qua `input[type=file]`.
+
+- `bridge_cancel_on_disconnect` (default `true`): Python phát hiện client ngắt kết nối
+  (non-stream) và huỷ job xuyên suốt, tránh requeue prompt cũ khi extension còn giữ job (finding 1).
+- `bridge_max_requeues` (default `8`): giới hạn số lần `/requeue` cho 1 job; vượt thì huỷ job
+  (chống job zombie).
+- `bridge_require_model` (default `false`): `true` → chọn model UI thất bại thì huỷ job + retry,
+  không gửi với model UI cũ; `false` → chỉ warn (hành vi cũ). Extension đọc qua `/status.require_model`.
+- `bridge_require_mode` (default `false`): tương tự cho chế độ Thinking/Auto/Fast (finding 4).
+- `file_prompt_truncate` (default `false`): `false` → KHÔNG cắt file prompt khi vượt trần paste
+  (mặc định, tránh mất evidence ở cuối log); `true` → cắt theo cơ chế cũ (finding 5).
+- `prompt_hard_max_chars` (default `0` = không giới hạn): vượt thì trả HTTP 413, không cắt im lặng
+  (finding 5).
+- `tool_reject_bad_arguments` (default `true`): từ chối tool_call có arguments hỏng (nudge retry),
+  không biến thành `{}` rồi trả cho client (finding 6).
 - Log `completion request:` có `model=` (model thật Qwen nhận), `want=`, `vis=`, `feature_config=`;
   model request ≠ model job → warn `MODEL KHAC YEU CAU`. Nhãn dropdown chỉ là hiển thị.
 - `bridge_select_model` (default `true`): `false` → extension không đụng model
@@ -199,6 +213,22 @@ Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` →
     chỗ: trước new-chat/reload, sau `waitPageReady`, lúc Send không bấm được. Selector captcha là
     ĐOÁN — cần DOM thật để chỉnh. `pageDiag` thêm trạng thái UI vào warn Send/timeout.
 
+13. **Liveness & strict model/mode (`qwen_findings_patch1`)**: trước MỖI thao tác UI (new-chat,
+    selectModel, selectMode, paste, send) extension gọi `GET /alive?job_id=<jid>` và nhận
+    `{alive, cancelled}`; job hết hiệu lực → dừng ngay, không gõ/gửi prompt cũ (finding 1/2).
+    `POST /cancel {job_id, reason}` huỷ job xuyên suốt. `/requeue` trả **409**
+    `{ok:false, cancelled:true}` khi job đã huỷ / không còn caller / vượt `bridge_max_requeues` / quá TTL.
+    `/event` cho job chết trả thêm `{stale:true, cancelled}` → extension **phải** dừng UI và bỏ response
+    cũ (`send()` settle job khi `stale=true`) (finding 2/8/9).
+    `bridge_require_model=true` → chọn model UI thất bại = huỷ job + retry, không gửi với model UI cũ;
+    `bridge_require_mode=true` tương tự cho chế độ Thinking/Auto/Fast. Extension đọc qua
+    `/status.require_model` / `require_mode`; mặc định `false` (chỉ warn) (finding 4).
+    Prompt file: `file_prompt_truncate=false` → không cắt file prompt khi vượt trần paste (finding 5);
+    file > 131072 ký tự đi đường upload `input[type=file]`; vượt `prompt_hard_max_chars` → HTTP 413.
+    Tool arguments: `tool_reject_bad_arguments=true` → từ chối call có arguments hỏng (nudge retry),
+    không biến thành `{}` rồi trả cho client (finding 6). Extension tách native call theo `id`/`index`
+    hoặc ranh giới JSON hoàn chỉnh, không gộp 2 call cùng tên thành 1 chuỗi hỏng (finding 7).
+
 ## Việc dự kiến (chưa làm)
 
 - **Chế độ UI (đã làm, `qwen_fix_patch7`)**: none/low → Fast, medium → Auto, high → Thinking. Nút mở
@@ -264,7 +294,8 @@ Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` →
   không token: mock `bridge._pending`, `bridge.generate`, `bridge.known_models`;
   riêng endpoint bridge thì dựng HTTP server loopback thật ở port 0.
 - Test đụng global state kế thừa `_Sandbox` để tự restore `CONFIG` +
-  `bridge._jobs`, `bridge._pending`, `bridge._models`, `bridge._last_seen`.
+  `bridge._jobs`, `bridge._pending`, `bridge._models`, `bridge._last_seen`,
+  `bridge._cancelled`, `bridge._managed_jobs`.
 - Sửa hành vi thì sửa test tương ứng. Không nới assertion chỉ để pass nếu
   hành vi đang sai — báo lại thay vì che bug.
 - **`test_thinking_trace.js`**: scratch file chạy bằng Node.js để debug
@@ -321,9 +352,22 @@ chạm vào bất kỳ điều nào dưới đây:
   history được ghi vào file tạm `qwen_prompt_*.txt` còn lượt cuối được điền vào composer làm prompt;
   nếu không thể tách, toàn bộ ghi file và composer dùng fallback `attachment_prompt`.
   Bridge chỉ serve file đó trong tempdir.
+- **XHR error/abort/timeout (finding 9)**: trước đây chỉ có handler `load` → job treo vĩnh viễn →
+  `active` không giảm → worker không nhận job mới (dù ping vẫn báo sống). Giờ thêm
+  `error`/`abort`/`timeout`/`loadend` + watchdog timer → giải phóng worker.
+- **Navigation watchdog (N1)**: `navigating=true` không có timeout → poll loop `continue` mãi → cùng triệu
+  chứng kẹt worker. Giờ sau 20s không navigate thật → bỏ cờ, poll lại.
+- **Reader leak (N2)**: job đã settle mà stream còn treo → giữ reader/socket. Giờ `reader.cancel()` trong
+  `finally` khi job settled.
+- **Job cancelled flag (finding 2)**: `job.cancelled` được set khi proxy báo `stale=true` hoặc vượt
+  `job.deadline`; mọi thao tác UI check `jobDead(job)` trước khi chạy.
+
 - Global state: `bridge._pending`, `bridge._jobs`, `bridge._models`,
-  `bridge._last_seen`, `qwen._recent_log`.
+  `bridge._last_seen`, `bridge._cancelled`, `bridge._managed_jobs`,
+  `qwen._recent_log`.
 - Tab reload giữa chừng (crash hoặc do app): extension ghi nhận trạng thái qua `sessionStorage`
   để cảnh báo nguyên nhân mất file đã upload; Python drop job orphan khi client ngắt kết nối.
 - Trên Windows, handler trả lỗi trước khi đọc body có thể reset connection;
   test cho case 403 gửi body rỗng.
+
+<!-- qwen_agents_patch1 -->
