@@ -216,6 +216,8 @@ Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` →
 13. **Liveness & strict model/mode (`qwen_findings_patch1`)**: trước MỖI thao tác UI (new-chat,
     selectModel, selectMode, paste, send) extension gọi `GET /alive?job_id=<jid>` và nhận
     `{alive, cancelled}`; job hết hiệu lực → dừng ngay, không gõ/gửi prompt cũ (finding 1/2).
+    Job chết đúng lúc đang chờ captcha cũng được `settle` ngay
+    (không để Python chờ tới timeout của job).
     `POST /cancel {job_id, reason}` huỷ job xuyên suốt. `/requeue` trả **409**
     `{ok:false, cancelled:true}` khi job đã huỷ / không còn caller / vượt `bridge_max_requeues` / quá TTL.
     `/event` cho job chết trả thêm `{stale:true, cancelled}` → extension **phải** dừng UI và bỏ response
@@ -357,8 +359,8 @@ chạm vào bất kỳ điều nào dưới đây:
   `error`/`abort`/`timeout`/`loadend` + watchdog timer → giải phóng worker.
 - **Navigation watchdog (N1)**: `navigating=true` không có timeout → poll loop `continue` mãi → cùng triệu
   chứng kẹt worker. Giờ sau 20s không navigate thật → bỏ cờ, poll lại.
-- **Reader leak (N2)**: job đã settle mà stream còn treo → giữ reader/socket. Giờ `reader.cancel()` trong
-  `finally` khi job settled.
+- **Reader leak (N2)**: job đã settle mà stream còn treo → giữ reader/socket. Giờ `reader.cancel()` ngay trong
+  idle timer (và trong `finally` khi job settled).
 - **Job cancelled flag (finding 2)**: `job.cancelled` được set khi proxy báo `stale=true` hoặc vượt
   `job.deadline`; mọi thao tác UI check `jobDead(job)` trước khi chạy.
 

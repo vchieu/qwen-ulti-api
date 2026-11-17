@@ -1065,7 +1065,9 @@
     const cid = nativeIdOf(fc);
     let call = null;
     if (cid) {
-      call = job._nativeCalls.find((c) => c.cid === cid) || null;
+      /* qwen_followup_patch1: id/index trung nhung TEN khac -> call moi (khong ghi de ten) */
+      call = job._nativeCalls.find((c) => c.cid === cid
+        && (!name || !c.name || c.name === name)) || null;
       if (!call) {
         call = { cid: cid, name: name, arguments: "" };
         job._nativeCalls.push(call);
@@ -1314,6 +1316,8 @@
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
         settle(job, new Error("Upstream stream timeout: khong nhan duoc du lieu tu Qwen sau " + (STREAM_IDLE_TIMEOUT_MS / 1000) + "s"));
+        /* qwen_followup_patch1 (N2): read() dang treo nen finally khong chay -> cancel o day */
+        try { const p = reader.cancel(); if (p && p.catch) p.catch(() => {}); } catch (e) { /* best-effort */ }
       }, STREAM_IDLE_TIMEOUT_MS);
     };
     resetIdleTimer();
@@ -2293,7 +2297,11 @@
          tac UI, va khong gui khi chon model/mode that bai neu config strict. */
       await ensureAlive(job, "truoc new-chat");
       await waitCaptchaClear(job, "truoc new-chat/reload");
-      if (!(await jobAlive(job))) return;
+      if (!(await jobAlive(job))) {
+        /* qwen_followup_patch1: settle de Python khong cho toi timeout */
+        if (!job.settled) settle(job, new Error("job cancelled (cho captcha)"));
+        return;
+      }
       if ((await tryNewChat(job)) === false) return;  // dang reload; job da requeue
       saveJobState(job, "new_chat_done", "New chat step finished");
       if (!(await ensureMode(job))) return;
@@ -2335,6 +2343,8 @@
         // Normal flow
         await submitPrompt(composer, job.prompt, job);
       }
+      /* qwen_followup_patch1: job bi huy ma khong ai settle -> tranh treo toi send-timeout */
+      if (job.cancelled && !job.settled) settle(job, new Error("job cancelled"));
       await job.promise;
     } catch (e) {
       settle(job, e);

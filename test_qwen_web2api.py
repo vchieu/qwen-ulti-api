@@ -2317,5 +2317,26 @@ class TestFindingsPatch1Http(_Sandbox):
         self.assertFalse(data["require_model"])
 
 
+class TestBridgeTimeoutIsInactivity(_Sandbox):
+    """bridge_job_timeout = thoi gian im lang, khong phai tong thoi gian job."""
+
+    def test_slow_but_active_stream_is_not_killed(self):
+        CONFIG["bridge_job_timeout"] = 1.5
+        bridge._last_seen = time.time() + 1000
+
+        def feed():
+            while not bridge._jobs:
+                time.sleep(0.01)
+            q = next(iter(bridge._jobs.values()))
+            for d, ev in zip([0.2, 1.2, 1.2, 1.2, 0.1],
+                             [{"kind": "delta", "text": c} for c in "abcd"]
+                             + [{"kind": "done"}]):
+                time.sleep(d)
+                q.put(ev)
+        threading.Thread(target=feed, daemon=True).start()
+        out = "".join(t for _k, t in bridge.generate_stream("p", "m", False))
+        self.assertEqual(out, "abcd")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

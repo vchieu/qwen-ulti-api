@@ -309,6 +309,9 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=N
                             status=504)
                     continue
                 kind = ev.get("kind")
+                # qwen_followup_patch1: bridge_job_timeout la thoi gian IM LANG,
+                # khong phai tong thoi gian job (stream dai khong bi giet).
+                deadline = time.monotonic() + timeout
                 if ev.get("cancelled"):
                     raise qwen.QwenError("browser bridge: job da bi huy", status=499)
                 if kind == "delta":
