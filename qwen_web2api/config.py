@@ -28,7 +28,7 @@ DEFAULT_CONFIG = {
     # job khi trang da co tin nhan de tranh lan context. false = chi canh bao.
     "temporary_chat_reload": True,
     # Khi tab dang hien captcha: cho nguoi dung giai (giay) thay vi reload/gui tiep.
-    # 0 = tat. (qwen_fix_patch6)
+    # 0 = tat.
     "captcha_wait_seconds": 300,
     # Chon che do Thinking/Auto/Fast trong UI theo reasoning_effort (none/low=Fast,
     # medium=Auto, high=Thinking; khong gui = giu nguyen UI). false = khong cham UI.
@@ -37,7 +37,7 @@ DEFAULT_CONFIG = {
     # (khong phu thuoc dropdown/tab nen). Mac dinh tat.
     "bridge_force_request_model": False,
     # Tuy chon (khong dat key = 130000): tran ky tu cua FILE prompt (paste->file).
-    # > 131072 ky tu thi extension upload qua input[type=file] thay vi paste.
+    # > 131072 ky tu van thu paste-file truoc; cac strategy khac chi la fallback.
     # "file_prompt_max_chars": 130000,
     # Text prompt gui kem khi prompt dai duoc paste/attach thanh document trong UI.
     "attachment_prompt": "Please read the text and action",
@@ -46,7 +46,7 @@ DEFAULT_CONFIG = {
     "retry_delay_sec": 2,
     "max_body_bytes": 32 * 1024 * 1024,
     # 0 = KHONG cat prompt (Qwen context lon; gioi han that la 131072 ky tu cua paste->file,
-    # xem file_prompt_max_chars). Dat so > 0 neu muon ep tran byte. (qwen_fix_patch7)
+    # xem file_prompt_max_chars). Dat so > 0 neu muon ep tran byte.
     "prompt_max_bytes": 0,
 
     "tool_retry_on_miss": True,
@@ -54,22 +54,25 @@ DEFAULT_CONFIG = {
 
     "log_requests": True,
     "log_file": None,
-    # --- qwen_findings_patch1 -------------------------------------------
-    # finding 4: true = chon model / che do UI that bai -> bao loi + retry,
+    # true = chon model / che do UI that bai -> bao loi + retry,
     # khong chay tiep voi model/mode cu cua UI. false = chi warn (cu).
     "bridge_require_model": False,
     "bridge_require_mode": False,
-    # finding 5: false = KHONG cat file prompt (mat evidence o cuoi log).
-    # File > tran paste thi extension phai upload qua input[type=file].
+    # true = job co file ma request cua app
+    # KHONG mang attachment (va noi dung chua gui du bang text) -> chan + retry,
+    # khong gui cau "Please read..." khi Qwen khong nhan duoc tai lieu.
+    "bridge_require_attachment": True,
+    # false = KHONG cat file prompt (mat evidence o cuoi log).
+    # File > tran paste van thu paste-file truoc; fallback cac strategy khac.
     "file_prompt_truncate": False,
-    # finding 5: 0 = khong gioi han. > 0 -> vuot thi tra 413, khong cat im lang.
+    # 0 = khong gioi han. > 0 -> vuot thi tra 413, khong cat im lang.
     "prompt_hard_max_chars": 0,
-    # finding 6: true = tu choi tool_call co arguments hong (nudge retry),
+    # true = tu choi tool_call co arguments hong (nudge retry),
     # false = hanh vi cu (bien thanh {} van tra call cho client).
     "tool_reject_bad_arguments": True,
-    # finding 1: phat hien client ngat ket noi (non-stream) de huy job.
+    # phat hien client ngat ket noi (non-stream) de huy job.
     "bridge_cancel_on_disconnect": True,
-    # finding 1: so lan /requeue toi da cho 1 job (chong job zombie).
+    # so lan /requeue toi da cho 1 job (chong job zombie).
     "bridge_max_requeues": 8,
     # Bat/tat log debug chi tiet (co the dat "debug": true hoac "debug_log": true trong config.json)
     "debug": False,

@@ -43,7 +43,6 @@ def _debug_log(msg):
         _log("[debug] " + msg)
 
 
-# --- qwen_findings_patch1: finding 1 -------------------------------------
 # Truoc day client ngat ket noi chi xoa _jobs[jid]; extension van dang giu
 # job va /requeue (khong kiem tra gi) co the hoi sinh job da chet -> prompt
 # cu tu duoc go lai vao UI. Registry nay cho huy job xuyen suot.
@@ -109,7 +108,7 @@ def _native_fence(name, args, call_id=None):
 
 
 def _split_json_objects(s):
-    """finding 7: tach nhieu JSON object lien tiep trong 1 chuoi arguments.
+    """Tach nhieu JSON object lien tiep trong 1 chuoi arguments.
     Tra ve [] neu khong tach duoc >= 2 object (de tools.py tu choi call)."""
     dec = json.JSONDecoder(strict=False)
     out, i, n = [], 0, len(s)
@@ -190,9 +189,11 @@ def status():
             "select_model": bool(CONFIG.get("bridge_select_model", True)),
             "select_mode": bool(CONFIG.get("bridge_select_mode", True)),
             "force_model": bool(CONFIG.get("bridge_force_request_model", False)),
-            # qwen_findings_patch1 (finding 4): extension phai doc 2 co nay.
+            # extension phai doc 2 co nay.
             "require_model": bool(CONFIG.get("bridge_require_model", False)),
             "require_mode": bool(CONFIG.get("bridge_require_mode", False)),
+            # chan request thieu attachment.
+            "require_attachment": bool(CONFIG.get("bridge_require_attachment", True)),
             "model_ids": _model_ids(),
             "temporary_reload": bool(CONFIG.get("temporary_chat_reload", True)),
             "captcha_wait": _captcha_wait(),
@@ -230,17 +231,30 @@ class _Tracker:
         return delta
 
 
+def _file_companion(file_info):
+    """Cau gui kem file khi prompt nam TOAN BO
+    trong file. Ngoai cau mac dinh con co response_format (extra_instructions)
+    va loi nhac sua loi cua lan retry (retry_nudge) -- truoc day chi co cau
+    mac dinh nen 2 phan nay khong bao gio toi Qwen.
+    """
+    parts = [str(CONFIG.get("attachment_prompt", "Please read the text and action"))]
+    for key in ("extra_instructions", "retry_nudge"):
+        extra = str((file_info or {}).get(key) or "").strip()
+        if extra:
+            parts.append(extra)
+    return "\n\n".join(parts)
+
+
 def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=None,
                     cancel_event=None):
     """Yield (kind, text) -- interface server.py goi cho luong SSE.
 
-    qwen_findings_patch1:
-      finding 1 -- cancel_event (threading.Event): client ngat ket noi thi
+      cancel_event (threading.Event): client ngat ket noi thi
       khong queue job moi, khong retry, huy job dang chay (ke ca GeneratorExit).
-      finding 3 -- khong co file dinh kem -> attachment_prompt = "" (khong
+      khong co file dinh kem -> attachment_prompt = "" (khong
       duoc phep co cau fallback de thay the prompt that cua user).
-      finding 4 -- warn model_mismatch/mode_mismatch + config strict -> loi.
-      finding 6/7 -- arguments hong giu nguyen de tools.py tu choi; chuoi
+      warn model_mismatch/mode_mismatch + config strict -> loi.
+      arguments hong giu nguyen de tools.py tu choi; chuoi
       nhieu JSON lien tiep thi tach thanh nhieu fence.
     """
     attempts = max(1, int(CONFIG.get("retry_attempts", 2)))
@@ -271,8 +285,7 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=N
             att_prompt = str(prompt or file_info["attachment_prompt"])
         elif file_info:
             # Fallback: khong dung prompt vi no chua "[Attached file: ...]".
-            att_prompt = str(CONFIG.get("attachment_prompt",
-                                        "Please read the text and action"))
+            att_prompt = _file_companion(file_info)
         else:
             att_prompt = ""
         _debug_log(f"queueing job {jid} (model={model}, "
@@ -309,7 +322,7 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=N
                             status=504)
                     continue
                 kind = ev.get("kind")
-                # qwen_followup_patch1: bridge_job_timeout la thoi gian IM LANG,
+                # bridge_job_timeout la thoi gian IM LANG,
                 # khong phai tong thoi gian job (stream dai khong bi giet).
                 deadline = time.monotonic() + timeout
                 if ev.get("cancelled"):
@@ -331,7 +344,7 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=N
                     key = ev.get("id") or ev.get("call_id") or ev.get("index")
                     if key is not None:
                         # args trong key: 1 native call bi tach thanh nhieu
-                        # JSON (finding 7) dung chung id nhung arguments khac.
+                        # JSON dung chung id nhung arguments khac.
                         key = (str(name), str(key), str(ev.get("arguments")))
                         if key in seen_native:
                             continue
@@ -398,7 +411,7 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=N
                     return
         except GeneratorExit:
             # Client dong stream: phai danh dau huy, neu khong extension
-            # /requeue la job chet song lai (finding 1).
+            # /requeue la job chet song lai.
             cancel_job(jid, "caller closed stream")
             raise
         except Exception as e:
@@ -424,7 +437,7 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=N
 
 
 def generate(prompt, model, think, file_info=None, mode=None, cancel_event=None):
-    """qwen_findings_patch1: nhan cancel_event (finding 1); join bang ""."""
+    """Nhan cancel_event de huy job; join bang "". Gop het delta thanh content."""
     t0 = time.monotonic()
     usage, content, reasoning = {}, [], []
     extra = {}
@@ -504,8 +517,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._json({"error": "not found"}, 404)
             return
 
-        # qwen_findings_patch1 (finding 1/2/8/9): extension hoi job con song
-        # khong TRUOC moi thao tac UI. GET /alive?job_id=<jid>
+        # Extension hoi job con song TRUOC moi thao tac UI. GET /alive?job_id=<jid>
         if path == "/alive":
             qs = self.path.split("?", 1)[1] if "?" in self.path else ""
             jid = ""
@@ -565,7 +577,6 @@ class _Handler(BaseHTTPRequestHandler):
         _last_seen = time.time()
         if isinstance(data.get("models"), list):
             _remember_models(data["models"])
-        # --- qwen_findings_patch1: finding 1 ---
         if path == "/cancel":
             jid = data.get("job_id")
             if not isinstance(jid, str) or not jid.strip():
@@ -662,7 +673,7 @@ class _Handler(BaseHTTPRequestHandler):
                     _log(f"extension warn (orphan job {jid}): {msg}")
                 else:
                     _debug_log(f"event '{kind}' for unknown/orphan job {jid}: {msg}")
-            # finding 2/8/9: stale=true -> extension phai dung UI va bo response cu.
+            # stale=true -> extension phai dung UI va bo response cu.
             return self._json({"ok": True, "stale": True, "cancelled": bool(dead)})
         self._json({"error": "not found"}, 404)
 

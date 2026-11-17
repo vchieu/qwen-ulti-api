@@ -7,6 +7,7 @@
   "debug": true,
   "bridge_require_model": true,
   "bridge_require_mode": true,
+  "bridge_require_attachment": true,
   "log_requests": true,
-  "attachment_prompt": ""
+  "attachment_prompt": "I have attached a file containing our compressed conversation history.Read the ENTIRE file carefully, then CONTINUE the work from where it left off. Do NOT repeat steps already completed. Start from the exact next action needed."
 }

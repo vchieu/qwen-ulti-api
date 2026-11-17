@@ -66,7 +66,6 @@ class _Sandbox(unittest.TestCase):
             "_jobs": bridge._jobs,
             "_pending": bridge._pending,
             "_models": list(bridge._models),
-            # qwen_findings_patch1
             "_cancelled": bridge._cancelled.copy(),
             "_managed_jobs": bridge._managed_jobs.copy(),
         }
@@ -74,8 +73,8 @@ class _Sandbox(unittest.TestCase):
         CONFIG["log_requests"] = False
         CONFIG["retry_attempts"] = 1
         CONFIG["retry_delay_sec"] = 0
-        bridge._cancelled.clear()      # qwen_findings_patch1
-        bridge._managed_jobs.clear()   # qwen_findings_patch1
+        bridge._cancelled.clear()
+        bridge._managed_jobs.clear()
 
     def tearDown(self):
         CONFIG.clear()
@@ -385,7 +384,7 @@ class TestToolsParsing(_Sandbox):
                          {"q": "x"})
 
     def test_unusable_arguments_degrade_to_empty_object(self):
-        """qwen_findings_patch1 (finding 6): arguments hong -> TU CHOI call."""
+        """Arguments hong -> TU CHOI call."""
         text = '```tool_call\n{"name": "f", "arguments": "not json"}\n```'
         clean, calls, dropped = tools.parse_tool_calls(text, {"f"}, None)
         self.assertEqual(calls, [])
@@ -1163,8 +1162,7 @@ class TestBridgeHttp(_Sandbox):
         self.assertEqual(json.loads(body), {"job": None})
 
     def test_event_handles_tab_reloaded_warning(self):
-        # qwen_findings_patch1: orphan event them stale/cancelled de extension
-        # biet phai dung UI (finding 2/8/9).
+        # orphan event them stale/cancelled de extension biet phai dung UI.
         status, body = self._req("POST", "/event", body={
             "job_id": "job_reloaded",
             "kind": "warn",
@@ -1441,7 +1439,7 @@ class TestServerHelpers(_Sandbox):
             server._remove_prompt_file(file_info)
 
     def test_prepare_large_prompt_history_file_fits_paste_limit(self):
-        """qwen_findings_patch1: cat chi xay ra khi file_prompt_truncate=true."""
+        """Cat chi xay ra khi file_prompt_truncate=true."""
         CONFIG["file_prompt_truncate"] = True
         msgs = [{"role": "system", "content": "SYS"}]
         msgs += [{"role": "user" if i % 2 == 0 else "assistant",
@@ -2068,10 +2066,10 @@ class TestUiModeAndModelList(_Sandbox):
             self.assertEqual(server._file_max_chars(), server.FILE_MAX_CHARS)
 
 
-# --- qwen_findings_patch1: regression tests -------------------------------
-class TestFindingsPatch1(_Sandbox):
+# --- cancel / liveness / strict -------------------------------
+class TestCancelAndStrict(_Sandbox):
     def test_no_attachment_prompt_without_file(self):
-        """finding 3: khong co file -> khong duoc co cau fallback."""
+        """Khong co file -> khong duoc co cau fallback."""
         pending = _fake_pending([{"kind": "delta", "text": "ok"},
                                  {"kind": "done"}])
         with mock.patch.object(bridge, "worker_alive", return_value=True), \
@@ -2080,7 +2078,7 @@ class TestFindingsPatch1(_Sandbox):
         self.assertEqual(pending.jobs[0]["attachment_prompt"], "")
 
     def test_client_gone_before_queue_raises_499(self):
-        """finding 1: khong queue job khi client da di."""
+        """Khong queue job khi client da di."""
         ev = threading.Event()
         ev.set()
         pending = _fake_pending([{"kind": "done"}])
@@ -2092,7 +2090,7 @@ class TestFindingsPatch1(_Sandbox):
         self.assertEqual(pending.jobs, [])
 
     def test_cancel_event_stops_retry(self):
-        """finding 1: khong retry job da bi huy."""
+        """Khong retry job da bi huy."""
         CONFIG["retry_attempts"] = 3
         ev = threading.Event()
         pending = _fake_pending([{"kind": "error", "message": "boom"}])
@@ -2126,7 +2124,7 @@ class TestFindingsPatch1(_Sandbox):
         self.assertEqual(ctx.exception.status, 499)
 
     def test_warn_model_mismatch_strict(self):
-        """finding 4: require_model=true -> loi + retry."""
+        """require_model=true -> loi + retry."""
         CONFIG["bridge_require_model"] = True
         pending = _fake_pending([
             {"kind": "warn", "model_mismatch": True, "message": "picker loi"},
@@ -2147,14 +2145,14 @@ class TestFindingsPatch1(_Sandbox):
         self.assertEqual(out, [("content", "ok")])
 
     def test_unusable_arguments_are_dropped(self):
-        """finding 6."""
+        """arguments khong parse duoc -> tu choi call."""
         text = '```tool_call\n{"name": "f", "arguments": "{oops"}\n```'
         _c, calls, dropped = tools.parse_tool_calls(text, {"f"}, {"f": {"q"}})
         self.assertEqual(calls, [])
         self.assertTrue(dropped and dropped[0].startswith("unusable arguments"))
 
     def test_run_turn_retries_unusable_arguments(self):
-        """finding 6: server phai nudge lai thay vi tra call {}."""
+        """Server phai nudge lai thay vi tra call {}."""
         h = _bare_handler()
         bad = '```tool_call\n{"name": "f", "arguments": "khong phai json"}\n```'
         good = '```tool_call\n{"name": "f", "arguments": {"q": "x"}}\n```'
@@ -2168,7 +2166,7 @@ class TestFindingsPatch1(_Sandbox):
         self.assertIn("unusable", gen.call_args_list[1][0][0])
 
     def test_run_turn_nudges_on_undeclared_tool_drop(self):
-        """qwen_fix_patch8: drop vì undeclared tool phải nudge retry."""
+        """Drop vì undeclared tool phải nudge retry."""
         h = _bare_handler()
         bad = ('```tool_call\n{"name": "code_interpreter", '
                '"arguments": {"code": "print(1)"}}\n```')
@@ -2187,7 +2185,7 @@ class TestFindingsPatch1(_Sandbox):
         self.assertIn("shell", retry_prompt)
 
     def test_run_turn_nudges_on_invalid_json_drop(self):
-        """qwen_fix_patch8: block thiếu ngoặc/JSON hỏng phải nudge retry."""
+        """Block thiếu ngoặc/JSON hỏng phải nudge retry."""
         h = _bare_handler()
         bad = ('```tool_call\n{"name": "shell", "arguments": '
                '{"command": "ls"}\n```')  # thiếu } đóng object ngoài
@@ -2203,7 +2201,7 @@ class TestFindingsPatch1(_Sandbox):
         self.assertIn("body is not valid JSON", gen.call_args_list[1][0][0])
 
     def test_native_concatenated_arguments_are_split(self):
-        """finding 7 (mitigation): 2 arguments dinh nhau -> 2 call."""
+        """Mitigation: 2 arguments dinh nhau -> 2 call."""
         pending = _fake_pending([
             {"kind": "tool_call", "name": "read_file",
              "arguments": '{"path": "a.py"}{"path": "b.py"}'},
@@ -2220,7 +2218,7 @@ class TestFindingsPatch1(_Sandbox):
             ["a.py", "b.py"])
 
     def test_native_split_parts_with_same_id_are_kept(self):
-        """finding 7: part tach tu 1 native call giu cung id nhung khac
+        """Part tach tu 1 native call giu cung id nhung khac
         arguments -> khong bi dedupe nham."""
         pending = _fake_pending([
             {"kind": "tool_call", "name": "read_file", "id": "call_1",
@@ -2241,7 +2239,7 @@ class TestFindingsPatch1(_Sandbox):
             [json.loads(c["function"]["arguments"])["path"] for c in calls],
             ["a.py", "b.py"])
     def test_large_prompt_keeps_full_content_by_default(self):
-        """finding 5: khong cat file prompt."""
+        """Khong cat file prompt."""
         msgs = [{"role": "user", "content": "HEAD" + "x" * 3000},
                 {"role": "user", "content": "tail question"}]
         with mock.patch.object(server, "MAX_PROMPT_CHARS", 1000), \
@@ -2257,7 +2255,7 @@ class TestFindingsPatch1(_Sandbox):
             server._remove_prompt_file(fi)
 
     def test_prompt_hard_limit_raises_413(self):
-        """finding 5: vuot hard limit -> bao loi, khong cat."""
+        """Vuot hard limit -> bao loi, khong cat."""
         CONFIG["prompt_hard_max_chars"] = 100
         with self.assertRaises(qwen.QwenError) as ctx:
             server.prepare_large_prompt([{"role": "user",
@@ -2265,7 +2263,7 @@ class TestFindingsPatch1(_Sandbox):
         self.assertEqual(ctx.exception.status, 413)
 
 
-class TestFindingsPatch1Http(_Sandbox):
+class TestConnectionLivenessHttp(_Sandbox):
     @classmethod
     def setUpClass(cls):
         cls.srv = bridge._Server(("127.0.0.1", 0), bridge._Handler)
@@ -2371,6 +2369,173 @@ class TestBridgeTimeoutIsInactivity(_Sandbox):
         threading.Thread(target=feed, daemon=True).start()
         out = "".join(t for _k, t in bridge.generate_stream("p", "m", False))
         self.assertEqual(out, "abcd")
+
+
+class TestDisconnectAndArguments(_Sandbox):
+    """Disconnect, arguments sai kieu, nudge/response_format vao composer
+    khi prompt nam trong file, va bridge_require_attachment."""
+
+    # ---- loi socket -> danh dau client da ngat
+    def _watch_raises(self, exc, expect_gone=True):
+        h = _bare_handler()
+        h.connection = object()
+        with mock.patch("select.select", side_effect=exc):
+            gone, stop = h._watch_disconnect()
+            try:
+                self.assertEqual(gone.wait(3 if expect_gone else 1.3), expect_gone)
+            finally:
+                stop()
+
+    def test_watcher_marks_gone_on_connection_reset(self):
+        self._watch_raises(ConnectionResetError(104, "reset by peer"))
+
+    def test_watcher_marks_gone_on_connection_aborted(self):
+        self._watch_raises(ConnectionAbortedError(10053, "aborted"))
+
+    def test_watcher_marks_gone_on_bad_fd_oserror(self):
+        import errno
+        self._watch_raises(OSError(errno.EBADF, "bad file descriptor"))
+
+    def test_watcher_marks_gone_on_closed_socket(self):
+        self._watch_raises(ValueError("file descriptor cannot be a negative integer (-1)"))
+
+    def test_watcher_ignores_unrelated_error(self):
+        self._watch_raises(RuntimeError("khong lien quan"), expect_gone=False)
+
+    def test_heartbeat_marks_gone_on_connection_aborted(self):
+        h = _bare_handler()
+        h._sse_write = mock.Mock(side_effect=ConnectionAbortedError(10053, "aborted"))
+        stop, gone = threading.Event(), threading.Event()
+        self.assertFalse(server._Heartbeat(h, stop, gone).ping())
+        self.assertTrue(gone.is_set())
+
+    # ---- arguments sai kieu
+    def test_non_object_arguments_rejected_for_optional_params(self):
+        for raw in ("[]", "[1, 2]", "5", "true", "1.5"):
+            text = '```tool_call\n{"name": "f", "arguments": %s}\n```' % raw
+            for schemas in ({"f": {"q"}}, {"f": set()}, None):
+                _c, calls, dropped = tools.parse_tool_calls(text, {"f"}, schemas)
+                self.assertEqual(calls, [], (raw, schemas))
+                self.assertEqual(len(dropped), 1, (raw, schemas))
+                self.assertTrue(dropped[0].startswith("unusable arguments"), dropped)
+                self.assertIn("got", dropped[0])
+
+    def test_object_null_and_json_string_arguments_still_ok(self):
+        ok = [('{"name": "f", "arguments": {"q": "x"}}', {"q": "x"}),
+              ('{"name": "f", "arguments": null}', {}),
+              ('{"name": "f", "arguments": "{\\"q\\": \\"x\\"}"}', {"q": "x"})]
+        for raw, expected in ok:
+            text = "```tool_call\n" + raw + "\n```"
+            _c, calls, dropped = tools.parse_tool_calls(text, {"f"}, {"f": {"q"}})
+            self.assertEqual(dropped, [], raw)
+            self.assertEqual(json.loads(calls[0]["function"]["arguments"]), expected, raw)
+
+    def test_param_named_arguments_is_not_treated_as_wrapper(self):
+        text = '```tool_call\n{"name": "f", "arguments": [1, 2]}\n```'
+        _c, calls, dropped = tools.parse_tool_calls(text, {"f"}, {"f": {"arguments"}})
+        self.assertEqual(dropped, [])
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]),
+                         {"arguments": [1, 2]})
+
+    def test_non_object_arguments_legacy_mode(self):
+        CONFIG["tool_reject_bad_arguments"] = False
+        text = '```tool_call\n{"name": "f", "arguments": []}\n```'
+        _c, calls, dropped = tools.parse_tool_calls(text, {"f"}, {"f": {"q"}})
+        self.assertEqual(dropped, [])
+        self.assertEqual(len(calls), 1)
+
+    def test_run_turn_retries_list_arguments(self):
+        h = _bare_handler()
+        bad = '```tool_call\n{"name": "f", "arguments": []}\n```'
+        good = '```tool_call\n{"name": "f", "arguments": {"q": "x"}}\n```'
+        results = [{"content": bad, "reasoning": "", "usage": {}},
+                   {"content": good, "reasoning": "", "usage": {}}]
+        with mock.patch.object(bridge, "generate", side_effect=results) as gen:
+            _t, _r, calls, _u = h._run_turn(
+                "p", "m", False, True, {"f"}, {"f": {"q"}}, None, False)
+        self.assertEqual(gen.call_count, 2)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"q": "x"})
+        self.assertIn("unusable", gen.call_args_list[1][0][0])
+
+    # ---- nudge / response_format vao composer khi prompt nam trong file
+    def test_file_companion_carries_extra_and_retry_nudge(self):
+        pending = _fake_pending([{"kind": "delta", "text": "ok"}, {"kind": "done"}])
+        fi = {"path": "x", "filename": "x.txt", "size": 10,
+              "extra_instructions": "IMPORTANT: Respond with JSON only.",
+              "retry_nudge": "IMPORTANT: Emit the tool_call again."}
+        with mock.patch.object(bridge, "worker_alive", return_value=True), \
+                mock.patch.object(bridge, "_pending", pending):
+            list(bridge.generate_stream("short", "m", False, file_info=fi))
+        att = pending.jobs[0]["attachment_prompt"]
+        self.assertTrue(att.startswith(CONFIG["attachment_prompt"]), att)
+        self.assertIn("Respond with JSON only.", att)
+        self.assertIn("Emit the tool_call again.", att)
+
+    def test_file_companion_unchanged_without_extras(self):
+        pending = _fake_pending([{"kind": "delta", "text": "ok"}, {"kind": "done"}])
+        with mock.patch.object(bridge, "worker_alive", return_value=True), \
+                mock.patch.object(bridge, "_pending", pending):
+            list(bridge.generate_stream(
+                "short", "m", False, file_info={"path": "x", "filename": "x.txt"}))
+        self.assertEqual(pending.jobs[0]["attachment_prompt"],
+                         CONFIG["attachment_prompt"])
+
+    def test_run_turn_passes_nudge_to_whole_file_job(self):
+        h = _bare_handler()
+        fi = {"path": "x", "filename": "x.txt", "size": 10}
+        bad = '```tool_call\n{"name": "f", "arguments": []}\n```'
+        good = '```tool_call\n{"name": "f", "arguments": {"q": "x"}}\n```'
+        results = [{"content": bad, "reasoning": "", "usage": {}},
+                   {"content": good, "reasoning": "", "usage": {}}]
+        with mock.patch.object(bridge, "generate", side_effect=results) as gen:
+            h._run_turn("p", "m", False, True, {"f"}, {"f": {"q"}}, None, False,
+                        file_info=fi)
+        first = gen.call_args_list[0][1]["file_info"]
+        second = gen.call_args_list[1][1]["file_info"]
+        self.assertNotIn("retry_nudge", first)
+        self.assertIn("unusable", second["retry_nudge"])
+        self.assertNotIn("retry_nudge", fi)   # khong sua file_info goc
+
+    def test_run_turn_split_job_keeps_same_file_info(self):
+        h = _bare_handler()
+        fi = {"path": "x", "filename": "x.txt", "size": 10,
+              "attachment_prompt": "p"}
+        bad = '```tool_call\n{"name": "f", "arguments": []}\n```'
+        good = '```tool_call\n{"name": "f", "arguments": {"q": "x"}}\n```'
+        results = [{"content": bad, "reasoning": "", "usage": {}},
+                   {"content": good, "reasoning": "", "usage": {}}]
+        with mock.patch.object(bridge, "generate", side_effect=results) as gen:
+            h._run_turn("p", "m", False, True, {"f"}, {"f": {"q"}}, None, False,
+                        file_info=fi)
+        self.assertIs(gen.call_args_list[1][1]["file_info"], fi)
+
+    def test_chat_whole_file_prompt_gets_response_format_extra(self):
+        h = _bare_handler()
+        h.send_json = lambda data, status=200: h.errors.append((status, data))
+        body = json.dumps({
+            "model": "qwen3.8-max",
+            "messages": [{"role": "user", "content": "Z" * 140000}],
+            "response_format": {"type": "json_object"},
+        }).encode()
+        seen = {}
+
+        def fake_generate(prompt, upstream, think, file_info=None, **kw):
+            seen["file_info"] = dict(file_info or {})
+            return {"content": "{}", "reasoning": "", "usage": {}}
+
+        with mock.patch.object(bridge, "generate", side_effect=fake_generate):
+            h._handle_chat(body)
+        self.assertEqual(h.errors[0][0], 200, h.errors)
+        self.assertIn("single valid JSON object",
+                      seen["file_info"].get("extra_instructions", ""))
+
+    # ---- co bridge_require_attachment
+    def test_require_attachment_default_and_status(self):
+        self.assertTrue(DEFAULT_CONFIG["bridge_require_attachment"])
+        self.assertTrue(bridge.status()["require_attachment"])
+        CONFIG["bridge_require_attachment"] = False
+        self.assertFalse(bridge.status()["require_attachment"])
 
 
 if __name__ == "__main__":

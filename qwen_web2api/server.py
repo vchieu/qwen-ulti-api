@@ -53,7 +53,7 @@ def _usage(prompt, text, upstream=None):
 
 
 def _map_error(e):
-    """qwen_findings_patch1: giu nguyen 413/499/504 thay vi don ve 503."""
+    """giu nguyen 413/499/504 thay vi don ve 503."""
     status = getattr(e, "status", None)
     if status == 429:
         return 429, f"upstream rate limited: {e}", ERR_RATE, "rate_limit_exceeded"
@@ -186,10 +186,11 @@ def _log_turn_result(cid, text, reasoning, calls, usage, elapsed):
 
 
 def _render_fit(messages, tools=None, tool_choice=None, prefix="", limit=None):
-    """qwen_findings_patch1 (finding 5): MAC DINH KHONG CAT.
+    """MAC DINH KHONG CAT.
 
-    Qwen chi chuyen paste <= 131072 ky tu thanh file, nhung extension co
-    duong upload input[type=file] cho file lon hon. Cat o day = mat evidence
+    Qwen co the chuyen paste thanh file (A/B: van dung o ~320k ky tu); neu that bai extension co
+    duong attach khac (paste-text, file-input, drop-file) neu paste that bai.
+    Cat o day = mat evidence
     (log loi thuong nam o CUOI message). Chi cat khi
     CONFIG["file_prompt_truncate"] = true.
     """
@@ -199,8 +200,8 @@ def _render_fit(messages, tools=None, tool_choice=None, prefix="", limit=None):
     if not CONFIG.get("file_prompt_truncate"):
         if len(prefix) + orig > limit:
             log(f"[bridge] file prompt {len(prefix) + orig} chars > paste limit "
-                f"{limit}: giu nguyen noi dung, extension phai upload qua "
-                "input[type=file] (khong cat)")
+                f"{limit}: giu nguyen noi dung, extension thu paste-file roi "
+                "drop-file, fallback paste-text/file-input (khong cat)")
         return prefix + text
     budget = max(1000, limit - len(prefix))
     if orig > budget:
@@ -219,10 +220,9 @@ def _render_fit(messages, tools=None, tool_choice=None, prefix="", limit=None):
 def prepare_large_prompt(messages, tools=None, tool_choice=None):
     """Prompt vuot MAX_PROMPT_CHARS -> tach history sang file .txt tam.
 
-    qwen_findings_patch1 (finding 5):
       - KHONG cat noi dung (tru khi file_prompt_truncate=true).
-      - file_info them paste_limit / over_paste_limit de extension chon
-        duong upload input[type=file] thay vi paste.
+      - file_info them paste_limit / over_paste_limit de extension thu paste
+        truoc; cac duong khac chi la fallback khi paste that bai.
       - prompt_hard_max_chars > 0 va vuot -> QwenError 413, khong cat im lang.
     """
     full_prompt = messages_to_prompt(messages, tools, tool_choice)
@@ -388,6 +388,39 @@ def _responses_messages(inp, instructions):
     return msgs
 
 
+def _is_disconnect_error(exc):
+    """loi socket nao nghia la 'client da ngat'.
+
+    ConnectionError (reset/aborted/broken pipe, ke ca WinError 10053/10054) va
+    OSError mang errno/winerror cua socket da dong/da ngat.
+    """
+    if isinstance(exc, ConnectionError):
+        return True
+    if isinstance(exc, OSError):
+        import errno as _errno
+        codes = {getattr(_errno, n) for n in
+                 ("ECONNRESET", "ECONNABORTED", "EPIPE", "ENOTCONN",
+                  "ESHUTDOWN", "EBADF", "ENOTSOCK") if hasattr(_errno, n)}
+        codes |= {10038, 10053, 10054, 10057, 10058}   # WSAE* (Windows)
+        return (getattr(exc, "errno", None) in codes
+                or getattr(exc, "winerror", None) in codes)
+    return False
+
+
+def _file_for_attempt(file_info, nudge):
+    """prompt nam TOAN BO trong file (khong co
+    file_info.attachment_prompt) thi composer chi nhan cau mac dinh -> loi nhac
+    retry cua _run_turn bi mat. Gan nudge vao ban sao file_info de bridge dua
+    vao composer. Job tach history/luot cuoi da dung `prompt` (co nudge) nen
+    giu nguyen doi tuong goc.
+    """
+    if not file_info or not nudge or file_info.get("attachment_prompt"):
+        return file_info
+    out = dict(file_info)
+    out["retry_nudge"] = str(nudge).strip()
+    return out
+
+
 class _Heartbeat:
     """SSE keep-alive while a buffered turn works upstream."""
 
@@ -402,10 +435,11 @@ class _Heartbeat:
             try:
                 self.h._sse_write(b": ping\n\n")
                 return True
-            except (BrokenPipeError, ConnectionResetError):
-                self.gone.set()
-                return False
-            except Exception:
+            except Exception as e:
+                # moi loi socket 'client ngat'
+                # (ke ca ConnectionAbortedError / WinError 10053) deu danh dau gone.
+                if _is_disconnect_error(e):
+                    self.gone.set()
                 return False
 
     def run(self):
@@ -607,7 +641,7 @@ class QwenHandler(BaseHTTPRequestHandler):
             elif e in ("medium", "high"):
                 think = True
         # Che do UI Thinking/Auto/Fast: none/low -> fast, medium -> auto, high -> thinking;
-        # khong co reasoning_effort -> None (giu nguyen UI). (qwen_fix_patch7)
+        # khong co reasoning_effort -> None (giu nguyen UI).
         mode = ui_mode_for_effort(effort)
         if mode is None and isinstance(raw, str) and "@think=" in raw:
             mode = "thinking" if think else "fast"
@@ -624,8 +658,7 @@ class QwenHandler(BaseHTTPRequestHandler):
 
     # ---------------------------------------------------------- tool turn --
     def _watch_disconnect(self):
-        """qwen_findings_patch1 (finding 1): phat hien client ngat ket noi cho
-        request NON-STREAM (khong co heartbeat SSE). Tra ve (event, stop_fn);
+        """Phat hien client ngat ket noi cho request NON-STREAM (khong co heartbeat SSE). Tra ve (event, stop_fn);
         khong co socket that -> (None, None) de unit test khong bi anh huong."""
         sock = getattr(self, "connection", None)
         if sock is None or not CONFIG.get("bridge_cancel_on_disconnect", True):
@@ -636,6 +669,10 @@ class QwenHandler(BaseHTTPRequestHandler):
         def _run():
             import select
             import socket as _socket
+            # loi socket cho thay client da
+            # ngat (reset/abort/broken pipe/socket da dong) -> DANH DAU gone roi
+            # moi thoat. Truoc day `except Exception: return` thoat im lang nen
+            # request cu van chay tiep.
             while not stop.wait(0.5):
                 try:
                     r, _w, _x = select.select([sock], [], [], 0)
@@ -644,7 +681,16 @@ class QwenHandler(BaseHTTPRequestHandler):
                     if not sock.recv(1, _socket.MSG_PEEK):
                         gone.set()
                         return
-                except Exception:
+                except (BlockingIOError, InterruptedError, _socket.timeout):
+                    continue
+                except ValueError:
+                    # select/recv tren socket da dong (fileno = -1)
+                    gone.set()
+                    return
+                except Exception as e:
+                    if _is_disconnect_error(e):
+                        debug_log(f"client disconnect detected: {e!r}")
+                        gone.set()
                     return
 
         threading.Thread(target=_run, daemon=True).start()
@@ -653,7 +699,7 @@ class QwenHandler(BaseHTTPRequestHandler):
     def _run_turn(self, prompt, upstream, think, tools_active, allowed,
                   schemas, required_params, required_tool, client_gone=None,
                   file_info=None, on_reasoning_delta=None):
-        """qwen_findings_patch1: finding 1 (huy job) + finding 6 (arguments hong)."""
+        """Huy job khi client ngat; tu choi tool_call co arguments hong."""
         stop_watch = None
         if client_gone is None:
             client_gone, stop_watch = self._watch_disconnect()
@@ -670,6 +716,7 @@ class QwenHandler(BaseHTTPRequestHandler):
                 if client_gone is not None and client_gone.is_set():
                     raise QwenError("client disconnected; job cancelled", status=499)
                 call_prompt = prompt + nudge if nudge else prompt
+                call_file = _file_for_attempt(file_info, nudge)
                 debug_log(f"run_turn attempt {attempt + 1}/{attempts} "
                           f"(tools_active={tools_active}, required_tool={bool(required_tool)})")
                 _t0 = time.time()
@@ -677,7 +724,7 @@ class QwenHandler(BaseHTTPRequestHandler):
                     content_parts, reasoning_parts, usage = [], [], {}
                     for kind, delta in bridge.generate_stream(
                             call_prompt, upstream, think, usage,
-                            file_info=file_info, **extra):
+                            file_info=call_file, **extra):
                         if client_gone is not None and client_gone.is_set():
                             break
                         if kind == "reasoning":
@@ -689,7 +736,7 @@ class QwenHandler(BaseHTTPRequestHandler):
                     reasoning = "".join(reasoning_parts)
                 else:
                     result = bridge.generate(call_prompt, upstream, think,
-                                             file_info=file_info, **extra)
+                                             file_info=call_file, **extra)
                     text, reasoning, usage = (result["content"], result["reasoning"],
                                               result["usage"])
                 if client_gone is not None and client_gone.is_set():
@@ -723,7 +770,7 @@ class QwenHandler(BaseHTTPRequestHandler):
                         text = text.strip()
                     return text, reasoning, calls, usage
                 if bad_args:
-                    # finding 6: KHONG tra call voi arguments {} gia tao.
+                    # KHONG tra call voi arguments {} gia tao.
                     if attempt + 1 < attempts:
                         debug_log(f"unusable tool arguments, nudge retry: {bad_args}")
                         nudge = ("\n\nIMPORTANT: Your previous tool_call had unusable "
@@ -735,7 +782,7 @@ class QwenHandler(BaseHTTPRequestHandler):
                     raise QwenError("model emitted tool_call with unusable arguments: "
                                     + "; ".join(bad_args))
                 if dropped and tools_active:
-                    # qwen_fix_patch8: block bị drop (undeclared tool, JSON hỏng)
+                    # block bị drop (undeclared tool, JSON hỏng)
                     # vẫn để lại raw fence trong text nên looks_like_missed_tool_call
                     # trả False; phải nudge theo đúng lý do drop.
                     if attempt + 1 < attempts:
@@ -835,7 +882,7 @@ class QwenHandler(BaseHTTPRequestHandler):
             else:
                 self.send_api_error(404, f"not found: {path}", ERR_INVALID)
         except QwenError as e:
-            # qwen_findings_patch1: prepare_large_prompt co the raise 413
+            # prepare_large_prompt co the raise 413
             self.send_api_error(*_map_error(e))
         except ValueError as e:
             self.send_api_error(413 if "too large" in str(e) else 400,
@@ -881,6 +928,10 @@ class QwenHandler(BaseHTTPRequestHandler):
             prompt += rf
         if file_info and file_info.get("attachment_prompt"):
             file_info["attachment_prompt"] = prompt
+        elif file_info and rf:
+            # prompt nam toan bo trong file ->
+            # response_format phai vao composer (file khong chua no).
+            file_info["extra_instructions"] = rf.strip()
         if not prompt.strip():
             return self.send_api_error(400, "empty prompt", ERR_INVALID)
         stream = bool(req.get("stream"))
@@ -1047,8 +1098,8 @@ class QwenHandler(BaseHTTPRequestHandler):
                     full += buf
                     self._sse_chunk(cid, model, {"content": buf},
                                     None, include_usage)
-        except (BrokenPipeError, ConnectionResetError):
-            gone.set()   # qwen_findings_patch1 (finding 1)
+        except ConnectionError:   # gom ca ConnectionAbortedError (Windows)
+            gone.set()
             return
         except Exception as e:
             log(f"stream error [{model}, prompt_len={len(prompt)}]: {e}")
@@ -1099,6 +1150,8 @@ class QwenHandler(BaseHTTPRequestHandler):
             prompt += rfi
         if file_info and file_info.get("attachment_prompt"):
             file_info["attachment_prompt"] = prompt
+        elif file_info and rfi:
+            file_info["extra_instructions"] = rfi.strip()
         if not prompt.strip():
             return self.send_api_error(400, "empty input", ERR_INVALID)
         tools_active = bool(tools) and tool_choice != "none"

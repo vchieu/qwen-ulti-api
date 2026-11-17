@@ -213,7 +213,7 @@ def _join_parts(parts, max_bytes, pinned_head=None) -> str:
 
 def messages_to_prompt(messages, tools=None, tool_choice=None,
                        max_bytes=None) -> str:
-    # prompt_max_bytes <= 0 / thieu = khong gioi han (qwen_fix_patch7)
+    # prompt_max_bytes <= 0 / thieu = khong gioi han
     max_bytes = int(max_bytes or CONFIG.get("prompt_max_bytes", 0) or 0)
     if max_bytes <= 0:
         max_bytes = 1 << 40
@@ -636,6 +636,27 @@ def _normalize_name(name, allowed):
     return next(iter(cands)) if len(cands) == 1 else None
 
 
+def _wrapper_type_error(data, props=None):
+    """Kiem tra KIEU cua khoa arguments/args/...
+    TRUOC khi _extract_args xu ly dang viet tat. Truoc day `arguments: []` o tool
+    chi co tham so tuy chon bi doi thanh {"arguments": []} roi tra cho client.
+    Tra ve mo ta loi, "" neu hop le. Khoa trung ten tham so that (key in props)
+    khong tinh la wrapper.
+    """
+    for key in _ARGUMENT_KEYS:
+        if key not in data:
+            continue
+        if props is not None and key in props:
+            continue
+        v = data[key]
+        if v is None or isinstance(v, dict):
+            continue
+        if isinstance(v, str):
+            continue   # _args_json tu kiem tra chuoi co phai JSON object khong
+        return f"arguments must be an object, got {type(v).__name__}"
+    return ""
+
+
 def _extract_args(data, props=None):
     for key in _ARGUMENT_KEYS:
         if key in data:
@@ -738,9 +759,15 @@ def parse_tool_calls(text, allowed_names=None, tool_schemas=None):
             else:
                 name = resolved or name
                 props = (tool_schemas or {}).get(name)
-                args, degraded = _args_json(_extract_args(data, props))
+                bad_type = _wrapper_type_error(data, props)
+                if bad_type and CONFIG.get("tool_reject_bad_arguments", True):
+                    # sai kieu -> tu choi + retry
+                    reason = f"unusable arguments ({bad_type})"
+                    args, degraded = "{}", None
+                else:
+                    args, degraded = _args_json(_extract_args(data, props))
                 if degraded:
-                    # qwen_findings_patch1 (finding 6): tu choi call co
+                    # tu choi call co
                     # arguments hong thay vi bien thanh {} roi tra cho client.
                     harmless = degraded in ("missing", "empty string") and not props
                     if CONFIG.get("tool_reject_bad_arguments", True) and not harmless:
