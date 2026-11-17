@@ -2167,6 +2167,41 @@ class TestFindingsPatch1(_Sandbox):
         self.assertEqual(len(calls), 1)
         self.assertIn("unusable", gen.call_args_list[1][0][0])
 
+    def test_run_turn_nudges_on_undeclared_tool_drop(self):
+        """qwen_fix_patch8: drop vì undeclared tool phải nudge retry."""
+        h = _bare_handler()
+        bad = ('```tool_call\n{"name": "code_interpreter", '
+               '"arguments": {"code": "print(1)"}}\n```')
+        good = '```tool_call\n{"name": "shell", "arguments": {"command": "ls"}}\n```'
+        results = [{"content": bad, "reasoning": "", "usage": {}},
+                   {"content": good, "reasoning": "", "usage": {}}]
+        with mock.patch.object(bridge, "generate", side_effect=results) as gen:
+            _t, _r, calls, _u = h._run_turn(
+                "p", "m", False, True, {"shell"}, {"shell": {"command"}},
+                None, False)
+        self.assertEqual(gen.call_count, 2)
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["function"]["name"], "shell")
+        retry_prompt = gen.call_args_list[1][0][0]
+        self.assertIn("undeclared tool 'code_interpreter'", retry_prompt)
+        self.assertIn("shell", retry_prompt)
+
+    def test_run_turn_nudges_on_invalid_json_drop(self):
+        """qwen_fix_patch8: block thiếu ngoặc/JSON hỏng phải nudge retry."""
+        h = _bare_handler()
+        bad = ('```tool_call\n{"name": "shell", "arguments": '
+               '{"command": "ls"}\n```')  # thiếu } đóng object ngoài
+        good = '```tool_call\n{"name": "shell", "arguments": {"command": "ls"}}\n```'
+        results = [{"content": bad, "reasoning": "", "usage": {}},
+                   {"content": good, "reasoning": "", "usage": {}}]
+        with mock.patch.object(bridge, "generate", side_effect=results) as gen:
+            _t, _r, calls, _u = h._run_turn(
+                "p", "m", False, True, {"shell"}, {"shell": {"command"}},
+                None, False)
+        self.assertEqual(gen.call_count, 2)
+        self.assertEqual(len(calls), 1)
+        self.assertIn("body is not valid JSON", gen.call_args_list[1][0][0])
+
     def test_native_concatenated_arguments_are_split(self):
         """finding 7 (mitigation): 2 arguments dinh nhau -> 2 call."""
         pending = _fake_pending([

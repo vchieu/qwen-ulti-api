@@ -734,6 +734,19 @@ class QwenHandler(BaseHTTPRequestHandler):
                         continue
                     raise QwenError("model emitted tool_call with unusable arguments: "
                                     + "; ".join(bad_args))
+                if dropped and tools_active:
+                    # qwen_fix_patch8: block bị drop (undeclared tool, JSON hỏng)
+                    # vẫn để lại raw fence trong text nên looks_like_missed_tool_call
+                    # trả False; phải nudge theo đúng lý do drop.
+                    if attempt + 1 < attempts:
+                        names = ", ".join(sorted(allowed)) if allowed else "(none)"
+                        debug_log(f"dropped tool_call block(s), nudge retry: {dropped}")
+                        nudge = ("\n\nIMPORTANT: Your previous tool_call block was "
+                                 "rejected (" + "; ".join(str(d) for d in dropped)
+                                 + "). Use ONLY these tools: " + names
+                                 + '. Emit the call again as valid JSON: '
+                                 '{"name": "<tool_name>", "arguments": {<parameters>}}.')
+                        continue
                 if required_tool:
                     nudge = "\n\nIMPORTANT: Respond with a tool_call block ONLY."
                     continue

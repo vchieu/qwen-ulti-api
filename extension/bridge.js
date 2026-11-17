@@ -23,6 +23,10 @@
   const MODE_NAV_WINDOW_MS = 60000;
   const MODE_NAV_MAX = 2;
   const ATTACHMENT_COMPANION_PROMPT = "Please read the text and action";
+  // qwen_fix_patch8: tool built-in cua Qwen UI (vd code_interpreter chay trong
+  // sandbox cua Qwen). Native call cua cac tool nay KHONG bi chan; de Qwen tu
+  // chay roi stream tiep ket qua. Tool khac van gom tra Python nhu cu.
+  const QWEN_BUILTIN_TOOLS = new Set(["code_interpreter"]);
   const ACTIVE_JOB_KEY = "qwenUIBridgeActiveJob";
 
   let pageLoadedAsTemporary = /[?&]temporary-chat=true/.test(location.search)
@@ -1035,9 +1039,24 @@
     return String(input);
   }
 
+  // qwen_fix_patch8: built-in tool cua Qwen (code_interpreter...) phai de Qwen
+  // UI tu chay; chi native call cua tool client moi bi chan/tra ve Python.
+  function nativeToolName(fc) {
+    let n = String((fc && fc.name) || "").trim().toLowerCase();
+    for (const p of ["functions.", "default_api."]) {
+      if (n.startsWith(p)) n = n.slice(p.length);
+    }
+    return n;
+  }
+
+  function isQwenBuiltinCall(fc) {
+    return QWEN_BUILTIN_TOOLS.has(nativeToolName(fc));
+  }
+
   // Qwen đôi khi gọi tool bằng native function_call thay vì text fence.
   // Gom name + arguments (Qwen stream cumulative) rồi trả cho proxy để client
-  // tự chạy tool, KHÔNG để Qwen tự chạy tool trong sandbox của nó.
+  // tự chạy tool; riêng built-in của Qwen (QWEN_BUILTIN_TOOLS) thì để Qwen
+  // tự chạy trong sandbox của nó.
   function nativeIdOf(fc) {
     for (const k of ["id", "call_id", "tool_call_id", "index"]) {
       const v = fc[k];
@@ -1195,9 +1214,19 @@
 
       // 0. Native function_call: Qwen đang gọi tool bằng structured call.
       // Chỉ can thiệp khi prompt có block "# Tool Use" (client khai báo tools);
-      // function_call của tool built-in (web search...) để Qwen tự xử lý.
+      // function_call của tool built-in (code_interpreter...) để Qwen tự xử lý.
       if (d.function_call) {
-        if (job.toolsActive) collectNativeCall(job, d.function_call);
+        if (isQwenBuiltinCall(d.function_call)) {
+          const bn = nativeToolName(d.function_call);
+          if (!job._builtinNoted) job._builtinNoted = new Set();
+          if (!job._builtinNoted.has(bn)) {
+            job._builtinNoted.add(bn);
+            await send(job.id, { kind: "debug",
+              message: "de Qwen tu chay built-in tool: " + bn });
+          }
+        } else if (job.toolsActive) {
+          collectNativeCall(job, d.function_call);
+        }
         continue;
       }
 

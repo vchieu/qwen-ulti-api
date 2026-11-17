@@ -5,6 +5,8 @@
   "temporary_chat_reload": true,
   "default_model": "qwen3.7-plus",
   "debug": true,
+  "bridge_require_model": true,
+  "bridge_require_mode": true,
   "log_requests": true,
-  "attachment_prompt": "DO NOT reply 'The current content is empty, please regenerate'.Please read the attached document carefully and respond."
+  "attachment_prompt": ""
 }

@@ -231,6 +231,15 @@ Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` →
     không biến thành `{}` rồi trả cho client (finding 6). Extension tách native call theo `id`/`index`
     hoặc ranh giới JSON hoàn chỉnh, không gộp 2 call cùng tên thành 1 chuỗi hỏng (finding 7).
 
+14. **Built-in tool & retry khi drop (`qwen_fix_patch8`)**: native `function_call` của tool built-in
+    Qwen (`code_interpreter` — chạy trong sandbox của Qwen) KHÔNG bị chặn; extension bỏ qua để Qwen
+    UI tự chạy rồi stream tiếp kết quả, chỉ gửi `debug` `de Qwen tu chay built-in tool: ...` một lần.
+    Native call khác vẫn gom trả Python như cũ. Ở `_run_turn`, nếu `parse_tool_calls` trả `dropped`
+    (undeclared tool, `body is not valid JSON`) thì nudge retry kèm lý do + danh sách tool hợp lệ;
+    trước đây raw fence còn trong text làm `looks_like_missed_tool_call` trả `False` nên không retry
+    và block bị trả nguyên thành text. Danh sách built-in là `QWEN_BUILTIN_TOOLS` trong
+    `extension/bridge.js` — Qwen thêm built-in mới phải thêm tên vào đây.
+
 ## Việc dự kiến (chưa làm)
 
 - **Chế độ UI (đã làm, `qwen_fix_patch7`)**: none/low → Fast, medium → Auto, high → Thinking. Nút mở
@@ -347,6 +356,9 @@ chạm vào bất kỳ điều nào dưới đây:
   phải sửa cả trong script.
 - Model-picker DOM là heuristic, chưa có test UI thật: Qwen đổi layout là
   phải chỉnh `findModelTrigger` / `selectModel`.
+- `QWEN_BUILTIN_TOOLS` (`extension/bridge.js`) là danh sách cứng tool built-in của Qwen
+  (`code_interpreter`). Qwen thêm built-in mới mà không thêm tên vào đây thì call đó bị chặn
+  và Python nudge-retry như tool client không khai báo.
 - Temporary-mode switch có thể `location.assign` → mất JS đang chạy; job được
   `/requeue` trước đó và `_jobs` phía Python không bị xoá, nhưng nếu tab
   không reload thì request sẽ timeout.
