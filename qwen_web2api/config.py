@@ -3,6 +3,19 @@ import json
 import os
 import threading
 
+# Che do Thinking/Auto/Fast cua Qwen web ghi thang vao body request (messages[].feature_config),
+# lay tu 3 request completion THAT. Chi liet ke key khac nhau giua cac che do; output_schema /
+# research_mode / auto_search giong nhau nen khong ghi de. Gia tri None (null trong JSON) = XOA key:
+# request Fast that khong co thinking_format.
+DEFAULT_MODE_FEATURE_CONFIG = {
+    "auto": {"thinking_enabled": True, "auto_thinking": True,
+             "thinking_mode": "Auto", "thinking_format": "summary"},
+    "thinking": {"thinking_enabled": True, "auto_thinking": False,
+                 "thinking_mode": "Thinking", "thinking_format": "summary"},
+    "fast": {"thinking_enabled": False, "auto_thinking": False,
+             "thinking_mode": "Fast", "thinking_format": None},
+}
+
 DEFAULT_CONFIG = {
     "host": "127.0.0.1",
     "port": 8082,
@@ -30,12 +43,21 @@ DEFAULT_CONFIG = {
     # Khi tab dang hien captcha: cho nguoi dung giai (giay) thay vi reload/gui tiep.
     # 0 = tat.
     "captcha_wait_seconds": 300,
-    # Chon che do Thinking/Auto/Fast trong UI theo reasoning_effort (none/low=Fast,
-    # medium=Auto, high=Thinking; khong gui = giu nguyen UI). false = khong cham UI.
-    "bridge_select_mode": True,
+    # Chon che do Thinking/Auto/Fast bang DROPDOWN UI theo reasoning_effort. Mac dinh false:
+    # che do da duoc ghi thang vao body request (bridge_force_request_mode), dropdown de
+    # treo khi tab khong active. true = van bam dropdown (bridge_require_mode chi co nghia o day).
+    "bridge_select_mode": False,
     # THU NGHIEM: extension ghi de `model` trong body completion bang model cua job
     # (khong phu thuoc dropdown/tab nen). Mac dinh tat.
     "bridge_force_request_model": False,
+    # Che do Thinking/Auto/Fast: reasoning_effort (none/minimal/low=fast, medium=auto,
+    # high/xhigh/max=thinking; khong gui = khong ghi de, body mang che do UI hien tai) ->
+    # extension ghi de feature_config cua body completion theo bridge_mode_feature_config[mode]
+    # -- khong phu thuoc dropdown UI. Mac dinh = DEFAULT_MODE_FEATURE_CONFIG (request that).
+    # config.json ghi de CA dict (khong merge theo mode); mode khong khai bao -> khong ghi de
+    # (extension warn 1 lan/job). Gia tri null = xoa key.
+    "bridge_force_request_mode": True,
+    "bridge_mode_feature_config": {m: dict(v) for m, v in DEFAULT_MODE_FEATURE_CONFIG.items()},
     # Tuy chon (khong dat key = 130000): tran ky tu cua FILE prompt (paste->file).
     # > 131072 ky tu van thu paste-file truoc; cac strategy khac chi la fallback.
     # "file_prompt_max_chars": 130000,
@@ -76,6 +98,27 @@ DEFAULT_CONFIG = {
     "bridge_max_requeues": 8,
     # Bat/tat log debug chi tiet (co the dat "debug": true hoac "debug_log": true trong config.json)
     "debug": False,
+
+    # --- Danh sach sua trong config.json (restart server de ap dung) ---
+    # Model hien trong /v1/models + id hop le cho extension. null = dung DEFAULT_MODELS
+    # trong models.py. Dang chap nhan: ["id", ...] | [{"id","upstream","desc"}] |
+    # {"id": {"upstream","desc"}}. Co gia tri hop le -> THAY HAN danh sach mac dinh.
+    "models": None,
+    # Tool built-in cua Qwen UI (chay trong sandbox cua Qwen): extension de Qwen tu chay,
+    # khong tra native call ve client. Them ten moi khi Qwen them built-in. [] = khong co.
+    "qwen_builtin_tools": ["code_interpreter"],
+
+    # --- Log theo phien chay ---
+    # true = moi lan bat server ghi 1 file <log_dir>/server-<ngay-gio>-<pid>.log
+    # (day du, khong bi gioi han 100 dong nhu GET /debug).
+    "log_session_file": False,
+    "log_dir": "logs",
+    # true = luu ban sao file prompt (qwen_prompt_*.txt) vao <log_dir>/prompts-<phien>/
+    # de doi chieu voi nhung gi Qwen nhan (file tam bi xoa sau moi luot). Ton dung luong.
+    "log_save_prompt_files": False,
+    # Job co file: usage.input_tokens / so ky tu file < nguong nay -> warn "Qwen co the
+    # chua doc file". 0 = tat warn (van log ty le).
+    "attachment_usage_warn_ratio": 0.05,
 }
 
 CONFIG = dict(DEFAULT_CONFIG)

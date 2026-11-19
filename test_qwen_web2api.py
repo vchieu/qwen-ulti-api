@@ -2040,13 +2040,13 @@ class TestUiModeAndModelList(_Sandbox):
 
     def test_status_flags(self):
         st = bridge.status()
-        self.assertTrue(st["select_mode"])
+        self.assertFalse(st["select_mode"])     # mac dinh: mode di qua body request
         self.assertFalse(st["force_model"])
         self.assertIn("qwen3.7-max", st["model_ids"])
-        CONFIG["bridge_select_mode"] = False
+        CONFIG["bridge_select_mode"] = True
         CONFIG["bridge_force_request_model"] = True
         st = bridge.status()
-        self.assertFalse(st["select_mode"])
+        self.assertTrue(st["select_mode"])
         self.assertTrue(st["force_model"])
 
     def test_prompt_cap_removed_by_default(self):
@@ -2536,6 +2536,279 @@ class TestDisconnectAndArguments(_Sandbox):
         self.assertTrue(bridge.status()["require_attachment"])
         CONFIG["bridge_require_attachment"] = False
         self.assertFalse(bridge.status()["require_attachment"])
+
+
+# ------------------------- config: models / builtin tools / session log / attach ----
+class TestConfigDrivenLists(_Sandbox):
+
+    def test_models_default_comes_from_default_models(self):
+        CONFIG["models"] = None
+        self.assertEqual(set(models.MODELS), set(models.DEFAULT_MODELS))
+        self.assertIn("qwen3.8-max", models.MODELS)
+
+    def test_models_from_config_list_replaces_defaults(self):
+        CONFIG["models"] = ["my-model", {"id": "other", "upstream": "other-up",
+                                         "desc": "d"}, "", 5]
+        self.assertEqual(set(models.MODELS), {"my-model", "other"})
+        self.assertEqual(models.resolve_model("other"), ("other", "other-up", False, None))
+        self.assertEqual(bridge._model_ids(), ["my-model", "other-up"])
+        self.assertNotIn("qwen3.8-max", models.MODELS)
+
+    def test_models_from_config_dict(self):
+        CONFIG["models"] = {"a": {"upstream": "a-up", "desc": "A"}, "b": "B model"}
+        self.assertEqual(models.MODELS["a"]["upstream"], "a-up")
+        self.assertEqual(models.MODELS["b"], {"upstream": "b", "desc": "B model"})
+
+    def test_models_invalid_config_falls_back(self):
+        for bad in ([], {}, "x", 5, [None, 3], {"": "x"}):
+            CONFIG["models"] = bad
+            self.assertEqual(set(models.MODELS), set(models.DEFAULT_MODELS), bad)
+
+    def test_builtin_tools_default_and_status(self):
+        self.assertEqual(DEFAULT_CONFIG["qwen_builtin_tools"], ["code_interpreter"])
+        self.assertEqual(bridge.status()["builtin_tools"], ["code_interpreter"])
+
+    def test_builtin_tools_normalised(self):
+        CONFIG["qwen_builtin_tools"] = [" Code_Interpreter ", "web_search", "web_search", "", 3]
+        self.assertEqual(bridge.builtin_tools(), ["code_interpreter", "web_search"])
+        CONFIG["qwen_builtin_tools"] = []
+        self.assertEqual(bridge.status()["builtin_tools"], [])
+        CONFIG["qwen_builtin_tools"] = "image_gen"
+        self.assertEqual(bridge.builtin_tools(), ["image_gen"])
+        CONFIG["qwen_builtin_tools"] = 5
+        self.assertEqual(bridge.builtin_tools(), ["code_interpreter"])
+
+
+class TestSessionLog(_Sandbox):
+
+    def tearDown(self):
+        qwen.close_session_log()
+        super().tearDown()
+
+    def test_disabled_by_default(self):
+        self.assertFalse(DEFAULT_CONFIG["log_session_file"])
+        self.assertIsNone(qwen.init_session_log())
+        self.assertIsNone(qwen.session_log_path())
+
+    def test_session_file_collects_log_lines_and_hides_api_keys(self):
+        with tempfile.TemporaryDirectory() as d:
+            CONFIG.update({"log_session_file": True, "log_requests": True,
+                           "log_dir": os.path.join(d, "logs"),
+                           "api_keys": ["sekret-key"]})
+            with mock.patch.object(qwen.sys, "stderr", io.StringIO()):
+                path = qwen.init_session_log()
+                self.assertEqual(qwen.init_session_log(), path)   # idempotent
+                qwen.log("hello session")
+            qwen.close_session_log()
+            self.assertTrue(os.path.basename(path).startswith("server-"))
+            with open(path, encoding="utf-8") as f:
+                text = f.read()
+        self.assertIn("hello session", text)
+        self.assertIn("config {", text)
+        self.assertNotIn("sekret-key", text)
+
+    def test_prompt_copy_only_when_enabled(self):
+        with tempfile.TemporaryDirectory() as d:
+            CONFIG["log_dir"] = d
+            msgs = [{"role": "user", "content": "x" * 51}]
+            with mock.patch.object(server, "MAX_PROMPT_CHARS", 50):
+                file_info, _ = server.prepare_large_prompt(msgs)
+            try:
+                self.assertIsNone(qwen.save_prompt_copy(
+                    file_info["path"], file_info["filename"]))
+                CONFIG["log_save_prompt_files"] = True
+                dst = qwen.save_prompt_copy(file_info["path"], file_info["filename"])
+                with open(file_info["path"], "rb") as a, open(dst, "rb") as b:
+                    self.assertEqual(a.read(), b.read())
+            finally:
+                server._remove_prompt_file(file_info)
+
+
+class TestAttachDiagnostics(_Sandbox):
+
+    def _fi(self, chars=130000):
+        return {"filename": "qwen_prompt_x.txt", "size": chars, "bytes": chars,
+                "sha256": "ab" * 32}
+
+    def test_prepare_large_prompt_adds_fingerprint(self):
+        import hashlib
+        msgs = [{"role": "user", "content": "xin chào " * 10}]
+        with mock.patch.object(server, "MAX_PROMPT_CHARS", 50):
+            file_info, _ = server.prepare_large_prompt(msgs)
+        try:
+            with open(file_info["path"], "rb") as f:
+                raw = f.read()
+            self.assertEqual(file_info["bytes"], len(raw))
+            self.assertGreater(file_info["bytes"], file_info["size"])
+            self.assertEqual(file_info["sha256"], hashlib.sha256(raw).hexdigest())
+            self.assertEqual(file_info["lines"], raw.count(b"\n") + 1)
+            self.assertFalse(file_info["truncated"])
+        finally:
+            server._remove_prompt_file(file_info)
+
+    def test_attach_report_low_usage_warns(self):
+        line, warns = bridge.attach_report(
+            self._fi(), {"input_tokens": 120, "output_tokens": 50}, "ok", 0.05)
+        self.assertIn("usage_in=120", line)
+        self.assertTrue(any("input_tokens" in w for w in warns))
+
+    def test_attach_report_normal_usage_is_quiet(self):
+        _line, warns = bridge.attach_report(
+            self._fi(), {"prompt_tokens": 40000}, "Da doc xong file", 0.05)
+        self.assertEqual(warns, [])
+
+    def test_attach_report_ratio_warning_can_be_disabled(self):
+        _line, warns = bridge.attach_report(
+            self._fi(), {"input_tokens": 10}, "ok", 0)
+        self.assertEqual(warns, [])
+
+    def test_attach_report_tolerates_sparse_input(self):
+        line, warns = bridge.attach_report({"path": "x"}, {}, "", 0.05)
+        self.assertIn("[attach-check]", line)
+        self.assertEqual(warns, [])
+        self.assertEqual(bridge.attach_report(None, None, None)[1], [])
+
+    def test_attach_report_detects_no_file_reply(self):
+        for text in ("I can't see any attached file in our conversation.",
+                     "Mình không thấy file đính kèm nào cả.",
+                     "我没有看到附件内容",
+                     "The attachment appears to be empty."):
+            _line, warns = bridge.attach_report(
+                self._fi(), {"input_tokens": 40000}, text, 0.05)
+            self.assertTrue(warns, text)
+
+    def test_attach_report_normal_reply_not_flagged(self):
+        for text in ("Đã đọc toàn bộ file. Bước tiếp theo là sửa hàm parse.",
+                     "I read the whole file; next I will update config.py"):
+            _line, warns = bridge.attach_report(
+                self._fi(), {"input_tokens": 40000}, text, 0.05)
+            self.assertEqual(warns, [], text)
+
+
+# ------------------------------- findings: attach liveness / empty-string arguments ----
+class TestEmptyStringArguments(unittest.TestCase):
+
+    def _parse(self, body, schemas):
+        text = "```tool_call\n" + body + "\n```"
+        return tools.parse_tool_calls(text, {"f"}, schemas)
+
+    def test_empty_string_rejected_for_tool_with_optional_params(self):
+        for raw in ('""', '"   "'):
+            body = '{"name": "f", "arguments": %s}' % raw
+            _c, calls, dropped = self._parse(body, {"f": {"q"}})
+            self.assertEqual(calls, [], raw)
+            self.assertEqual(dropped, ["unusable arguments (empty string)"], raw)
+
+    def test_empty_string_is_empty_object_for_tool_without_params(self):
+        for schemas in ({"f": set()}, None):
+            _c, calls, dropped = self._parse('{"name": "f", "arguments": ""}', schemas)
+            self.assertEqual(dropped, [], schemas)
+            self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {}, schemas)
+
+    def test_empty_wrapper_never_becomes_a_parameter(self):
+        for key in ("arguments", "args", "input", "params", "parameters"):
+            body = '{"name": "f", "%s": ""}' % key
+            _c, calls, _d = self._parse(body, {"f": set()})
+            self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {}, key)
+
+    def test_empty_wrapper_dropped_next_to_shorthand_params(self):
+        _c, calls, dropped = self._parse(
+            '{"name": "f", "arguments": "", "q": "x"}', {"f": {"q"}})
+        self.assertEqual(dropped, [])
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"q": "x"})
+
+    def test_param_named_like_wrapper_is_kept(self):
+        _c, calls, dropped = self._parse(
+            '{"name": "f", "input": ""}', {"f": {"input"}})
+        self.assertEqual(dropped, [])
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {"input": ""})
+
+    def test_empty_string_legacy_mode_degrades_to_empty_object(self):
+        CONFIG["tool_reject_bad_arguments"] = False
+        try:
+            _c, calls, dropped = self._parse(
+                '{"name": "f", "arguments": ""}', {"f": {"q"}})
+        finally:
+            CONFIG["tool_reject_bad_arguments"] = True
+        self.assertEqual(dropped, [])
+        self.assertEqual(json.loads(calls[0]["function"]["arguments"]), {})
+
+    def test_action_input_empty_string_rejected(self):
+        _c, calls, dropped = self._parse(
+            '{"action": "f", "action_input": ""}', {"f": {"q"}})
+        self.assertEqual(calls, [])
+        self.assertEqual(dropped, ["unusable arguments (empty string)"])
+
+
+# ------------------------------------------------ extension (node --test test_bridge.js) ----
+class TestBridgeJs(unittest.TestCase):
+    """Chay test_bridge.js trong unittest; bo qua neu may khong co node."""
+
+    def test_bridge_js(self):
+        import shutil
+        import subprocess
+        node = shutil.which("node")
+        if not node:
+            self.skipTest("node khong co trong PATH")
+        root = os.path.dirname(os.path.abspath(__file__))
+        r = subprocess.run([node, "--test", "test_bridge.js"], cwd=root,
+                           capture_output=True, text=True, encoding="utf-8",
+                           errors="replace", timeout=120)
+        self.assertEqual(r.returncode, 0, (r.stdout or "")[-3000:] + (r.stderr or "")[-1000:])
+
+
+class TestForceModeConfig(_Sandbox):
+
+    # feature_config cua 3 request completion THAT (Qwen web). Khi Qwen doi key thi sua day
+    # va DEFAULT_MODE_FEATURE_CONFIG trong config.py cung luc.
+    REAL_MODE_PATCH = {
+        "auto": {"thinking_enabled": True, "auto_thinking": True,
+                 "thinking_mode": "Auto", "thinking_format": "summary"},
+        "thinking": {"thinking_enabled": True, "auto_thinking": False,
+                     "thinking_mode": "Thinking", "thinking_format": "summary"},
+        "fast": {"thinking_enabled": False, "auto_thinking": False,
+                 "thinking_mode": "Fast", "thinking_format": None},
+    }
+
+    def test_defaults_inject_mode_into_request(self):
+        st = bridge.status()
+        self.assertIs(DEFAULT_CONFIG["bridge_force_request_mode"], True)
+        self.assertIs(DEFAULT_CONFIG["bridge_select_mode"], False)
+        self.assertIs(st["force_mode"], True)
+        self.assertIs(st["select_mode"], False)
+        self.assertEqual(st["mode_feature_config"], self.REAL_MODE_PATCH)
+
+    def test_default_mapping_is_a_copy(self):
+        from qwen_web2api.config import DEFAULT_MODE_FEATURE_CONFIG
+        CONFIG["bridge_mode_feature_config"]["fast"]["thinking_mode"] = "X"
+        self.assertEqual(DEFAULT_MODE_FEATURE_CONFIG["fast"]["thinking_mode"], "Fast")
+        self.assertEqual(DEFAULT_CONFIG["bridge_mode_feature_config"]["fast"]["thinking_mode"],
+                         "Fast")
+
+    def test_reasoning_effort_picks_each_mode(self):
+        f = models.ui_mode_for_effort
+        for effort, mode in (("low", "fast"), ("minimal", "fast"), ("none", "fast"),
+                             ("medium", "auto"),
+                             ("high", "thinking"), ("xhigh", "thinking"), ("max", "thinking")):
+            self.assertEqual(f(effort), mode)
+            self.assertIn(mode, bridge.mode_feature_config())
+
+    def test_null_value_survives_normalisation(self):
+        CONFIG["bridge_mode_feature_config"] = {"fast": {"thinking_format": None}}
+        self.assertEqual(bridge.mode_feature_config(),
+                         {"fast": {"thinking_format": None}})
+
+    def test_mode_feature_config_normalised(self):
+        CONFIG["bridge_force_request_mode"] = True
+        CONFIG["bridge_mode_feature_config"] = {
+            "Thinking": {"a": True}, " fast ": {"a": False}, "bogus": {"a": 1},
+            "auto": {}, "x": "str", 5: {"a": 1}}
+        st = bridge.status()
+        self.assertIs(st["force_mode"], True)
+        self.assertEqual(st["mode_feature_config"],
+                         {"thinking": {"a": True}, "fast": {"a": False}})
+        CONFIG["bridge_mode_feature_config"] = "oops"
+        self.assertEqual(bridge.mode_feature_config(), {})
 
 
 if __name__ == "__main__":

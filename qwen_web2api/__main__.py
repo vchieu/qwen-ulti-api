@@ -42,6 +42,9 @@ def main():
 
     _guard_bind(CONFIG["host"], a.allow_insecure)
 
+    from .qwen import init_session_log
+    session_path = init_session_log()
+
     from . import bridge as _bridge
     _bridge.start_server()
 
@@ -61,6 +64,7 @@ def main():
     print(f"  Debug:     {'ON' if debug_on else 'off'}  |  "
           f"log_requests={'on' if log_req else 'off'}  |  "
           f"log_file={log_file}")
+    print(f"  Session:   {session_path or 'off (log_session_file=false)'}")
     print()
     try:
         srv.serve_forever()

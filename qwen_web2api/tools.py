@@ -658,6 +658,9 @@ def _wrapper_type_error(data, props=None):
 
 
 def _extract_args(data, props=None):
+    # Wrapper la chuoi rong/khoang trang (vd `"arguments": ""`): xu ly TRUOC nhanh viet tat,
+    # khong de no thanh tham so {"arguments": ""}. Khoa trung ten tham so that thi bo qua.
+    empty_wrappers = set()
     for key in _ARGUMENT_KEYS:
         if key in data:
             v = data[key]
@@ -666,15 +669,22 @@ def _extract_args(data, props=None):
                         and (set(data) - _META_KEYS - {key})):
                     continue
                 return v
-            if isinstance(v, str) and v.strip():
+            if isinstance(v, str):
                 if props is not None and key in props:
                     continue
-                return v
+                if v.strip():
+                    return v
+                empty_wrappers.add(key)
     if props is None:
         rest = {k: v for k, v in data.items() if k not in _META_KEYS}
     else:
         rest = {k: v for k, v in data.items()
                 if k not in _META_KEYS or k in props}
+    rest = {k: v for k, v in rest.items() if k not in empty_wrappers}
+    if empty_wrappers and not rest:
+        # Chi co wrapper rong: tra "" de _args_json bao "empty string"
+        # (tool co schema -> tu choi + retry; tool khong tham so -> {}).
+        return ""
     # arguments: null = khong co tham so; khong de lot {"arguments": null}
     rest = {k: v for k, v in rest.items() if v is not None}
     if len(rest) == 1:

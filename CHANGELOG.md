@@ -151,3 +151,52 @@ hiện tại thì đọc `AGENTS.md`.
   số/bool/list/dict JSON. `<function=...>` standalone không được parse →
   `looks_like_missed_tool_call` trả `True` để nudge retry.
 - Khi response có cả prose và tool_call, prose được giữ ở `content`.
+
+## Config hoá danh sách + chẩn đoán attachment + log theo phiên
+
+- `models` và `qwen_builtin_tools` chuyển ra `config.json`. `models.MODELS` giờ là mapping đọc
+  live từ `CONFIG` (config được load sau khi import nên dict tĩnh bị cũ); `DEFAULT_MODELS` là
+  mặc định khi key trống/sai. `QWEN_BUILTIN_TOOLS` hardcode trong `extension/bridge.js` thành
+  `qwenBuiltinTools` (mặc định `code_interpreter`), cập nhật từ `/status.builtin_tools`.
+- Lý do: `bridge_require_attachment` không có ca test thật nên không biết khi nào xảy ra. Log cũ
+  chỉ cho biết request có `files` hay không, không trả lời được: đính nhầm file? file thiếu nội
+  dung? Qwen có đọc không? File tạm bị xoá sau mỗi lượt nên không đối chiếu được sau đó.
+  Thêm: dấu vân tay file (`bytes`/`sha256`/`lines`), extension đối chiếu nội dung lấy từ
+  `/file/`, so tên/kích thước/trạng thái file trong body completion với file đã tạo, cảnh báo
+  attachment sót khi job không có file, `[attach-check]` (usage.input_tokens / ký tự file + đầu
+  câu trả lời, bắt câu kiểu "không thấy file"). Tất cả chỉ cảnh báo, không chặn.
+- `log_session_file`: mỗi lần bật server một file log riêng (`/debug` chỉ giữ 100 dòng).
+  `log_save_prompt_files` giữ bản sao file prompt để so với dòng `[attach]`. Các dòng
+  `extension:` / `extension warn:` mang tiền tố `[job <8 ký tự>]`.
+
+## Findings: huỷ lúc attach + arguments chuỗi rỗng
+
+- `attachLongPrompt`: job bị huỷ trong lúc chờ strategy attach cuối vẫn `clearComposer` rồi điền lại text thô (~100000 ký tự). Giờ kiểm tra `jobAlive(job, true)` trước `clearComposer` và trước nhánh fallback điền text.
+- `_extract_args`: `arguments: ""` ở tool có tham số optional rơi vào nhánh viết tắt thành `{"arguments": ""}` rồi trả thẳng cho client, không retry. Giờ chuỗi rỗng được xử lý trước nhánh viết tắt (wrapper không thành tham số): tool có schema bị từ chối `unusable arguments (empty string)` + nudge retry, tool không có tham số cho `{}`; `tool_reject_bad_arguments=false` giữ hành vi cũ (`{}`).
+
+## Test tự động cho extension
+
+- `test_bridge.js` (Node `node:test`, không dependency) + `TestBridgeJs` trong test Python. Test cắt nguyên văn thân hàm từ `extension/bridge.js` và chạy với stub DOM/mạng/sleep. Khoá luồng điều khiển: job huỷ giữa chừng khi attach (finding clearComposer/điền lại text), thứ tự strategy, fallback text thô, ném lỗi khi > 125000, `jobAlive`, đối chiếu file (`verifyPromptFile`, `checkRequestFiles`). Hình dạng file trong request là giả định, sửa test khi có capture thật.
+
+## Ghi đè mode trong request (`bridge_force_request_mode`)
+
+- Giống `bridge_force_request_model` nhưng cho Thinking/Auto/Fast: `rewriteRequestMode` ghi đè `feature_config` theo `bridge_mode_feature_config[mode]` (người dùng khai báo từ capture thật, không có default vì chưa xác nhận tên key). Lý do: dropdown UI treo khi tab không active, trong khi sửa body không cần chạm UI.
+- Dòng `completion request:` giờ in `mode=`, `feature_config` đầy đủ (≤1500 ký tự, kèm `top_feature_config` nếu có) và `top={scalar top-level}` để lấy mẫu từng mode.
+
+## Mode Auto/Thinking/Fast qua body request (mặc định)
+
+- Có 3 request completion thật của Qwen web (một cho mỗi mode). Chỉ `messages[0].feature_config` khác
+  nhau, không có `feature_config` top-level. Auto: `thinking_enabled=true, auto_thinking=true,
+  thinking_mode="Auto", thinking_format="summary"`; Thinking: `thinking_enabled=true,
+  auto_thinking=false, thinking_mode="Thinking", thinking_format="summary"`; Fast:
+  `thinking_enabled=false, auto_thinking=false, thinking_mode="Fast"` và **không có** `thinking_format`.
+  `output_schema="phase"`, `research_mode="normal"`, `auto_search=true` giống nhau ở cả 3.
+- Mapping đó thành default (`DEFAULT_MODE_FEATURE_CONFIG`). `bridge_force_request_mode` mặc định `true`,
+  `bridge_select_mode` mặc định `false`: chọn mode chỉ cần `reasoning_effort` (low/none → Fast, medium →
+  Auto, high → Thinking), proxy ghi thẳng vào body, không bấm dropdown nữa. Áp cho cả 3 mode, không riêng
+  Thinking. Lý do: dropdown treo khi tab không active, sửa body thì không phụ thuộc UI. Không gửi
+  `reasoning_effort` → body giữ mode UI hiện tại.
+- Giá trị `null` trong `bridge_mode_feature_config` = xoá key. Lý do: UI đang ở Thinking/Auto mà job cần Fast,
+  nếu chỉ ghi đè key có sẵn thì body vẫn mang `thinking_format:"summary"`, khác request Fast thật.
+- `bridge_require_mode` chỉ kiểm tra lúc bấm dropdown, nên không còn tác dụng khi `bridge_select_mode=false`.
+  Muốn quay về dropdown: `bridge_select_mode=true`, `bridge_force_request_mode=false`.

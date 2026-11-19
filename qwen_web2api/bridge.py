@@ -13,6 +13,7 @@ Chay fetch() trong trang dung session that + header anti-bot that.
 import collections
 import json
 import queue
+import re
 import threading
 import time
 import uuid
@@ -180,6 +181,42 @@ def _model_ids():
     return sorted({str(c.get("upstream", n)) for n, c in MODELS.items()})
 
 
+_DEFAULT_BUILTIN_TOOLS = ("code_interpreter",)
+
+
+def builtin_tools():
+    """Ten tool built-in cua Qwen (config qwen_builtin_tools): extension de Qwen UI tu
+    chay, khong tra ve client. Chuan hoa lowercase + bo trung; sai kieu -> mac dinh."""
+    raw = CONFIG.get("qwen_builtin_tools")
+    if isinstance(raw, str):
+        raw = [raw]
+    if not isinstance(raw, (list, tuple)):
+        return list(_DEFAULT_BUILTIN_TOOLS)
+    out = []
+    for x in raw:
+        if isinstance(x, str):
+            n = x.strip().lower()
+            if n and n not in out:
+                out.append(n)
+    return out
+
+
+_UI_MODES = ("auto", "thinking", "fast")
+
+
+def mode_feature_config():
+    """config bridge_mode_feature_config -> {mode: {key: value}} chi giu mode hop le
+    (auto/thinking/fast, khong phan biet hoa thuong) co gia tri la dict khong rong."""
+    raw = CONFIG.get("bridge_mode_feature_config")
+    out = {}
+    if isinstance(raw, dict):
+        for k, v in raw.items():
+            name = k.strip().lower() if isinstance(k, str) else ""
+            if name in _UI_MODES and isinstance(v, dict) and v:
+                out[name] = v
+    return out
+
+
 def status():
     with _lock:
         n = len(_jobs)
@@ -189,12 +226,16 @@ def status():
             "select_model": bool(CONFIG.get("bridge_select_model", True)),
             "select_mode": bool(CONFIG.get("bridge_select_mode", True)),
             "force_model": bool(CONFIG.get("bridge_force_request_model", False)),
+            "force_mode": bool(CONFIG.get("bridge_force_request_mode", False)),
+            "mode_feature_config": mode_feature_config(),
             # extension phai doc 2 co nay.
             "require_model": bool(CONFIG.get("bridge_require_model", False)),
             "require_mode": bool(CONFIG.get("bridge_require_mode", False)),
             # chan request thieu attachment.
             "require_attachment": bool(CONFIG.get("bridge_require_attachment", True)),
             "model_ids": _model_ids(),
+            # tool built-in cua Qwen (config qwen_builtin_tools).
+            "builtin_tools": builtin_tools(),
             "temporary_reload": bool(CONFIG.get("temporary_chat_reload", True)),
             "captcha_wait": _captcha_wait(),
             "attachment_prompt": str(CONFIG.get("attachment_prompt", "Please read the text and action")),
@@ -245,6 +286,74 @@ def _file_companion(file_info):
     return "\n\n".join(parts)
 
 
+# Heuristic: cau tra loi cua Qwen nghe nhu "khong thay / khong doc duoc file". Chi dung
+# de canh bao (co the bao nham khi noi dung that co cau tuong tu).
+_NO_FILE_RX = re.compile(
+    r"(?:(?:\bno\b|\bnot\b|n't|\bcannot\b|\bunable\b|\bmissing\b)[^.\n]{0,60}?"
+    r"\b(?:see|find|access|read|open|receive|view|locate|detect|attached)\b[^.\n]{0,40}?"
+    r"\b(?:file|attachment|attached|document)s?\b"
+    r"|\b(?:file|attachment|document)s?\b[^.\n]{0,40}?\b(?:empty|missing|blank)\b"
+    r"|\b(?:file|attachment|document)s?\b[^.\n]{0,30}?"
+    r"\bnot (?:attached|visible|provided|included)\b"
+    r"|không\s+(?:thấy|tìm thấy|nhận được|đọc được|truy cập được|có)"
+    r"[^.\n]{0,40}?(?:file|tệp|tài liệu|đính kèm)"
+    r"|(?:没有|未|无法|看不到|没看到|读取不到)[^。\n]{0,10}?(?:文件|附件|文档))",
+    re.IGNORECASE)
+
+
+def _num(v):
+    return v if isinstance(v, (int, float)) and not isinstance(v, bool) else None
+
+
+def attach_report(file_info, usage, content, warn_ratio=0.05):
+    """Job co file da xong -> (dong_tom_tat, [canh_bao]). Thuan tuy, khong log.
+
+    Tin hieu Qwen co doc file hay khong (chi la heuristic, khong chung minh duoc):
+      - usage.input_tokens so voi so ky tu file (ty le qua thap -> chua doc file,
+        hoac usage cua Qwen khong tinh token cua file: doi chieu vai job dau);
+      - cau tra loi dau tien co dang "khong thay file".
+    """
+    fi = file_info if isinstance(file_info, dict) else {}
+    usage = usage if isinstance(usage, dict) else {}
+    chars = fi.get("size") if isinstance(fi.get("size"), int) else 0
+    tin = next((_num(usage.get(k)) for k in ("input_tokens", "prompt_tokens")
+                if _num(usage.get(k)) is not None), None)
+    tout = next((_num(usage.get(k)) for k in ("output_tokens", "completion_tokens")
+                 if _num(usage.get(k)) is not None), None)
+    ratio = (tin / chars) if (tin is not None and chars) else None
+    text = content or ""
+    head = " ".join(text[:160].split())
+    line = (f"[attach-check] file={fi.get('filename') or '?'} chars={chars or '?'} "
+            f"bytes={fi.get('bytes', '?')} sha256={str(fi.get('sha256') or '?')[:12]} "
+            f"usage_in={tin} usage_out={tout} "
+            f"tokens_per_char={'%.3f' % ratio if ratio is not None else '?'} "
+            f"usage_keys={sorted(usage)} resp_chars={len(text)} resp_head={head!r}")
+    warns = []
+    if ratio is not None and warn_ratio and warn_ratio > 0 and chars >= 2000 \
+            and ratio < warn_ratio:
+        warns.append(
+            f"usage.input_tokens={tin:g} qua thap so voi file {chars} ky tu "
+            f"(ty le {ratio:.3f} < {warn_ratio}): Qwen co the CHUA doc file, hoac usage "
+            "khong tinh token cua file -- doi chieu voi vai job dau roi chinh "
+            "attachment_usage_warn_ratio")
+    m = _NO_FILE_RX.search(text[:600])
+    if m:
+        warns.append(f"cau tra loi giong Qwen KHONG thay/doc duoc file: {m.group(0)!r}")
+    return line, warns
+
+
+def _log_attach_report(jid, attempt, file_info, usage, content):
+    try:
+        line, warns = attach_report(
+            file_info, usage, content,
+            _as_num(CONFIG.get("attachment_usage_warn_ratio"), 0.05))
+        _log(f"[job {jid[:8]}] attempt={attempt + 1} {line}")
+        for w in warns:
+            _log(f"[job {jid[:8]}] attach-check WARN: {w}")
+    except Exception as e:   # chan doan khong duoc lam hong request
+        _log(f"[job {jid[:8]}] attach-check error: {e}")
+
+
 def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=None,
                     cancel_event=None):
     """Yield (kind, text) -- interface server.py goi cho luong SSE.
@@ -289,7 +398,10 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=N
         else:
             att_prompt = ""
         _debug_log(f"queueing job {jid} (model={model}, "
-                   f"prompt_len={len(prompt or '')}, file={bool(file_info)})")
+                   f"prompt_len={len(prompt or '')}, file={bool(file_info)}, "
+                   f"attempt={attempt + 1}/{attempts}"
+                   + (f", filename={file_info.get('filename')}"
+                      if isinstance(file_info, dict) else "") + ")")
         _pending.put({"job_id": jid, "model": model, "prompt": prompt,
                       "think": bool(think), "ts": now,
                       "deadline": now + timeout, "attempt": attempt,
@@ -298,6 +410,7 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=N
                       "attachment_prompt": att_prompt,
                       "managed": True})
         tracker = _Tracker()
+        usage_seen = {}
         emitted = False
         seen_native = set()
         deadline = time.monotonic() + timeout
@@ -378,12 +491,14 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=N
                         emitted = True
                         yield "content", d
                 elif kind == "usage":
+                    if isinstance(ev.get("usage"), dict):
+                        usage_seen.update(ev["usage"])
                     if usage_out is not None and isinstance(ev.get("usage"), dict):
                         usage_out.update(ev["usage"])
                 elif kind in ("debug", "log"):
-                    _debug_log("extension: " + str(ev.get("message") or ""))
+                    _debug_log(f"[job {jid[:8]}] extension: " + str(ev.get("message") or ""))
                 elif kind == "warn":
-                    _log("extension warn: " + str(ev.get("message") or ""))
+                    _log(f"[job {jid[:8]}] extension warn: " + str(ev.get("message") or ""))
                     if ev.get("tab_reloaded"):
                         raise qwen.QwenError(
                             "browser bridge: tab reload giua chung job (buoc: "
@@ -408,6 +523,9 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=N
                     _debug_log(f"job {jid} completed successfully "
                                f"({len(tracker.total['content'])} content, "
                                f"{len(tracker.total['reasoning'])} reasoning)")
+                    if file_info:
+                        _log_attach_report(jid, attempt, file_info, usage_seen,
+                                           tracker.total["content"])
                     return
         except GeneratorExit:
             # Client dong stream: phai danh dau huy, neu khong extension
@@ -540,7 +658,9 @@ class _Handler(BaseHTTPRequestHandler):
                          "file_prompt_max_chars",
                          "retry_attempts",
                          "bridge_job_timeout", "bridge_poll_wait", "bridge_worker_ttl",
-                         "attachment_prompt", "log_file", "bridge_port", "port")
+                         "attachment_prompt", "log_file", "bridge_port", "port",
+                         "models", "qwen_builtin_tools", "log_session_file", "log_dir",
+                         "log_save_prompt_files", "attachment_usage_warn_ratio")
             cfg_snapshot = {k: CONFIG[k] for k in safe_keys if k in CONFIG}
             return self._json({
                 "config": cfg_snapshot,

@@ -26,7 +26,8 @@
   // tool built-in cua Qwen UI (vd code_interpreter chay trong
   // sandbox cua Qwen). Native call cua cac tool nay KHONG bi chan; de Qwen tu
   // chay roi stream tiep ket qua. Tool khac van gom tra Python nhu cu.
-  const QWEN_BUILTIN_TOOLS = new Set(["code_interpreter"]);
+  // Mac dinh; Python gui danh sach that qua /status.builtin_tools (config qwen_builtin_tools).
+  let qwenBuiltinTools = new Set(["code_interpreter"]);
   const ACTIVE_JOB_KEY = "qwenUIBridgeActiveJob";
 
   let pageLoadedAsTemporary = /[?&]temporary-chat=true/.test(location.search)
@@ -40,6 +41,8 @@
   let lastModeCheck = 0;
   let selectModelEnabled = true;
   let selectModeEnabled = true;    // config bridge_select_mode (qua /status)  /* */
+  let forceRequestMode = false;    // config bridge_force_request_mode (qua /status)
+  let modeFeatureConfig = {};      // config bridge_mode_feature_config: {mode: {key: value}}
   let forceRequestModel = false;   // config bridge_force_request_model (qua /status)
   let uiModelIds = [];             // id model hop le (models.py) de ghi de request
   let attachmentPrompt = ATTACHMENT_COMPANION_PROMPT;
@@ -485,11 +488,25 @@
     if (st && typeof st.select_model === "boolean") selectModelEnabled = st.select_model;
     if (st && typeof st.select_mode === "boolean") selectModeEnabled = st.select_mode;
     if (st && typeof st.force_model === "boolean") forceRequestModel = st.force_model;
+    if (st && typeof st.force_mode === "boolean") forceRequestMode = st.force_mode;
+    if (st && st.mode_feature_config && typeof st.mode_feature_config === "object") {
+      modeFeatureConfig = st.mode_feature_config;
+    }
     if (st && typeof st.require_model === "boolean") requireModel = st.require_model;
     if (st && typeof st.require_mode === "boolean") requireMode = st.require_mode;
     if (st && typeof st.require_attachment === "boolean") requireAttachment = st.require_attachment;
     if (st && Array.isArray(st.model_ids)) {
       uiModelIds = st.model_ids.filter((x) => typeof x === "string");
+    }
+    if (st && Array.isArray(st.builtin_tools)) {
+      const names = st.builtin_tools
+        .filter((x) => typeof x === "string")
+        .map((x) => x.trim().toLowerCase())
+        .filter(Boolean);
+      if (names.join(",") !== Array.from(qwenBuiltinTools).join(",")) {
+        debugLog("builtin tools cua Qwen:", names);
+      }
+      qwenBuiltinTools = new Set(names);
     }
     if (st && typeof st.attachment_prompt === "string" && st.attachment_prompt.trim()) {
       attachmentPrompt = st.attachment_prompt.trim();
@@ -665,6 +682,64 @@
       }
       if (!changed) return null;
       fwd(job, "debug", "force model: ghi de request model '" + was + "' -> '" + want + "'");
+      return Object.assign({}, init, { body: JSON.stringify(req) });
+    } catch (e) { return null; }
+  }
+
+  // (config bridge_force_request_mode): ghi de feature_config trong body completion theo che do
+  // cua job (reasoning_effort -> auto/thinking/fast), giong rewriteRequestModel. Key/gia tri lay
+  // tu bridge_mode_feature_config[mode] (mac dinh = request that cua Qwen, xem config.py) --
+  // code khong doan ten key. Gia tri null = XOA key khoi feature_config (Fast khong co
+  // thinking_format; chi ghi de key co san thi chuyen tu Thinking sang Fast se de sot key cu).
+  function rewriteRequestMode(job, init) {
+    try {
+      if (!job || !init || typeof init.body !== "string" || !init.body) return null;
+      const mode = String(job.mode || "").toLowerCase();
+      if (!mode) return null;
+      const warnOnce = (msg) => {
+        if (job._modeWarned) return;
+        job._modeWarned = true;
+        fwd(job, "warn", "force mode: " + msg);
+      };
+      const patch = modeFeatureConfig && modeFeatureConfig[mode];
+      if (!patch || typeof patch !== "object" || !Object.keys(patch).length) {
+        warnOnce("chua khai bao bridge_mode_feature_config['" + mode + "'] -> khong ghi de");
+        return null;
+      }
+      const req = JSON.parse(init.body);
+      if (!req || typeof req !== "object") return null;
+      const targets = [];
+      if (req.feature_config && typeof req.feature_config === "object") {
+        targets.push(["top", req.feature_config]);
+      }
+      for (const m of Array.isArray(req.messages) ? req.messages : []) {
+        if (m && typeof m === "object" && m.feature_config && typeof m.feature_config === "object") {
+          targets.push(["msg", m.feature_config]);
+        }
+      }
+      if (!targets.length) {
+        warnOnce("body khong co feature_config (keys=" + Object.keys(req).join(",") + ") -> khong ghi de");
+        return null;
+      }
+      const diffs = [];
+      for (const [where, fc] of targets) {
+        for (const k of Object.keys(patch)) {
+          if (patch[k] === null) {
+            if (Object.prototype.hasOwnProperty.call(fc, k)) {
+              diffs.push(where + "." + k + ": " + JSON.stringify(fc[k]) + " -> (xoa)");
+              delete fc[k];
+            }
+          } else if (JSON.stringify(fc[k]) !== JSON.stringify(patch[k])) {
+            diffs.push(where + "." + k + ": " + JSON.stringify(fc[k]) + " -> " + JSON.stringify(patch[k]));
+            fc[k] = patch[k];
+          }
+        }
+      }
+      if (!diffs.length) {
+        debugLog("force mode '" + mode + "': feature_config da dung, khong can ghi de");
+        return null;
+      }
+      fwd(job, "debug", "force mode '" + mode + "': " + diffs.join("; "));
       return Object.assign({}, init, { body: JSON.stringify(req) });
     } catch (e) { return null; }
   }
@@ -1059,12 +1134,12 @@
   }
 
   function isQwenBuiltinCall(fc) {
-    return QWEN_BUILTIN_TOOLS.has(nativeToolName(fc));
+    return qwenBuiltinTools.has(nativeToolName(fc));
   }
 
   // Qwen đôi khi gọi tool bằng native function_call thay vì text fence.
   // Gom name + arguments (Qwen stream cumulative) rồi trả cho proxy để client
-  // tự chạy tool; riêng built-in của Qwen (QWEN_BUILTIN_TOOLS) thì để Qwen
+  // tự chạy tool; riêng built-in của Qwen (config qwen_builtin_tools) thì để Qwen
   // tự chạy trong sandbox của nó.
   function nativeIdOf(fc) {
     for (const k of ["id", "call_id", "tool_call_id", "index"]) {
@@ -1468,6 +1543,103 @@
     return "";
   }
 
+  // Thong tin 1 file dinh kem trong body completion. Key that cua Qwen chua duoc xac nhan
+  // nen doc theo nhieu ten key kha di; file0={...} trong log giu mau raw de doi chieu.
+  function describeFileEntry(f) {
+    const out = { name: "", size: null, status: "", type: "", id: "" };
+    if (typeof f === "string") { out.id = f.slice(0, 60); return out; }
+    if (!f || typeof f !== "object") return out;
+    const scan = (o, depth) => {
+      if (!o || typeof o !== "object" || depth > 3) return;
+      for (const k of Object.keys(o)) {
+        const v = o[k];
+        const lk = k.toLowerCase();
+        if (typeof v === "string") {
+          if (!out.name && /^(name|filename|file_name|title)$/.test(lk)) out.name = v;
+          else if (!out.status && lk === "status") out.status = v;
+          else if (!out.type && /^(file_type|content_type|mime|mime_type)$/.test(lk)) out.type = v;
+          else if (!out.id && /^(id|file_id)$/.test(lk)) out.id = v;
+        } else if (typeof v === "number") {
+          if (out.size === null && /^(size|file_size|bytes|content_length)$/.test(lk)) out.size = v;
+        } else if (v && typeof v === "object" && !Array.isArray(v)) {
+          scan(v, depth + 1);
+        }
+      }
+    };
+    scan(f, 0);
+    return out;
+  }
+
+  function describeFileBrief(d) {
+    return (d.name || "?") + "|" + (d.size === null ? "?" : d.size) + "B|"
+      + (d.status || "?") + (d.type ? "|" + d.type : "");
+  }
+
+  // Gom file dinh kem (key files/attachments/file_ids) trong body, bo trung.
+  function collectRequestFiles(req) {
+    const out = [];
+    const seen = new Set();
+    const walk = (v, depth) => {
+      if (depth > 5 || v === null || typeof v !== "object") return;
+      if (Array.isArray(v)) { v.slice(0, 50).forEach((x) => walk(x, depth + 1)); return; }
+      for (const k of Object.keys(v)) {
+        const val = v[k];
+        if (/^(files?|attachments?|file_ids?)$/i.test(k) && Array.isArray(val)) {
+          for (const f of val.slice(0, 20)) {
+            const d = describeFileEntry(f);
+            const key = d.id || (d.name + "|" + d.size);
+            if (seen.has(key)) continue;
+            seen.add(key);
+            out.push(d);
+          }
+        } else {
+          walk(val, depth + 1);
+        }
+      }
+    };
+    walk(req, 0);
+    return out;
+  }
+
+  // So file request that su gui voi file proxy da tao. Tra ve danh sach van de (rong = on).
+  // Chi de canh bao: Qwen co the doi ten/kich thuoc -> xem dong 'completion request'.
+  function checkRequestFiles(job, files) {
+    const problems = [];
+    const exp = job && job.file_info;
+    if (!exp) {
+      if (files.length) {
+        problems.push("job KHONG co file nhung request mang " + files.length
+          + " attachment (file cu con sot trong composer/trang?): "
+          + files.map(describeFileBrief).join("; "));
+      }
+      return problems;
+    }
+    if (!files.length) return problems;   // truong hop nay da bao rieng (missing)
+    if (files.length !== 1) {
+      problems.push("request mang " + files.length + " file (ky vong 1): "
+        + files.map(describeFileBrief).join("; "));
+    }
+    const expName = String(exp.filename || "");
+    const named = files.filter((f) => f.name);
+    if (expName && named.length && !named.some((f) => f.name === expName)) {
+      problems.push("ten file gui di [" + named.map((f) => f.name).join(", ")
+        + "] khac file proxy tao '" + expName + "' (DINH NHAM FILE?)");
+    }
+    const expBytes = Number(exp.bytes) || 0;
+    const sized = files.filter((f) => typeof f.size === "number");
+    if (expBytes && sized.length && !sized.some((f) => f.size === expBytes)) {
+      problems.push("kich thuoc file gui di [" + sized.map((f) => f.size).join(", ")
+        + "] != " + expBytes + " byte proxy da ghi (FILE THIEU/DU NOI DUNG? "
+        + "neu Qwen tinh size khac thi bo qua)");
+    }
+    const bad = files.filter((f) => f.status
+      && !/^(uploaded|success|done|finished|complete|completed)$/i.test(f.status));
+    if (bad.length) {
+      problems.push("trang thai file chua xong: " + bad.map(describeFileBrief).join("; "));
+    }
+    return problems;
+  }
+
   // Chan doan chinh xac: request completion cua app co kem file/attachment khong?
   // (heuristic DOM co the bao sai). Chi doc body, khong sua request, khong throw.
   async function inspectCompletionRequest(job, input, init) {
@@ -1496,7 +1668,7 @@
               fileSample = {};
               for (const fk of Object.keys(val[0]).slice(0, 12)) {
                 const fv = val[0][fk];
-                if (typeof fv === "string") fileSample[fk] = fv.slice(0, 40);
+                if (typeof fv === "string") fileSample[fk] = fv.slice(0, 80);
                 else if (typeof fv === "number" || typeof fv === "boolean") fileSample[fk] = fv;
               }
             }
@@ -1515,20 +1687,47 @@
       const modelBad = selectModelEnabled !== false && !!(wantModel && reqModel
         && normLabel(reqModel) !== normLabel(wantModel));
       let fcTxt = "";
-      try { fcTxt = JSON.stringify((last && last.feature_config) || req.feature_config || null).slice(0, 220); }
-      catch (e) { /* bo qua */ }
+      let topTxt = "";
+      try {
+        const msgFc = last && last.feature_config;
+        fcTxt = JSON.stringify(msgFc || req.feature_config || null).slice(0, 1500);
+        if (msgFc && req.feature_config) {
+          fcTxt += " top_feature_config=" + JSON.stringify(req.feature_config).slice(0, 600);
+        }
+        const sc = {};
+        for (const k of Object.keys(req)) {
+          const v = req[k];
+          if (typeof v === "number" || typeof v === "boolean") sc[k] = v;
+          else if (typeof v === "string" && k !== "model") sc[k] = v.slice(0, 40);
+        }
+        topTxt = JSON.stringify(sc).slice(0, 400);
+      } catch (e) { /* bo qua */ }
       const info = "completion request: model=" + reqModel + " msg_models=" + msgModel
-        + " want=" + wantModel + " vis=" + visState() + " feature_config=" + fcTxt
+        + " want=" + wantModel + " mode=" + ((job && job.mode) || "-")
+        + " vis=" + visState() + " feature_config=" + fcTxt
+        + " top=" + topTxt
         + " keys=" + Object.keys(req).join(",")
         + " messages=" + msgs.length + " content_chars=" + chars
         + " last_msg_keys=" + (last && typeof last === "object" ? Object.keys(last).join(",") : "-")
         + " attachments=[" + found.join(", ") + "]"
         + (fileSample ? " file0=" + JSON.stringify(fileSample) : "");
       const missing = !!(job && job.file_info) && !found.length;
+      const files = collectRequestFiles(req);
+      const verdict = checkRequestFiles(job, files);
+      const expInfo = (job && job.file_info)
+        ? " expect=" + (job.file_info.filename || "?") + "/" + (job.file_info.bytes || "?")
+          + "B/sha256:" + String(job.file_info.sha256 || "?").slice(0, 12)
+          + " companion_len=" + String(job.attachment_prompt || "").length
+        : " expect=no-file";
+      const filesInfo = " files=[" + files.map(describeFileBrief).join("; ") + "]";
       const pre = modelBad ? "MODEL KHAC YEU CAU (request gui '" + reqModel
         + "' != job '" + wantModel + "'): " : "";
-      send(job.id, { kind: (missing || modelBad) ? "warn" : "debug",
-        message: pre + (missing ? "request gui di KHONG thay file/attachment: " + info : info) });
+      const problemTxt = verdict.length
+        ? "FILE DINH KEM BAT THUONG: " + verdict.join(" | ") + " :: " : "";
+      send(job.id, { kind: (missing || modelBad || verdict.length) ? "warn" : "debug",
+        message: pre + problemTxt
+          + (missing ? "request gui di KHONG thay file/attachment: " + info : info)
+          + filesInfo + expInfo });
     } catch (e) {
       debugLog("inspectCompletionRequest skipped:", (e && e.message) || e);
     }
@@ -1552,6 +1751,10 @@
       if (forceRequestModel) {
         const forced = rewriteRequestModel(jobRef, init);
         if (forced) init = forced;
+      }
+      if (forceRequestMode) {
+        const forcedMode = rewriteRequestMode(jobRef, init);
+        if (forcedMode) init = forcedMode;
       }
       /* strict -> chan request sai model / thieu file. */
       const strictMsg = await strictRequestProblem(jobRef, input, init);
@@ -2013,6 +2216,74 @@
     await sleep(2000);
   }
 
+  // UTF-8 byte length + sha256 (hex) cua text; sha256 = "" neu crypto.subtle khong co.
+  async function fingerprintText(text) {
+    const bytes = new TextEncoder().encode(text);
+    let sha = "";
+    try {
+      if (window.crypto && crypto.subtle) {
+        const d = await crypto.subtle.digest("SHA-256", bytes);
+        sha = Array.from(new Uint8Array(d)).map((b) => b.toString(16).padStart(2, "0")).join("");
+      }
+    } catch (e) { /* chi so byte */ }
+    return { bytes: bytes.length, sha256: sha };
+  }
+
+  // Noi dung extension lay tu /file/<ten> co khop file Python da ghi khong
+  // (bytes + sha256). Chi canh bao, khong chan.
+  async function verifyPromptFile(job, fileInfo, text) {
+    try {
+      if (!fileInfo || typeof fileInfo._inlineText === "string") return;
+      const name = fileInfo.filename || "?";
+      const wantBytes = Number(fileInfo.bytes) || 0;
+      const wantSha = String(fileInfo.sha256 || "");
+      if (!wantBytes && !wantSha) {
+        fwd(job, "debug", "file prompt " + name + ": proxy khong gui bytes/sha256, bo qua doi chieu");
+        return;
+      }
+      const fp = await fingerprintText(text);
+      const bad = [];
+      if (wantBytes && fp.bytes !== wantBytes) bad.push("bytes " + fp.bytes + " != " + wantBytes);
+      if (wantSha && fp.sha256 && fp.sha256 !== wantSha) {
+        bad.push("sha256 " + fp.sha256.slice(0, 12) + " != " + wantSha.slice(0, 12));
+      }
+      if (bad.length) {
+        fwd(job, "warn", "FILE PROMPT LECH so voi file Python da ghi (" + name + "): "
+          + bad.join(", ") + " -> noi dung dinh kem co the sai/thieu");
+      } else {
+        fwd(job, "debug", "file prompt khop file Python: " + name + " bytes=" + fp.bytes
+          + " sha256=" + (fp.sha256 ? fp.sha256.slice(0, 12) : "(khong co subtle)")
+          + (fileInfo.lines ? " lines=" + fileInfo.lines : ""));
+      }
+    } catch (e) {
+      debugLog("verifyPromptFile skipped:", (e && e.message) || e);
+    }
+  }
+
+  // Text hien thi cua cac attachment card dang co trong composer (heuristic DOM).
+  function attachmentTexts(composer) {
+    try {
+      return findActiveAttachmentElements(composer).slice(0, 8).map((el) =>
+        String(el.getAttribute("aria-label") || el.getAttribute("title") || el.textContent || "")
+          .replace(/\s+/g, " ").trim().slice(0, 70)).filter(Boolean);
+    } catch (e) { return []; }
+  }
+
+  function reportStaleAttachments(job, composer) {
+    const stale = attachmentTexts(composer)
+      .filter((t) => /qwen_prompt_|\.(txt|md|log|json|csv|pdf)\b/i.test(t));
+    if (stale.length) {
+      fwd(job, "warn", "composer da co attachment TRUOC khi dinh kem file moi "
+        + "(file cu con sot? heuristic DOM): [" + stale.join("; ") + "]");
+    }
+  }
+
+  function reportAttachmentCards(job, composer, used, fname) {
+    const t = attachmentTexts(composer);
+    fwd(job, "debug", "attachment cards sau '" + used + "': n=" + t.length
+      + " [" + t.join("; ") + "] expect=" + fname);
+  }
+
   async function fetchPromptText(fileInfo) {
     if (fileInfo && typeof fileInfo._inlineText === "string") return fileInfo._inlineText;
     const response = await fetch(`${BRIDGE}/file/${encodeURIComponent(fileInfo.filename)}`);
@@ -2072,6 +2343,8 @@
     const fname = fileInfo.filename || "";
     const before = attachmentSnapshot();
     const baseCount = findActiveAttachmentElements(composer).length;
+    await verifyPromptFile(job, fileInfo, text);
+    reportStaleAttachments(job, composer);
 
     // Moi cach deu duoc kiem tra card; that bai thi xoa composer roi thu cach tiep.
     // Thu tu uu tien theo ty le thanh cong thuc te: paste-file, drop-file truoc.
@@ -2114,6 +2387,9 @@
       log("large prompt via " + s.name + ": composer=" + pastedLen + " chars");
       attached = await waitForAttachmentEx(composer, before, baseCount, pastedLen, fname, s.wait);
       if (attached) { used = s.name; break; }
+      /* Job co the vua bi huy trong luc cho attachment (nhat la strategy cuoi):
+         khong xoa composer / khong thu tiep. */
+      if (!(await jobAlive(job, true))) return;
       if (job) send(job.id, { kind: "warn",
         message: "attach '" + s.name + "' khong tao duoc attachment card; thu cach khac" });
       clearComposer(composer);
@@ -2124,6 +2400,7 @@
       if (!(await jobAlive(job))) return;
       saveJobState(job, "file_uploaded", "File attached via " + used + ": " + fname);
       if (job) send(job.id, { kind: "debug", message: "large prompt attached via " + used });
+      reportAttachmentCards(job, composer, used, fname);
       await sleep(800);
       if (!(await jobAlive(job, true))) return;
       setComposerClean(composer, promptText);
@@ -2149,6 +2426,9 @@
     }
 
     // Khong cach nao tao duoc attachment.
+    // Job da het hieu luc (huy luc strategy cuoi / trong luc sleep sau clearComposer):
+    // khong dien lai text tho vao composer.
+    if (!(await jobAlive(job, true))) return;
     const extra = (promptText && promptText !== ATTACHMENT_COMPANION_PROMPT
       && promptText !== attachmentPrompt) ? promptText : "";
     const fullText = extra ? text + "\n\n" + extra : text;

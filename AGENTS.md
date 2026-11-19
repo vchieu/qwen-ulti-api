@@ -16,6 +16,7 @@ python -m qwen_web2api --port 8081     # override port API
 python -m unittest test_qwen_web2api -v
 python -m pytest test_qwen_web2api.py -q
 node --check extension/bridge.js       # cú pháp content script
+node --test test_bridge.js              # test logic extension (Node >= 18, không cần browser)
 ```
 
 Cần mở https://chat.qwen.ai (đã đăng nhập), giữ tab mở và load unpacked `extension/`.
@@ -28,12 +29,13 @@ Không có tab/worker → request trả 503.
 | `qwen_web2api/server.py` | HTTP OpenAI-compatible: `/v1/chat/completions`, `/v1/responses`, `/v1/models`, auth, CORS, SSE, `_run_turn` (tool retry/nudge), `prepare_large_prompt` | route, SSE response, auth, tool retry, file prompt |
 | `qwen_web2api/bridge.py` | Server 8083 cho extension: `/poll`, `/event`, `/status`, `/debug`, `/requeue`, `/file/*`, `/alive`, `/cancel`; queue job, stream event, `known_models()`, `temporary_chat_enabled()`, `job_cancelled()`, `job_alive()`, `cancel_job()` | job queue/timeout/requeue, liveness, file serving, models feed |
 | `qwen_web2api/tools.py` | Flatten messages → prompt, chèn `# Tool Use`, parse tool_call, truncate theo byte | prompt render, tool_call parser |
-| `qwen_web2api/models.py` | Alias model + `@think=0/1` | tên model |
+| `qwen_web2api/models.py` | `DEFAULT_MODELS`; `MODELS` đọc live từ config `models`; `@think=0/1` | tên model |
 | `qwen_web2api/config.py` | `DEFAULT_CONFIG` + `CONFIG` (global mutable), load/find config | giá trị mặc định, alias config key |
-| `qwen_web2api/qwen.py` | `QwenError` + logger `log()`, `debug_log()`, `is_debug()`, `get_recent_log()` | log/error dùng chung |
+| `qwen_web2api/qwen.py` | `QwenError` + logger `log()`, `debug_log()`, `is_debug()`, `get_recent_log()`, `init_session_log()`, `save_prompt_copy()` | log/error dùng chung, log theo phiên |
 | `qwen_web2api/__main__.py` | CLI, `_guard_bind` tự sinh API key khi bind ra ngoài loopback | khởi động, auth |
 | `extension/bridge.js` | MV3 content script (MAIN world): poll job, temporary/model/mode picker, gửi prompt, attach file, bắt native `tool_call`, hook fetch/XHR | mọi hành vi trong tab Qwen |
-| `test_qwen_web2api.py` | Toàn bộ unit test (1 file, stdlib `unittest`) | regression, mock endpoint |
+| `test_qwen_web2api.py` | Toàn bộ unit test Python (stdlib `unittest`); `TestBridgeJs` gọi `test_bridge.js` | regression, mock endpoint |
+| `test_bridge.js` | Test logic `extension/bridge.js` bằng `node:test` (cắt nguyên văn thân hàm + stub DOM) | huỷ giữa chừng khi attach, liveness, đối chiếu file |
 | `test_thinking_trace.js` | Scratch Node debug parser thinking (không phải test suite) | debug SSE shape upstream |
 | `CHANGELOG.md` | Lịch sử patch/finding | lý do thay đổi, triệu chứng cũ |
 
@@ -50,9 +52,11 @@ Giá trị mặc định và alias nằm trong `qwen_web2api/config.py`. Các ke
   phải sửa cả 2 nơi.
 - `temporary_chat` (chấp nhận cả spelling `temporary-chat`), `temporary_chat_reload` (default
   `true`), `captcha_wait_seconds` (default 300, `0` = tắt).
-- UI: `bridge_select_model` (true), `bridge_select_mode` (true), `bridge_force_request_model`
-  (false, thử nghiệm), `bridge_require_model` / `bridge_require_mode` (false),
-  `bridge_require_attachment` (true).
+- UI: `bridge_select_model` (true), `bridge_select_mode` (**false**: không bấm dropdown mode),
+  `bridge_force_request_model` (false, thử nghiệm), `bridge_force_request_mode` (**true**) +
+  `bridge_mode_feature_config` (mặc định = 3 mode lấy từ request thật, xem "Mode Auto/Thinking/Fast"),
+  `bridge_require_model` / `bridge_require_mode` (false; `require_mode` chỉ có nghĩa khi
+  `bridge_select_mode=true`), `bridge_require_attachment` (true).
 - File/prompt: `prompt_max_bytes` (0 = không cắt), `prompt_hard_max_chars` (0),
   `file_prompt_max_chars` (mặc định 130000), `file_prompt_truncate` (false),
   `attachment_prompt` (mặc định `"Please read the text and action"`).
@@ -61,6 +65,14 @@ Giá trị mặc định và alias nằm trong `qwen_web2api/config.py`. Các ke
   `tool_reject_bad_arguments` (true).
 - Khác: `default_model`, `strict_models`, `thinking`, `max_body_bytes`, `log_requests`,
   `log_file`, `debug` (alias `debug_log`/`verbose_log`).
+- Danh sách sửa trong `config.json` (restart server để áp dụng): `models` (null = dùng
+  `DEFAULT_MODELS` trong `models.py`; có giá trị hợp lệ → thay hẳn; dạng `["id"]` /
+  `[{"id","upstream","desc"}]` / `{"id": {...}}`), `qwen_builtin_tools` (mặc định
+  `["code_interpreter"]`; Python gửi cho extension qua `/status.builtin_tools`).
+- Log theo phiên: `log_session_file` (mỗi lần bật server 1 file `<log_dir>/server-<ngày-giờ>-<pid>.log`,
+  không giới hạn 100 dòng như `/debug`), `log_dir` (mặc định `logs`), `log_save_prompt_files`
+  (chép file prompt vào `<log_dir>/prompts-<phiên>/`). Chỉ ghi khi `log_requests=true`.
+  `attachment_usage_warn_ratio` (0.05, 0 = tắt warn): xem "Chẩn đoán attachment".
 
 `debug=true` → `/status` trả `debug: true`, extension log chi tiết + forward event `debug`,
 `GET /debug` (8083) trả snapshot config/bridge state/100 dòng `recent_log`.
@@ -84,15 +96,37 @@ Giá trị mặc định và alias nằm trong `qwen_web2api/config.py`. Các ke
   `.wms-*` có popup phụ qua `.wms-more-entry`. Chọn lỗi → `warn` (mặc định chạy tiếp với model
   UI cũ) hoặc huỷ+retry nếu `bridge_require_model`. `bridge_force_request_model` ghi đè
   `model`/`models` trong body request.
-- Mode: dropdown gần ô prompt; click `.qwen-chat-v2-dropdown-menu-select`, item
-  `role="menuitem"` / `.qwen-chat-v2-dropdown-menu-item`. none/minimal/low → Fast, medium →
-  Auto, high/xhigh/max → Thinking. `/poll` trả `mode`, vòng poll phải copy vào `job`.
+- Mode (chỉ khi `bridge_select_mode=true`, không phải đường mặc định): dropdown gần ô prompt; click
+  `.qwen-chat-v2-dropdown-menu-select`, item `role="menuitem"` / `.qwen-chat-v2-dropdown-menu-item`.
+  none/minimal/low → Fast, medium → Auto, high/xhigh/max → Thinking. `/poll` trả `mode`, vòng poll
+  phải copy vào `job`. Mặc định mode đi qua body request, xem "Mode Auto/Thinking/Fast".
 - `refreshModels()` đọc `/api/v2/models` trong tab (throttle 10 phút), gửi qua body `/poll`,
   merge vào `/v1/models`.
 - Captcha: `waitCaptchaClear` chờ ở 3 chỗ (trước new-chat/reload, sau `waitPageReady`, lúc Send
   không bấm được). Selector hiện là **đoán** (`captchaSignal`: baxia/turnstile/URL
   `_____tmd_____`/text dialog) — cần DOM thật để chỉnh.
 - Lỗi UI mới phải `warn`/log rồi chạy tiếp, không throw làm hỏng request.
+- **Mode Auto/Thinking/Fast qua body request** (mặc định, không chạm dropdown, áp cho cả 3 mode):
+  `reasoning_effort` (none/minimal/low → fast, medium → auto, high/xhigh/max → thinking) →
+  `job.mode` → hook `fetch` (`rewriteRequestMode`) ghi đè `feature_config` (từng message, và top-level
+  nếu có) của body completion theo `bridge_mode_feature_config[mode]`. Không gửi `reasoning_effort` →
+  không ghi đè, body mang mode UI hiện tại. Mặc định (`DEFAULT_MODE_FEATURE_CONFIG` trong `config.py`)
+  lấy từ 3 request completion thật của Qwen web (chỉ `messages[0].feature_config` khác nhau, không có
+  `feature_config` top-level):
+
+  | mode | thinking_enabled | auto_thinking | thinking_mode | thinking_format |
+  | --- | --- | --- | --- | --- |
+  | auto | true | true | `"Auto"` | `"summary"` |
+  | thinking | true | false | `"Thinking"` | `"summary"` |
+  | fast | false | false | `"Fast"` | `null` = xoá key (request Fast thật không có key này) |
+
+  `output_schema="phase"`, `research_mode="normal"`, `auto_search=true` giống nhau ở cả 3 mode nên
+  không ghi đè. Giá trị `null` = xoá key khỏi `feature_config`. `config.json` ghi đè **cả dict**
+  (không merge theo mode): mode không khai báo / body không có `feature_config` → warn 1 lần/job,
+  không ghi đè. Chỉ hook `fetch` (như force model), chưa hook XHR. Qwen đổi key → lấy lại từ dòng
+  debug `completion request: ... mode=<mode> ... feature_config=<đầy đủ> top={...}`. Test:
+  `TestForceModeConfig` (Python) + `rewriteRequestMode: ...` trong `test_bridge.js` (đối chiếu từng
+  cặp trạng thái UI → mode với feature_config thật).
 
 ### SSE & thinking
 
@@ -132,6 +166,25 @@ Giá trị mặc định và alias nằm trong `qwen_web2api/config.py`. Các ke
   → HTTP 413. `bridge_require_attachment` chặn request thiếu attachment trừ khi nội dung text
   >= 95% `file_info.size`.
 
+#### Chẩn đoán attachment (chỉ cảnh báo, không chặn)
+
+Một job có file để lại các dòng log sau (grep `job <8 ký tự đầu>` để gom theo job):
+
+1. Python `[attach] file ...`: chars/bytes/lines/sha256/truncated/layout; `file_info` mang thêm
+   `bytes`, `sha256`, `lines`, `truncated` (debug thêm `head`/`tail`).
+2. Extension `file prompt khop file Python` hoặc `FILE PROMPT LECH`: bytes + sha256 của nội dung
+   extension lấy từ `/file/` so với file Python đã ghi. `composer da co attachment TRUOC...` =
+   file cũ còn sót; `attachment cards sau '<strategy>'` = card DOM sau khi attach.
+3. Extension `completion request: ... files=[tên|size|status|type] expect=<tên>/<bytes>B/sha256:..`:
+   `FILE DINH KEM BAT THUONG` khi sai số lượng file, khác tên, khác kích thước, trạng thái chưa
+   xong, hoặc job không có file mà request vẫn mang attachment. Cách đọc key file (`name`,
+   `size`, `status`...) là đoán theo nhiều tên key — nếu Qwen dùng key khác thì `files=[?|?B|?]`;
+   xem `file0={...}`.
+4. Python `[attach-check]` khi job xong: `usage_in` (input_tokens) / chars = `tokens_per_char`,
+   + 160 ký tự đầu câu trả lời. `attach-check WARN` khi tỉ lệ < `attachment_usage_warn_ratio` hoặc
+   câu trả lời giống "không thấy file". Chưa xác nhận Qwen có tính token của file vào `usage`
+   hay không → đối chiếu vài job thật trước khi tin warn tỉ lệ.
+
 ### Liveness / huỷ / retry
 
 - Trước mỗi thao tác UI extension hỏi `GET /alive?job_id=<jid>` (`jobAlive(force=true)` bỏ cache
@@ -142,7 +195,7 @@ Giá trị mặc định và alias nằm trong `qwen_web2api/config.py`. Các ke
   `bridge_cancel_on_disconnect` huỷ job non-stream. `tab_reloaded` → fail nhanh 502 + retry;
   `tab_reloading` chỉ warn. Job orphan (caller ngắt/TTL) bị `/poll` drop.
 - Tool drop (undeclared / `body is not valid JSON`) → `_run_turn` nudge retry kèm lý do + tool
-  hợp lệ. Tool built-in của Qwen (`QWEN_BUILTIN_TOOLS`, hiện `code_interpreter`) bị extension bỏ
+  hợp lệ. Tool built-in của Qwen (config `qwen_builtin_tools`, mặc định `code_interpreter`) bị extension bỏ
   qua để Qwen tự chạy.
 
 ### Tool protocol
@@ -158,8 +211,11 @@ arguments sai kiểu thay vì biến thành `{}`. Chi tiết lịch sử ở `CH
 - `extension/bridge.js` hardcode bridge port 8083.
 - DOM heuristics chưa có test UI thật: model picker, mode dropdown, captcha selector, nút Send.
   Qwen đổi layout → sửa `findModelTrigger` / `selectModel` / `findModeTrigger` / `captchaSignal`.
-- `QWEN_BUILTIN_TOOLS` là danh sách cứng; Qwen thêm built-in mà không cập nhật → bị nudge như
-  tool lạ.
+- `bridge_mode_feature_config` mặc định là tên key `feature_config` của Qwen web lúc capture.
+  Qwen đổi tên/giá trị key → mode không còn đổi đúng (request vẫn chạy, nhưng với mode UI
+  hiện tại); `bridge_require_mode` không bắt được lỗi này khi `bridge_select_mode=false`.
+- Built-in tool của Qwen lấy từ config `qwen_builtin_tools`; Qwen thêm built-in mà không cập
+  nhật config → bị nudge như tool lạ. Extension chỉ nhận danh sách mới sau khi Python restart.
 - Temporary switch có thể `location.assign` làm mất JS đang chạy; job đã `/requeue` vẫn nằm trong
   `_jobs` nhưng request timeout nếu tab không reload.
 - Global state cần restore trong test: `bridge._pending`, `_jobs`, `_models`, `_last_seen`,
@@ -175,7 +231,7 @@ arguments sai kiểu thay vì biến thành `{}`. Chi tiết lịch sử ở `CH
   mutable → test snapshot/restore qua `_Sandbox`. `log()` chỉ ghi khi `CONFIG["log_requests"]`.
 - `extension/bridge.js` là content script MV3 duy nhất, MAIN world (override được `window.fetch`),
   không thêm file/build step.
-- Một file test: `test_qwen_web2api.py` (unittest, pytest collect được). Không network/browser/
+- Test Python: `test_qwen_web2api.py` (unittest, pytest collect được). Test extension: `test_bridge.js` (Node `node:test`, không dependency): `bridge.js` là IIFE nên test cắt thân hàm theo thụt lề 2 ký tự (`  function ten(` … dòng `  }`) và dựng lại bằng `new Function` với stub; hàm mới cần test thì thêm vào `loadFns([...], ctx)`, thiếu stub → ReferenceError. Không thay test UI thật (selector DOM). Không network/browser/
   token; mock `bridge._pending`/`generate`/`known_models`; endpoint bridge dùng HTTP server
   loopback port 0. Không nới assertion chỉ để pass nếu hành vi đang sai.
 - `test_thinking_trace.js` là scratch Node, không chạy CI (`node test_thinking_trace.js`).

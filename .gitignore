@@ -13,3 +13,4 @@ qwen-raw.log
 *_patch*.py
 *.bak*
 *.mhtml
+logs/

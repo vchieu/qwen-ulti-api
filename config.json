@@ -1,0 +1,75 @@
+{
+  "port": 8081,
+  "bridge_port": 8083,
+  "temporary_chat": true,
+  "temporary_chat_reload": true,
+  "default_model": "qwen3.7-plus",
+  "debug": true,
+  "bridge_require_model": true,
+  "bridge_require_mode": true,
+  "bridge_require_attachment": true,
+  "log_requests": true,
+  "attachment_prompt": "I have attached a file containing our compressed conversation history.Read the ENTIRE file carefully, then CONTINUE the work from where it left off. Do NOT repeat steps already completed. Start from the exact next action needed.",
+  "qwen_builtin_tools": [
+    "code_interpreter"
+  ],
+  "models": [
+    {
+      "id": "qwen3.7-plus",
+      "upstream": "qwen3.7-plus",
+      "desc": "Qwen3.7-Plus (web default, multimodal)"
+    },
+    {
+      "id": "qwen4-max",
+      "upstream": "qwen4-max",
+      "desc": "Qwen4-Max (flagship Qwen4)"
+    },
+    {
+      "id": "qwen3.8-max",
+      "upstream": "qwen3.8-max",
+      "desc": "Qwen3.8-Max (flagship Qwen3.8)"
+    },
+    {
+      "id": "qwen3.8-omni-flash",
+      "upstream": "qwen3.8-omni-flash",
+      "desc": "Qwen3.8-Omni-Flash (native multimodal: text, image, audio, video)"
+    },
+    {
+      "id": "qwen3.7-max",
+      "upstream": "qwen3.7-max",
+      "desc": "Qwen3.7-Max (flagship Qwen3.7, text-only)"
+    },
+    {
+      "id": "qwen3.5-omni-plus",
+      "upstream": "qwen3.5-omni-plus",
+      "desc": "Qwen3.5-Omni-Plus (native multimodal)"
+    }
+  ],
+  "log_session_file": true,
+  "log_dir": "logs",
+  "log_save_prompt_files": true,
+  "bridge_force_request_model": true,
+  "bridge_force_request_mode": true,
+  "bridge_select_model": false,
+  "bridge_select_mode": false,
+  "bridge_mode_feature_config": {
+    "auto": {
+      "thinking_enabled": true,
+      "auto_thinking": true,
+      "thinking_mode": "Auto",
+      "thinking_format": "summary"
+    },
+    "thinking": {
+      "thinking_enabled": true,
+      "auto_thinking": false,
+      "thinking_mode": "Thinking",
+      "thinking_format": "summary"
+    },
+    "fast": {
+      "thinking_enabled": false,
+      "auto_thinking": false,
+      "thinking_mode": "Fast",
+      "thinking_format": null
+    }
+  }
+}

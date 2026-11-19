@@ -1,4 +1,5 @@
 """OpenAI-compatible HTTP server for Qwen Web."""
+import hashlib
 import hmac
 import json
 import threading
@@ -14,9 +15,10 @@ from socketserver import ThreadingMixIn
 from . import __version__
 from .config import CONFIG
 from .models import MODELS, resolve_model, ui_mode_for_effort
-from .qwen import QwenError, log, debug_log
+from .qwen import QwenError, log, debug_log, save_prompt_copy
 from . import bridge
-from .tools import (build_response_format_instruction, is_required_tool_choice,
+from .tools import (_TRUNCATION_MARKER, build_response_format_instruction,
+                    is_required_tool_choice,
                     looks_like_missed_tool_call, messages_to_prompt,
                     missing_required_params, parse_tool_calls, strip_code_fence,
                     tool_names, tool_parameters, tool_required_params)
@@ -217,6 +219,40 @@ def _render_fit(messages, tools=None, tool_choice=None, prefix="", limit=None):
     return prefix + text
 
 
+def _roles_summary(messages):
+    """[{role:user},...] -> "user:3,assistant:2" (de log layout file prompt)."""
+    counts = {}
+    for m in messages or []:
+        role = str(m.get("role")) if isinstance(m, dict) else "?"
+        counts[role] = counts.get(role, 0) + 1
+    return ",".join(f"{r}:{n}" for r, n in counts.items()) or "-"
+
+
+def _fingerprint_prompt_file(file_info, content, layout=""):
+    """Dau van tay cua file prompt (bytes/sha256/lines/truncated) -> luu vao file_info de
+    extension doi chieu voi file no that su dinh kem, va ghi log de so voi dong
+    'completion request' / '[attach-check]'. Khong bao gio lam hong request."""
+    try:
+        raw = content.encode("utf-8")
+        file_info["bytes"] = len(raw)
+        file_info["sha256"] = hashlib.sha256(raw).hexdigest()
+        file_info["lines"] = content.count("\n") + 1
+        file_info["truncated"] = _TRUNCATION_MARKER in content
+        log(f"[attach] file {file_info.get('filename')}: chars={len(content)} "
+            f"bytes={file_info['bytes']} lines={file_info['lines']} "
+            f"sha256={file_info['sha256'][:16]} truncated={file_info['truncated']} "
+            f"over_paste_limit={file_info.get('over_paste_limit')} {layout}".rstrip())
+
+        def flat(s):
+            return s.replace("\r", " ").replace("\n", " ")
+        debug_log(f"[attach] head={flat(content[:120])!r} tail={flat(content[-120:])!r}")
+        saved = save_prompt_copy(file_info.get("path"), file_info.get("filename"))
+        if saved:
+            log(f"[attach] saved copy: {saved}")
+    except Exception as e:
+        log(f"[attach] fingerprint error: {e}")
+
+
 def prepare_large_prompt(messages, tools=None, tool_choice=None):
     """Prompt vuot MAX_PROMPT_CHARS -> tach history sang file .txt tam.
 
@@ -261,6 +297,10 @@ def prepare_large_prompt(messages, tools=None, tool_choice=None):
             "paste_limit": paste_limit,
             "over_paste_limit": len(file_content) > paste_limit,
         }
+        _fingerprint_prompt_file(
+            file_info, file_content,
+            f"layout=split history={len(history)} msgs [{_roles_summary(history)}] "
+            f"companion={len(companion_prompt)} chars")
         debug_log(f"large prompt split: history -> file ({len(file_content)} chars), "
                   f"companion prompt {len(companion_prompt)} chars, "
                   f"over_paste_limit={file_info['over_paste_limit']}")
@@ -282,6 +322,9 @@ def prepare_large_prompt(messages, tools=None, tool_choice=None):
         "paste_limit": paste_limit,
         "over_paste_limit": len(full_prompt) > paste_limit,
     }
+    _fingerprint_prompt_file(
+        file_info, full_prompt,
+        f"layout=full messages={len(messages)} [{_roles_summary(messages)}] reason={reason}")
     short_messages = [{
         "role": "user",
         "content": (
