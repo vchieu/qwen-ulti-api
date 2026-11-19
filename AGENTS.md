@@ -56,7 +56,8 @@ Giá trị mặc định và alias nằm trong `qwen_web2api/config.py`. Các ke
   `bridge_force_request_model` (false, thử nghiệm), `bridge_force_request_mode` (**true**) +
   `bridge_mode_feature_config` (mặc định = 3 mode lấy từ request thật, xem "Mode Auto/Thinking/Fast"),
   `bridge_require_model` / `bridge_require_mode` (false; `require_mode` chỉ có nghĩa khi
-  `bridge_select_mode=true`), `bridge_require_attachment` (true).
+  `bridge_select_mode=true`), `bridge_require_attachment` (true),
+  `bridge_attachment_block` (`["name","size","status","count","content"]`; `stale` opt-in; `[]` = chỉ cảnh báo).
 - File/prompt: `prompt_max_bytes` (0 = không cắt), `prompt_hard_max_chars` (0),
   `file_prompt_max_chars` (mặc định 130000), `file_prompt_truncate` (false),
   `attachment_prompt` (mặc định `"Please read the text and action"`).
@@ -166,7 +167,15 @@ Giá trị mặc định và alias nằm trong `qwen_web2api/config.py`. Các ke
   → HTTP 413. `bridge_require_attachment` chặn request thiếu attachment trừ khi nội dung text
   >= 95% `file_info.size`.
 
-#### Chẩn đoán attachment (chỉ cảnh báo, không chặn)
+#### Chẩn đoán attachment (cảnh báo; metadata lệch thì chặn theo `bridge_attachment_block`)
+
+Khi `bridge_require_attachment=true`, request **có** attachment nhưng metadata lệch file proxy đã
+tạo (tên / size / status đang upload / số file, hoặc file lấy từ `/file/` lệch bytes/sha256) bị
+chặn + Python retry, thay vì chỉ cảnh báo. Guard chạy cả đường fetch lẫn XHR
+(`strictProblemForBody`). Status lạ (`status_unknown`) và shape lạ chỉ cảnh báo vì key thật của Qwen
+chưa xác nhận: dòng `file shape` (1 lần/job) in entry file thật để đối chiếu `describeFileEntry`.
+Strategy `paste-text` bỏ qua so tên (Qwen tự đặt tên document). Hệ quả: nếu Qwen đổi tên/tính size
+khác, bỏ kind tương ứng khỏi `bridge_attachment_block`.
 
 Một job có file để lại các dòng log sau (grep `job <8 ký tự đầu>` để gom theo job):
 

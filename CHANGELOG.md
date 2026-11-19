@@ -200,3 +200,16 @@ hiện tại thì đọc `AGENTS.md`.
   nếu chỉ ghi đè key có sẵn thì body vẫn mang `thinking_format:"summary"`, khác request Fast thật.
 - `bridge_require_mode` chỉ kiểm tra lúc bấm dropdown, nên không còn tác dụng khi `bridge_select_mode=false`.
   Muốn quay về dropdown: `bridge_select_mode=true`, `bridge_force_request_mode=false`.
+
+## Attachment guard: chặn metadata lệch, thêm XHR (`qwen_findings_patch_attach`)
+
+- Vấn đề: `checkRequestFiles` / `verifyPromptFile` chỉ cảnh báo, request vẫn gửi dù sai tên, sai
+  size, file còn uploading hay nội dung lấy từ bridge lệch sha256; `strictRequestProblem` chỉ chặn
+  khi attachments=0. Đường XHR không có guard nào. Key file của Qwen vẫn là đoán.
+- Sửa: `classifyRequestFiles` trả `{kind,msg}`; `strictProblemForBody` (sync) chặn kind nằm trong
+  `bridge_attachment_block` (mặc định name/size/status/count/content); `verifyPromptFile` trả
+  boolean và `attachLongPrompt` ném lỗi khi lệch (Python retry); XHR gọi cùng guard. `status`
+  chỉ chặn nhóm pending/uploading, status lạ chỉ cảnh báo; `paste-text` bỏ qua so tên.
+- Thêm dòng debug `file shape` + cảnh báo `FILE SHAPE/DOM` để đối chiếu key/card thật.
+- Còn lại (không sửa được từ client): chưa chứng minh Qwen đọc đủ nội dung; chỉ có heuristic
+  `attach-check` (usage input_tokens / chars). XHR chưa có `rewriteRequestModel/Mode`.

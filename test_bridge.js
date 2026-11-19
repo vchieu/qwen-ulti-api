@@ -97,7 +97,7 @@ function attachEnv(opts = {}) {
     fetchPromptText: async () => opts.text || TEXT,
     attachmentSnapshot: () => ({}),
     findActiveAttachmentElements: () => [],
-    verifyPromptFile: async () => {},
+    verifyPromptFile: opts.verify || (async () => {}),
     reportStaleAttachments: () => {},
     reportAttachmentCards: () => {},
     jobAlive: async () => !state.dead,
@@ -123,8 +123,8 @@ function attachEnv(opts = {}) {
     setComposerClean: (_c, t) => { state.composer = t; calls.push(["setComposerClean", t]); },
   };
   const fns = loadFns(["attachLongPrompt"], ctx);
-  const run = (companion) =>
-    fns.attachLongPrompt({}, { filename: "qwen_prompt_x.txt" }, companion, { id: "job1" });
+  const run = (companion, job) =>
+    fns.attachLongPrompt({}, { filename: "qwen_prompt_x.txt" }, companion, job || { id: "job1" });
   const names = () => calls.map((c) => c[0]);
   return { run, calls, names, state };
 }
@@ -247,7 +247,8 @@ test("verifyPromptFile: khong co bytes/sha256 hoac file inline -> khong warn", a
 
 function requestEnv() {
   return loadFns(
-    ["describeFileEntry", "describeFileBrief", "collectRequestFiles", "checkRequestFiles"], {});
+    ["describeFileEntry", "describeFileBrief", "collectRequestFiles",
+      "classifyRequestFiles", "checkRequestFiles"], {});
 }
 
 // Hinh dang file cua Qwen la GIA DINH (chua co capture that): sua khi co mau that.
@@ -288,6 +289,109 @@ test("collectRequestFiles: bo trung cung file xuat hien 2 cho", (t) => {
   if (!e) return t.skip("helper request chua co trong bridge.js");
   const req = { files: [qwenFile()], messages: [{ files: [qwenFile()] }] };
   assert.equal(e.collectRequestFiles(req).length, 1);
+});
+
+// ------------------------------- chan metadata file lech (bridge_attachment_block) ----
+function guardEnv(block) {
+  const attachmentBlock = new Set(block);
+  const fns = loadFns(
+    ["partsText", "describeFileEntry", "describeFileBrief", "collectRequestFiles",
+      "classifyRequestFiles", "countAttachments", "strictProblemForBody"],
+    {
+      requireModel: false, selectModelEnabled: true, requireAttachment: true,
+      attachmentBlock, modelTargets: () => [], normLabel: (s) => s,
+    });
+  return { fns, attachmentBlock };
+}
+const GUARD_JOB = { file_info: { filename: "qwen_prompt_ab.txt", bytes: 1000, size: 1000 } };
+const reqBody = (files) =>
+  JSON.stringify({ messages: [{ role: "user", content: "hi", files }] });
+const DEFAULT_BLOCK = ["name", "size", "status", "count", "content"];
+
+test("strictProblemForBody: dung file -> cho phep", (t) => {
+  const g = guardEnv(DEFAULT_BLOCK);
+  if (!g.fns) return t.skip("strictProblemForBody chua co trong bridge.js");
+  assert.equal(g.fns.strictProblemForBody(GUARD_JOB, reqBody([qwenFile()])), "");
+});
+
+test("strictProblemForBody: sai ten / size / dang upload / 2 file -> CHAN", (t) => {
+  const g = guardEnv(DEFAULT_BLOCK);
+  if (!g.fns) return t.skip("strictProblemForBody chua co trong bridge.js");
+  const run = (files) => g.fns.strictProblemForBody(GUARD_JOB, reqBody(files));
+  assert.match(run([qwenFile({ id: "f2", name: "old.txt", file: { id: "f2" } })]), /old\.txt/);
+  assert.match(run([qwenFile({ size: 400, file: { id: "f1" } })]), /400/);
+  assert.match(run([qwenFile({ status: "uploading" })]), /uploading/);
+  assert.match(run([qwenFile(), qwenFile({ id: "f9", file: { id: "f9" } })]), /2 file/);
+});
+
+test("strictProblemForBody: van chan khi thieu attachment (companion don thuan)", (t) => {
+  const g = guardEnv(DEFAULT_BLOCK);
+  if (!g.fns) return t.skip("strictProblemForBody chua co trong bridge.js");
+  assert.match(g.fns.strictProblemForBody(GUARD_JOB, reqBody(undefined)), /KHONG mang file/);
+});
+
+test("strictProblemForBody: kind khong nam trong block -> chi canh bao, khong chan", (t) => {
+  const wrongName = [qwenFile({ id: "f2", name: "old.txt", file: { id: "f2" } })];
+  const g1 = guardEnv(["size"]);
+  if (!g1.fns) return t.skip("strictProblemForBody chua co trong bridge.js");
+  assert.equal(g1.fns.strictProblemForBody(GUARD_JOB, reqBody(wrongName)), "");
+  const g2 = guardEnv([]);                                  // [] = hanh vi cu
+  assert.equal(g2.fns.strictProblemForBody(GUARD_JOB, reqBody(wrongName)), "");
+});
+
+test("strictProblemForBody: status la / shape la -> khong chan (tranh false positive)", (t) => {
+  const g = guardEnv(DEFAULT_BLOCK);
+  if (!g.fns) return t.skip("strictProblemForBody chua co trong bridge.js");
+  assert.equal(g.fns.strictProblemForBody(GUARD_JOB, reqBody([qwenFile({ status: "ready" })])), "");
+  assert.equal(g.fns.strictProblemForBody(GUARD_JOB, reqBody([{ weird: "x" }])), "");
+});
+
+test("strictProblemForBody: paste-text bo qua ten nhung van so size", (t) => {
+  const g = guardEnv(DEFAULT_BLOCK);
+  if (!g.fns) return t.skip("strictProblemForBody chua co trong bridge.js");
+  const job = { ...GUARD_JOB, _attachStrategy: "paste-text" };
+  const renamed = qwenFile({ id: "f2", name: "Pasted_Text.txt", file: { id: "f2" } });
+  assert.equal(g.fns.strictProblemForBody(job, reqBody([renamed])), "");
+  const wrongSize = qwenFile({ id: "f2", name: "Pasted_Text.txt", size: 5, file: { id: "f2" } });
+  assert.match(g.fns.strictProblemForBody(job, reqBody([wrongSize])), /5/);
+});
+
+test("strictProblemForBody: stale chi chan khi bat opt-in", (t) => {
+  const g1 = guardEnv(DEFAULT_BLOCK);
+  if (!g1.fns) return t.skip("strictProblemForBody chua co trong bridge.js");
+  assert.equal(g1.fns.strictProblemForBody({}, reqBody([qwenFile()])), "");
+  const g2 = guardEnv([...DEFAULT_BLOCK, "stale"]);
+  assert.match(g2.fns.strictProblemForBody({}, reqBody([qwenFile()])), /KHONG co file/);
+});
+
+test("strictProblemForBody: body khong phai string -> khong chan", (t) => {
+  const g = guardEnv(DEFAULT_BLOCK);
+  if (!g.fns) return t.skip("strictProblemForBody chua co trong bridge.js");
+  assert.equal(g.fns.strictProblemForBody(GUARD_JOB, null), "");
+  assert.equal(g.fns.strictProblemForBody(GUARD_JOB, {}), "");
+});
+
+test("verifyPromptFile: tra false khi lech, true khi khop", async (t) => {
+  const { fns } = verifyEnv();
+  if (!fns) return t.skip("verifyPromptFile chua co trong bridge.js");
+  const text = "abc";
+  const ok = { filename: "f.txt", bytes: 3, sha256: await sha(text) };
+  assert.equal(await fns.verifyPromptFile({ id: "j" }, ok, text), true);
+  assert.equal(await fns.verifyPromptFile({ id: "j" }, { ...ok, bytes: 9 }, text), false);
+});
+
+test("attachLongPrompt: file lech + blockFileMismatch -> nem loi, chua dinh kem gi", async () => {
+  const env = attachEnv({ verify: async () => false });
+  await assert.rejects(
+    () => env.run(undefined, { id: "job1", blockFileMismatch: true }), /khong khop/);
+  assert.ok(!env.names().includes("pasteFileEvent"));
+  assert.ok(!env.names().includes("dropFileEvent"));
+});
+
+test("attachLongPrompt: file lech nhung khong bat blockFileMismatch -> khong nem loi 'khong khop'", async () => {
+  const env = attachEnv({ verify: async () => false });
+  await env.run(undefined, { id: "job1" }).catch((e) =>
+    assert.doesNotMatch(String(e && e.message), /khong khop file Python/));
 });
 
 // ------------------------------------------------------------ rewriteRequestMode ----

@@ -84,6 +84,14 @@ DEFAULT_CONFIG = {
     # KHONG mang attachment (va noi dung chua gui du bang text) -> chan + retry,
     # khong gui cau "Please read..." khi Qwen khong nhan duoc tai lieu.
     "bridge_require_attachment": True,
+    # Request THAT co attachment nhung metadata lech file proxy da tao -> CHAN (retry) thay vi
+    # chi canh bao. Kind: name (khac ten), size (khac byte), status (dang upload/pending),
+    # count (khong dung 1 file), content (extension fetch file tu bridge lech bytes/sha256 so
+    # voi file Python ghi), stale (job khong co file ma request van mang attachment; mac
+    # dinh TAT vi hinh dang field Qwen chua xac nhan). Chi co tac dung khi
+    # bridge_require_attachment=true. [] = chi canh bao (hanh vi cu). Neu Qwen doi ten/tinh
+    # size khac -> bo kind do ra khoi danh sach.
+    "bridge_attachment_block": ["name", "size", "status", "count", "content"],
     # false = KHONG cat file prompt (mat evidence o cuoi log).
     # File > tran paste van thu paste-file truoc; fallback cac strategy khac.
     "file_prompt_truncate": False,

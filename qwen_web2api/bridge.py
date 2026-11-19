@@ -217,6 +217,18 @@ def mode_feature_config():
     return out
 
 
+_ATTACH_BLOCK_KINDS = ("name", "size", "status", "count", "content", "stale")
+
+
+def _attachment_block():
+    """config bridge_attachment_block -> list kind hop le (kind la bi bo qua)."""
+    raw = CONFIG.get("bridge_attachment_block")
+    if not isinstance(raw, (list, tuple)):
+        return []
+    kinds = (str(x).strip().lower() for x in raw)
+    return [k for k in kinds if k in _ATTACH_BLOCK_KINDS]
+
+
 def status():
     with _lock:
         n = len(_jobs)
@@ -233,6 +245,7 @@ def status():
             "require_mode": bool(CONFIG.get("bridge_require_mode", False)),
             # chan request thieu attachment.
             "require_attachment": bool(CONFIG.get("bridge_require_attachment", True)),
+            "attachment_block": _attachment_block(),
             "model_ids": _model_ids(),
             # tool built-in cua Qwen (config qwen_builtin_tools).
             "builtin_tools": builtin_tools(),

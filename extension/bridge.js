@@ -297,6 +297,10 @@
   let requireModel = false;   // config bridge_require_model (qua /status)
   let requireMode = false;    // config bridge_require_mode  (qua /status)
   let requireAttachment = true;   // config bridge_require_attachment (qua /status)  /* */
+  // config bridge_attachment_block (qua /status): kind metadata file lech thi CHAN thay vi canh bao.
+  // name|size|status|count (request), content (file lay tu bridge lech file Python), stale (opt-in).
+  let attachmentBlock = new Set(["name", "size", "status", "count", "content"]);
+  let xhrBodyWarned = false;  // XHR body khong phai string: chi canh bao 1 lan
   let navSince = 0;           // N1: watchdog cho co `navigating`
   const ALIVE_CACHE_MS = 1500;
 
@@ -495,6 +499,11 @@
     if (st && typeof st.require_model === "boolean") requireModel = st.require_model;
     if (st && typeof st.require_mode === "boolean") requireMode = st.require_mode;
     if (st && typeof st.require_attachment === "boolean") requireAttachment = st.require_attachment;
+    if (st && Array.isArray(st.attachment_block)) {
+      attachmentBlock = new Set(st.attachment_block
+        .filter((x) => typeof x === "string")
+        .map((x) => x.trim().toLowerCase()).filter(Boolean));
+    }
     if (st && Array.isArray(st.model_ids)) {
       uiModelIds = st.model_ids.filter((x) => typeof x === "string");
     }
@@ -1493,22 +1502,22 @@
     return n;
   }
 
-  // Tra ve ly do chan ("" = cho phep). Chi hoat dong theo config strict:
+  // Tra ve ly do chan ("" = cho phep) tu body (string) cua request completion. Dong bo de dung
+  // chung cho fetch (sau khi doc body) va XHR (send() khong await duoc). Chi hoat dong theo
+  // config strict:
   //  - bridge_require_model: request mang model khac job.model -> chan
   //  - bridge_require_attachment: job co file ma request khong co attachment
   //    VA noi dung chua gui du bang text (content_chars < 95% file) -> chan
-  async function strictRequestProblem(job, input, init) {
+  //  - bridge_attachment_block: request CO attachment nhung metadata (ten/size/status/so luong)
+  //    lech file proxy da tao -> chan neu kind nam trong danh sach, kind khac chi canh bao
+  function strictProblemForBody(job, body) {
     try {
-      if (!job) return "";
+      if (!job || typeof body !== "string" || !body) return "";
       const wantModel = String(job.model || "").split("@think=")[0].trim();
       const checkModel = !!(requireModel && selectModelEnabled !== false && wantModel);
       const checkFile = !!(requireAttachment && job.file_info);
-      if (!checkModel && !checkFile) return "";
-      let body = init && init.body;
-      if (typeof body !== "string" && input && typeof input.clone === "function") {
-        body = await input.clone().text();
-      }
-      if (typeof body !== "string" || !body) return "";
+      const checkStale = !!(requireAttachment && !job.file_info && attachmentBlock.has("stale"));
+      if (!checkModel && !checkFile && !checkStale) return "";
       const req = JSON.parse(body);
       if (!req || typeof req !== "object") return "";
       const msgs = Array.isArray(req.messages) ? req.messages : [];
@@ -1530,15 +1539,45 @@
             + "' (bridge_require_model=true -> chan, khong gui)";
         }
       }
-      if (checkFile && !countAttachments(req, 0)) {
-        const chars = msgs.reduce((n, m) => n + partsText(m && m.content).length, 0);
-        const need = Number(job.file_info.size) || 0;
-        if (!(need > 0 && chars >= need * 0.95)) {
-          return "request KHONG mang file dinh kem (attachments=0, content_chars=" + chars
-            + ", file=" + need + " ky tu) -> chan, khong gui cau companion thay noi dung that "
-            + "(bridge_require_attachment=true)";
+      if (checkFile) {
+        if (!countAttachments(req, 0)) {
+          const chars = msgs.reduce((n, m) => n + partsText(m && m.content).length, 0);
+          const need = Number(job.file_info.size) || 0;
+          if (!(need > 0 && chars >= need * 0.95)) {
+            return "request KHONG mang file dinh kem (attachments=0, content_chars=" + chars
+              + ", file=" + need + " ky tu) -> chan, khong gui cau companion thay noi dung that "
+              + "(bridge_require_attachment=true)";
+          }
+        } else {
+          const hard = classifyRequestFiles(job, collectRequestFiles(req))
+            .filter((p) => attachmentBlock.has(p.kind));
+          if (hard.length) {
+            return "metadata file dinh kem lech file proxy da tao: "
+              + hard.map((p) => p.msg).join(" | ")
+              + " (bridge_attachment_block -> chan, khong gui)";
+          }
+        }
+      } else if (checkStale) {
+        const stale = classifyRequestFiles(job, collectRequestFiles(req))
+          .filter((p) => p.kind === "stale");
+        if (stale.length) {
+          return stale.map((p) => p.msg).join(" | ")
+            + " (bridge_attachment_block co 'stale' -> chan, khong gui)";
         }
       }
+    } catch (e) { /* loi chan doan khong duoc chan app */ }
+    return "";
+  }
+
+  // Wrapper cho fetch: lay body (string hoac Request.clone) roi dung chung strictProblemForBody.
+  async function strictRequestProblem(job, input, init) {
+    try {
+      if (!job || !(requireModel || requireAttachment)) return "";
+      let body = init && init.body;
+      if (typeof body !== "string" && input && typeof input.clone === "function") {
+        body = await input.clone().text();
+      }
+      return strictProblemForBody(job, body);
     } catch (e) { /* loi chan doan khong duoc chan app */ }
     return "";
   }
@@ -1601,43 +1640,76 @@
     return out;
   }
 
-  // So file request that su gui voi file proxy da tao. Tra ve danh sach van de (rong = on).
-  // Chi de canh bao: Qwen co the doi ten/kich thuoc -> xem dong 'completion request'.
-  function checkRequestFiles(job, files) {
+  // So file request that su gui voi file proxy da tao. Tra ve [{kind, msg}] (rong = on).
+  // kind: name | size | status (dang upload/pending) | status_unknown (khong biet nghia: chi canh bao)
+  //       | count | stale. Caller chan theo bridge_attachment_block, kind khac chi canh bao.
+  function classifyRequestFiles(job, files) {
     const problems = [];
+    const add = (kind, msg) => problems.push({ kind, msg });
     const exp = job && job.file_info;
     if (!exp) {
       if (files.length) {
-        problems.push("job KHONG co file nhung request mang " + files.length
+        add("stale", "job KHONG co file nhung request mang " + files.length
           + " attachment (file cu con sot trong composer/trang?): "
           + files.map(describeFileBrief).join("; "));
       }
       return problems;
     }
     if (!files.length) return problems;   // truong hop nay da bao rieng (missing)
-    if (files.length !== 1) {
-      problems.push("request mang " + files.length + " file (ky vong 1): "
+    // Chi dem entry co ten/size (entry chi co id chuoi la cach khac bieu dien cung 1 file).
+    const detailed = files.filter((f) => f.name || typeof f.size === "number");
+    const nFiles = detailed.length || files.length;
+    if (nFiles !== 1) {
+      add("count", "request mang " + nFiles + " file (ky vong 1): "
         + files.map(describeFileBrief).join("; "));
     }
     const expName = String(exp.filename || "");
     const named = files.filter((f) => f.name);
-    if (expName && named.length && !named.some((f) => f.name === expName)) {
-      problems.push("ten file gui di [" + named.map((f) => f.name).join(", ")
+    // paste-text: Qwen tu dat ten document -> khong so ten duoc (van so size).
+    const skipName = !!(job && job._attachStrategy === "paste-text");
+    if (!skipName && expName && named.length && !named.some((f) => f.name === expName)) {
+      add("name", "ten file gui di [" + named.map((f) => f.name).join(", ")
         + "] khac file proxy tao '" + expName + "' (DINH NHAM FILE?)");
     }
     const expBytes = Number(exp.bytes) || 0;
     const sized = files.filter((f) => typeof f.size === "number");
     if (expBytes && sized.length && !sized.some((f) => f.size === expBytes)) {
-      problems.push("kich thuoc file gui di [" + sized.map((f) => f.size).join(", ")
+      add("size", "kich thuoc file gui di [" + sized.map((f) => f.size).join(", ")
         + "] != " + expBytes + " byte proxy da ghi (FILE THIEU/DU NOI DUNG? "
-        + "neu Qwen tinh size khac thi bo qua)");
+        + "neu Qwen tinh size khac thi bo 'size' khoi bridge_attachment_block)");
     }
-    const bad = files.filter((f) => f.status
-      && !/^(uploaded|success|done|finished|complete|completed)$/i.test(f.status));
-    if (bad.length) {
-      problems.push("trang thai file chua xong: " + bad.map(describeFileBrief).join("; "));
+    const OK_STATUS = /^(uploaded|success|done|finished|complete|completed)$/i;
+    const PENDING_STATUS = /^(uploading|pending|processing|parsing|queued|queueing|waiting|loading|in_progress|in-progress)$/i;
+    const notOk = files.filter((f) => f.status && !OK_STATUS.test(f.status));
+    const pending = notOk.filter((f) => PENDING_STATUS.test(f.status));
+    const unknown = notOk.filter((f) => !PENDING_STATUS.test(f.status));
+    if (pending.length) {
+      add("status", "trang thai file chua xong: " + pending.map(describeFileBrief).join("; "));
+    }
+    if (unknown.length) {
+      add("status_unknown", "trang thai file la (khong thuoc nhom da biet, chi canh bao): "
+        + unknown.map(describeFileBrief).join("; "));
     }
     return problems;
+  }
+
+  // API cu: chi tra danh sach thong bao.
+  function checkRequestFiles(job, files) {
+    return classifyRequestFiles(job, files).map((p) => p.msg);
+  }
+
+  // Hinh dang (key + kieu/gia tri cat ngan) cua 1 entry file trong request, de doi chieu key THAT
+  // cua Qwen voi describeFileEntry (hien chi doan ten key).
+  function fileShape(v, depth) {
+    if (v === null) return null;
+    if (v === undefined) return "undefined";
+    if (typeof v === "string") return "str:" + v.slice(0, 40);
+    if (typeof v === "number" || typeof v === "boolean") return v;
+    if (depth > 3) return "...";
+    if (Array.isArray(v)) return v.slice(0, 3).map((x) => fileShape(x, depth + 1));
+    const out = {};
+    for (const k of Object.keys(v).slice(0, 20)) out[k] = fileShape(v[k], depth + 1);
+    return out;
   }
 
   // Chan doan chinh xac: request completion cua app co kem file/attachment khong?
@@ -1652,6 +1724,7 @@
       const req = JSON.parse(body);
       if (!req || typeof req !== "object") return;
       const found = [];
+      const rawFiles = [];     // entry file THAT (toi da 3) de log shape
       let fileSample = null;   // mau file dinh kem dau tien ()
       const walk = (v, path, depth) => {
         if (depth > 5 || v === null || typeof v !== "object") return;
@@ -1664,6 +1737,7 @@
           if (/^(files?|attachments?|file_ids?)$/i.test(k)
               && Array.isArray(val) && val.length) {
             found.push(path + "." + k + "=" + val.length);
+            for (const x of val) if (rawFiles.length < 3) rawFiles.push(x);
             if (!fileSample && val[0] && typeof val[0] === "object") {
               fileSample = {};
               for (const fk of Object.keys(val[0]).slice(0, 12)) {
@@ -1714,6 +1788,27 @@
       const missing = !!(job && job.file_info) && !found.length;
       const files = collectRequestFiles(req);
       const verdict = checkRequestFiles(job, files);
+      // Shape metadata chua duoc xac nhan voi request that: log 1 lan/job, canh bao neu khong doc
+      // duoc gi, va doi chieu ten voi attachment card DOM (heuristic, chi canh bao).
+      if (rawFiles.length && job && !job._shapeLogged) {
+        job._shapeLogged = true;
+        let shapeTxt = "";
+        try { shapeTxt = JSON.stringify(rawFiles.map((x) => fileShape(x, 0))).slice(0, 1800); } catch (e) { /* bo qua */ }
+        send(job.id, { kind: "debug",
+          message: "file shape (entry that trong request, chuoi cat 40 ky tu): " + shapeTxt });
+      }
+      const shapeWarn = [];
+      if (files.length && !files.some((f) => f.name || f.size !== null || f.status)) {
+        shapeWarn.push("SHAPE FILE LA: khong doc duoc name/size/status tu entry file -> metadata "
+          + "KHONG duoc doi chieu/chan (xem dong 'file shape', sua describeFileEntry)");
+      }
+      const cards = job && Array.isArray(job._cardTexts) ? job._cardTexts : [];
+      const namedFiles = files.filter((f) => f.name);
+      if (cards.length && namedFiles.length
+          && !namedFiles.some((f) => cards.some((c) => c.indexOf(f.name.slice(0, 20)) >= 0))) {
+        shapeWarn.push("ten file trong request [" + namedFiles.map((f) => f.name).join(", ")
+          + "] khong khop attachment card DOM [" + cards.join("; ") + "] (heuristic DOM)");
+      }
       const expInfo = (job && job.file_info)
         ? " expect=" + (job.file_info.filename || "?") + "/" + (job.file_info.bytes || "?")
           + "B/sha256:" + String(job.file_info.sha256 || "?").slice(0, 12)
@@ -1722,9 +1817,10 @@
       const filesInfo = " files=[" + files.map(describeFileBrief).join("; ") + "]";
       const pre = modelBad ? "MODEL KHAC YEU CAU (request gui '" + reqModel
         + "' != job '" + wantModel + "'): " : "";
-      const problemTxt = verdict.length
-        ? "FILE DINH KEM BAT THUONG: " + verdict.join(" | ") + " :: " : "";
-      send(job.id, { kind: (missing || modelBad || verdict.length) ? "warn" : "debug",
+      const problemTxt = (verdict.length
+        ? "FILE DINH KEM BAT THUONG: " + verdict.join(" | ") + " :: " : "")
+        + (shapeWarn.length ? "FILE SHAPE/DOM: " + shapeWarn.join(" | ") + " :: " : "");
+      send(job.id, { kind: (missing || modelBad || verdict.length || shapeWarn.length) ? "warn" : "debug",
         message: pre + problemTxt
           + (missing ? "request gui di KHONG thay file/attachment: " + info : info)
           + filesInfo + expInfo });
@@ -1793,6 +1889,25 @@
   XMLHttpRequest.prototype.send = function (body) {
     const job = current;   // giu job tu luc gui 
     if (job && !job.attached && !job.settled && isCompletionURL(this.__qwenURL)) {
+      /* XHR cung phai qua guard nhu fetch: mat noi dung inline / metadata file lech / sai model. */
+      if (typeof body === "string") {
+        const xhrLost = checkInlineIntegrity(job, { body });
+        const xhrStrict = xhrLost ? "" : strictProblemForBody(job, body);
+        if (xhrLost || xhrStrict) {
+          if (xhrLost) learnInlineLimit(String(job.prompt || "").length);
+          const xErr = new Error(xhrLost
+            ? "Qwen UI " + xhrLost + " (XHR; se dung duong attach file o lan retry)"
+            : "Qwen UI request bi chan: " + xhrStrict + " (XHR)");
+          fwd(job, "warn", xErr.message);
+          settle(job, xErr);
+          throw xErr;
+        }
+        inspectCompletionRequest(job, null, { body });
+      } else if (!xhrBodyWarned) {
+        xhrBodyWarned = true;
+        fwd(job, "warn", "XHR completion body khong phai string (" + typeof body
+          + "): khong guard/doi chieu duoc attachment");
+      }
       job.attached = true;
       if (typeof job._clearSendTimer === "function") job._clearSendTimer();
       /* send timer DA bi clear o tren, nen neu
@@ -2229,17 +2344,18 @@
     return { bytes: bytes.length, sha256: sha };
   }
 
-  // Noi dung extension lay tu /file/<ten> co khop file Python da ghi khong
-  // (bytes + sha256). Chi canh bao, khong chan.
+  // Noi dung extension lay tu /file/<ten> co khop file Python da ghi khong (bytes + sha256).
+  // Tra ve false khi LECH (attachLongPrompt chan neu job.blockFileMismatch), true khi khop hoac
+  // khong du du lieu de doi chieu.
   async function verifyPromptFile(job, fileInfo, text) {
     try {
-      if (!fileInfo || typeof fileInfo._inlineText === "string") return;
+      if (!fileInfo || typeof fileInfo._inlineText === "string") return true;
       const name = fileInfo.filename || "?";
       const wantBytes = Number(fileInfo.bytes) || 0;
       const wantSha = String(fileInfo.sha256 || "");
       if (!wantBytes && !wantSha) {
         fwd(job, "debug", "file prompt " + name + ": proxy khong gui bytes/sha256, bo qua doi chieu");
-        return;
+        return true;
       }
       const fp = await fingerprintText(text);
       const bad = [];
@@ -2250,13 +2366,15 @@
       if (bad.length) {
         fwd(job, "warn", "FILE PROMPT LECH so voi file Python da ghi (" + name + "): "
           + bad.join(", ") + " -> noi dung dinh kem co the sai/thieu");
-      } else {
-        fwd(job, "debug", "file prompt khop file Python: " + name + " bytes=" + fp.bytes
-          + " sha256=" + (fp.sha256 ? fp.sha256.slice(0, 12) : "(khong co subtle)")
-          + (fileInfo.lines ? " lines=" + fileInfo.lines : ""));
+        return false;
       }
+      fwd(job, "debug", "file prompt khop file Python: " + name + " bytes=" + fp.bytes
+        + " sha256=" + (fp.sha256 ? fp.sha256.slice(0, 12) : "(khong co subtle)")
+        + (fileInfo.lines ? " lines=" + fileInfo.lines : ""));
+      return true;
     } catch (e) {
       debugLog("verifyPromptFile skipped:", (e && e.message) || e);
+      return true;
     }
   }
 
@@ -2280,6 +2398,7 @@
 
   function reportAttachmentCards(job, composer, used, fname) {
     const t = attachmentTexts(composer);
+    if (job) job._cardTexts = t;   // inspectCompletionRequest doi chieu ten file voi card
     fwd(job, "debug", "attachment cards sau '" + used + "': n=" + t.length
       + " [" + t.join("; ") + "] expect=" + fname);
   }
@@ -2343,7 +2462,11 @@
     const fname = fileInfo.filename || "";
     const before = attachmentSnapshot();
     const baseCount = findActiveAttachmentElements(composer).length;
-    await verifyPromptFile(job, fileInfo, text);
+    const fileOk = await verifyPromptFile(job, fileInfo, text);
+    if (fileOk === false && job && job.blockFileMismatch) {
+      throw new Error("noi dung file prompt lay tu bridge khong khop file Python da ghi "
+        + "(bytes/sha256) -> khong dinh kem (bridge_attachment_block co 'content')");
+    }
     reportStaleAttachments(job, composer);
 
     // Moi cach deu duoc kiem tra card; that bai thi xoa composer roi thu cach tiep.
@@ -2399,6 +2522,7 @@
     if (attached) {
       if (!(await jobAlive(job))) return;
       saveJobState(job, "file_uploaded", "File attached via " + used + ": " + fname);
+      if (job) job._attachStrategy = used;   // classifyRequestFiles bo qua ten khi paste-text
       if (job) send(job.id, { kind: "debug", message: "large prompt attached via " + used });
       reportAttachmentCards(job, composer, used, fname);
       await sleep(800);
@@ -2723,6 +2847,7 @@
 
       if (job.file_info) {
         // Large prompt: paste/upload de Qwen tao document, roi gui attachment.
+        job.blockFileMismatch = !!(requireAttachment && attachmentBlock.has("content"));
         await attachLongPrompt(composer, job.file_info, job.attachment_prompt, job);
         await sendPrompt(composer, 45000, job.attachment_prompt, job);
       } else {
