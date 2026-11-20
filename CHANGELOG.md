@@ -275,3 +275,40 @@ Sửa: `stopGenerationOnCancel(job)` trong `finally` của `runJobInner` (chỉ 
 Kèm: test `sendPromptEnv` của session_patch3 thiếu `sendDiag` trong `loadFns` → 2 test Node fail
 (`ReferenceError: sendDiag is not defined`); đã thêm `sendDiag`.
 
+## Session: companion của lượt `new` + ngưỡng inline học được chảy về Python (F1/F2)
+
+**F1 — lượt `new` dùng nhầm câu companion của config.** `Plan.job_session()` chỉ gắn
+`attach_prompt` cho `continue`/`fork`. Khi extension tự chuyển inline → file (ngưỡng đã học),
+`job.attachment_prompt` rỗng (Python không tạo file) → rơi xuống `attachment_prompt` của config
+("I have attached a file containing our **compressed conversation history**… CONTINUE the work
+from where it left off"). Log `server-20261120-200441-816.log`: 3 job `new` đều
+`content_chars=228 companion_len=228`; tin user cuối là "Thanks" nhưng model trả
+"Tôi đã đọc toàn bộ file lịch sử hội thoại. Tóm tắt những gì đã làm: …" (usage_in=43731 ⇒ file
+**có** tới Qwen, `status=uploaded`, `parse_status=success` — không phải lỗi mất file).
+Sửa: thêm `DEFAULT_PROMPTS["attach_full"]` (file chứa TOÀN BỘ hội thoại, kể cả system/tool
+definitions, và **tin cuối là tin cần trả lời**) + `job_session()` trả nó cho `KIND_NEW`.
+Đường Python whole-file (không split được) cũng dính cùng lỗi: `_compose_prompt` giờ đặt
+`file_info["companion_prompt"]` cho job session và `_file_companion` ưu tiên nó hơn config.
+
+**F2 — ngưỡng inline "đã học" chỉ nằm trong tab.** `learnInlineLimit` ghi `sessionStorage` +
+console, không báo Python; `server._inline_max_chars()` chỉ đọc config. Với
+`inline_prompt_max_chars=0` Python nghĩ ngưỡng = 130000 nên **không** split history/last-message,
+không `[attach]` fingerprint, không prompt copy, không `[attach-check]`; extension nhận cả
+prompt (kể cả tin user cuối) vào 1 file. `file_info` extension tự dựng cũng thiếu `bytes` nên
+`classifyRequestFiles` bỏ qua so size (`Number(exp.bytes)||0`) → guard `size` vô hiệu
+(log `expect=…txt/?B/sha256:?`).
+Sửa: (1) extension gửi `inline_limit` trong ping 5s + body `/poll`, **và gửi ngay** khi học
+(`/event` `kind:"ping"` — không sinh log orphan); `bridge._remember_inline_limit` chỉ nhận
+1000..1000000 và **chỉ giảm**; `/status.inline_limit` trả lại để tab mới adopt;
+`_inline_max_chars() = min(config, learned)`, tắt bằng `inline_prompt_use_learned=false`.
+(2) Khối inline→file tách thành `maybeInlineToFile(job)` (test được), `file_info` mang thêm
+`bytes`/`sha256` từ `fingerprintText()`; debug in rõ `companion=python|session|config`.
+
+**Giới hạn đã biết:** `prompt`/`file_info` được tính **một lần** trong `_compose_prompt` trước
+`_run_turn`, nên các attempt retry *cùng lượt* vẫn dùng prompt chưa split (extension tự chuyển).
+Ngưỡng mới có tác dụng từ **request kế tiếp**. Trong log này 2/3 lượt replay lớn (95994 và
+117870 ký tự) sẽ được Python split với companion thật.
+
+Test: `TestNewPlanAttachPrompt` + `TestNewPlanAttachPromptHttp` (test_session.py),
+`TestLearnedInlineLimit` + `TestInlineLimitReporting` (test_qwen_web2api.py),
+6 test Node (`adoptInlineLimit`, `learnInlineLimit`, `maybeInlineToFile` ×3, guard size).

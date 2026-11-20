@@ -42,7 +42,8 @@ def tool(cid, content):
 class _Sandbox(unittest.TestCase):
     def setUp(self):
         self._config = copy.deepcopy(CONFIG)
-        self._bridge = {"_last_seen": bridge._last_seen, "_pending": bridge._pending,
+        self._bridge = {"_last_seen": bridge._last_seen,
+            "_inline_limit": bridge._inline_limit, "_pending": bridge._pending,
                         "_tab": bridge._tab, "_tab_ts": bridge._tab_ts,
                         "_models": list(bridge._models)}
         self._cancelled = bridge._cancelled.copy()
@@ -1186,6 +1187,56 @@ class TestInterruptHttp(_HttpSandbox):
         self.assertEqual(j["prompt"], "tiep di ban")
         self.assertEqual(j["session"]["chat_id"], "CHAT-1")
         self.assertEqual(sess.STORE.get().turns, 3)
+
+
+class TestNewPlanAttachPrompt(_Sandbox):
+    """F1: luot new (replay day du) phai mang attach_prompt rieng. Extension tu chuyen
+    inline -> file thi composer dung cau nay, KHONG dung attachment_prompt cua config."""
+
+    M = [{"role": "system", "content": "SYS"}, {"role": "user", "content": "Thanks"}]
+
+    def test_new_plan_carries_full_replay_attach_prompt(self):
+        p = sess.STORE.plan(self.M, TOOLS, "auto", tab=None)
+        self.assertEqual(p.kind, "new")
+        ap = p.job_session()["attach_prompt"]
+        self.assertIn("FULL conversation", ap)
+        self.assertIn("LAST input", ap)
+        self.assertNotIn("compressed", ap.lower())
+        self.assertNotIn("my next message", ap)   # khong phai delta trong chat da co history
+
+    def test_new_plan_without_tools_still_gets_prompt(self):
+        p = sess.STORE.plan([{"role": "user", "content": "hi"}], None, "auto", tab=None)
+        self.assertIn("FULL conversation", p.job_session()["attach_prompt"])
+
+    def test_override_from_config(self):
+        CONFIG["session_prompts"] = {"attach_full": "DOC FILE: {nothing}"}
+        p = sess.STORE.plan(self.M, TOOLS, "auto", tab=None)
+        self.assertEqual(p.job_session()["attach_prompt"], "DOC FILE: {nothing}")
+
+    def test_plan_attach_prompt_wins(self):
+        p = sess.STORE.plan(self.M, TOOLS, "auto", tab=None)
+        p.attach_prompt = "RIENG"
+        self.assertEqual(p.job_session()["attach_prompt"], "RIENG")
+
+    def test_continue_delta_prompt_unchanged(self):
+        _commit_new(sess.STORE, self.M, "ok", None, tools=None)
+        msgs = self.M + [{"role": "assistant", "content": "ok"},
+                         {"role": "user", "content": "next"}]
+        p = sess.STORE.plan(msgs, None, "auto", tab=TAB)
+        self.assertEqual(p.kind, "continue")
+        ap = p.job_session()["attach_prompt"]
+        self.assertIn("my next message", ap)
+        self.assertNotIn("FULL conversation", ap)
+
+
+class TestNewPlanAttachPromptHttp(_HttpSandbox):
+    def test_new_job_payload_has_attach_prompt(self):
+        self.tab.push("ok")
+        st, _r = self.chat([{"role": "user", "content": "hi"}], tools=None)
+        self.assertEqual(st, 200)
+        sj = self.tab.jobs[0]["session"]
+        self.assertEqual(sj["mode"], "new")
+        self.assertIn("FULL conversation", sj["attach_prompt"])
 
 
 if __name__ == "__main__":

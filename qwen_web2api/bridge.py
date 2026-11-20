@@ -35,6 +35,11 @@ _last_seen = 0.0
 # path, chat_id tren URL. session.py doi chieu nonce de biet tab co bi reload khong.
 _tab = {}
 _tab_ts = 0.0
+# Nguong inline->file ma extension HOC duoc (learnInlineLimit): Qwen doi paste dai thanh
+# document / Send treo o muc thap hon tran 130000. Extension bao qua /poll + ping, Python dung
+# min(inline_prompt_max_chars, gia tri nay) de TACH history sang file ngay tu Python (co
+# fingerprint + companion that), thay vi de extension tu nhan ca prompt vao 1 file.
+_inline_limit = 0
 # Reference to shared circular buffer in qwen.py
 _recent_log = qwen._recent_log
 
@@ -171,6 +176,30 @@ def _remember_models(items):
             _models = clean
 
 
+def _remember_inline_limit(v):
+    """Ghi nguong inline extension bao ve. Chi nhan so nguyen hop le (1000..1000000) va CHI
+    GIAM: ca hai ben coi day la tran an toan, khong tu nang len. Gia tri 0/None = chua hoc."""
+    global _inline_limit
+    try:
+        n = int(float(v))
+    except (TypeError, ValueError):
+        return
+    if n < 1000 or n > 1000000:
+        return
+    with _lock:
+        if _inline_limit and n >= _inline_limit:
+            return
+        _inline_limit = n
+    _log(f"inline limit hoc duoc tu extension: {n} ky tu "
+         "(Python se tach prompt dai hon nguong nay sang file)")
+
+
+def learned_inline_limit():
+    """Nguong inline extension da hoc (0 = chua hoc duoc). server._inline_max_chars dung."""
+    with _lock:
+        return _inline_limit
+
+
 def _remember_tab(tab):
     """Luu trang thai tab tu extension. Chi giu nonce/path/chat_id (str) va busy (bool); khong
     co nonce -> bo qua (extension cu)."""
@@ -286,6 +315,7 @@ def status():
             "attachment_prompt": str(CONFIG.get("attachment_prompt", "Please read the text and action")),
             "debug": qwen.is_debug(),
             "models": n_models,
+            "inline_limit": learned_inline_limit(),
             "last_seen_ago": round(time.time() - _last_seen, 1)
             if _last_seen else None}
 
@@ -318,14 +348,21 @@ class _Tracker:
 
 
 def _file_companion(file_info):
-    """Cau gui kem file khi prompt nam TOAN BO
-    trong file. Ngoai cau mac dinh con co response_format (extra_instructions)
-    va loi nhac sua loi cua lan retry (retry_nudge) -- truoc day chi co cau
-    mac dinh nen 2 phan nay khong bao gio toi Qwen.
+    """Cau gui kem file khi prompt nam TOAN BO trong file.
+
+    companion_prompt (session dat) uu tien hon attachment_prompt cua config: luot new cua
+    session can cau "file chua toan bo hoi thoai, tra loi tin CUOI", khong phai cau
+    "compressed conversation history... continue from where it left off" (model se tom tat
+    lich su thay vi tra loi). Van kem response_format (extra_instructions) va loi nhac sua
+    loi cua lan retry (retry_nudge) -- truoc day 2 phan nay khong bao gio toi Qwen.
     """
-    parts = [str(CONFIG.get("attachment_prompt", "Please read the text and action"))]
+    fi = file_info if isinstance(file_info, dict) else {}
+    base = str(fi.get("companion_prompt") or "").strip()
+    if not base:
+        base = str(CONFIG.get("attachment_prompt", "Please read the text and action"))
+    parts = [base]
     for key in ("extra_instructions", "retry_nudge"):
-        extra = str((file_info or {}).get(key) or "").strip()
+        extra = str(fi.get(key) or "").strip()
         if extra:
             parts.append(extra)
     return "\n\n".join(parts)
@@ -740,6 +777,7 @@ class _Handler(BaseHTTPRequestHandler):
                          "bridge_select_model", "temporary_chat_reload", "captcha_wait_seconds", "default_model",
                          "bridge_select_mode", "bridge_force_request_model", "prompt_max_bytes",
                          "file_prompt_max_chars", "inline_prompt_max_chars",
+                         "inline_prompt_use_learned",
                          "retry_attempts",
                          "bridge_job_timeout", "bridge_poll_wait", "bridge_worker_ttl",
                          "attachment_prompt", "log_file", "bridge_port", "port",
@@ -756,6 +794,7 @@ class _Handler(BaseHTTPRequestHandler):
                     "pending_jobs": _pending.qsize(),
                     "active_jobs": n_jobs,
                     "known_models_count": n_models,
+                    "inline_limit": learned_inline_limit(),
                     "temporary_chat": temporary_chat_enabled(),
                 },
                 "recent_log": qwen.get_recent_log(),
@@ -785,6 +824,8 @@ class _Handler(BaseHTTPRequestHandler):
             _remember_models(data["models"])
         if isinstance(data.get("tab"), dict):
             _remember_tab(data["tab"])
+        if data.get("inline_limit") is not None:
+            _remember_inline_limit(data["inline_limit"])
         if path == "/cancel":
             jid = data.get("job_id")
             if not isinstance(jid, str) or not jid.strip():

@@ -326,3 +326,26 @@ arguments sai kiểu thay vì biến thành `{}`. Chi tiết lịch sử ở `CH
 
 Chỉ cập nhật khi **interface hoặc hành vi quan sát được từ bên ngoài** thay đổi — rename biến
 nội bộ/refactor không đổi hành vi thì không cần.
+
+## Ngưỡng inline học được & companion của lượt `new` (F1/F2)
+
+`bridge.learned_inline_limit()` là ngưỡng inline→file mà extension **học** được
+(`learnInlineLimit`, trần `INLINE_LIMIT_CAP`=32000) và báo về qua `inline_limit` trong ping 5s
++ body `/poll` (gửi ngay khi học, `/event` `kind:"ping"`). Chỉ giảm, chỉ nhận 1000..1000000.
+`/status.inline_limit` trả lại giá trị này → extension `adoptInlineLimit` cho tab mới.
+`server._inline_max_chars()` = `min(inline_prompt_max_chars, learned)`; đặt
+`inline_prompt_use_learned=false` để chỉ dùng config. Nhờ vậy Python **tự** split
+history→file + companion thật (có `[attach]` fingerprint, prompt copy, `[attach-check]`)
+thay vì để extension nhận cả prompt vào 1 file.
+**Lưu ý:** `prompt`/`file_info` tính một lần trong `_compose_prompt` trước `_run_turn` → retry
+*cùng lượt* vẫn dùng prompt chưa split; ngưỡng mới áp dụng từ request kế tiếp.
+
+Companion khi prompt nằm trong file, theo thứ tự ưu tiên:
+1. `job.attachment_prompt` do Python tạo (split: history→file + tin user cuối ở composer);
+2. `job.session.attach_prompt` — `attach_results`/`attach_fallback` cho delta,
+   **`attach_full` cho lượt `new`** (file chứa toàn bộ hội thoại, tin CUỐI là tin cần trả lời);
+3. `attachment_prompt` của config (fallback cuối, kiểu compaction).
+Đường Python whole-file: `_compose_prompt` đặt `file_info["companion_prompt"]` cho job session,
+`_file_companion` ưu tiên nó hơn config. Extension `maybeInlineToFile(job)` dựng `file_info`
+có `bytes`/`sha256` (`fingerprintText`) để guard `size` của `bridge_attachment_block` hoạt động
+cả trên đường extension tự chuyển; debug in `companion=python|session|config`.

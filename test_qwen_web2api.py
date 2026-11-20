@@ -63,6 +63,7 @@ class _Sandbox(unittest.TestCase):
         self._config = copy.deepcopy(CONFIG)
         self._bridge = {
             "_last_seen": bridge._last_seen,
+            "_inline_limit": bridge._inline_limit,
             "_jobs": bridge._jobs,
             "_pending": bridge._pending,
             "_models": list(bridge._models),
@@ -2871,6 +2872,150 @@ class TestInlinePromptThreshold(_Sandbox):
             self.assertEqual(fi.get("attachment_prompt"), "dung python co loi hon node khong")
         finally:
             server._remove_prompt_file(fi)
+
+
+class TestLearnedInlineLimit(_Sandbox):
+    """F2: nguong inline extension hoc duoc -> Python tach history->file dung cho."""
+
+    def setUp(self):
+        super().setUp()
+        self._saved_limit = bridge._inline_limit
+        bridge._inline_limit = 0
+
+    def tearDown(self):
+        bridge._inline_limit = self._saved_limit
+        super().tearDown()
+
+    def test_remember_only_decreases_and_validates(self):
+        self.assertEqual(bridge.learned_inline_limit(), 0)
+        bridge._remember_inline_limit(32000)
+        self.assertEqual(bridge.learned_inline_limit(), 32000)
+        bridge._remember_inline_limit(40000)          # khong nang len
+        self.assertEqual(bridge.learned_inline_limit(), 32000)
+        bridge._remember_inline_limit(24000)
+        self.assertEqual(bridge.learned_inline_limit(), 24000)
+        for bad in (None, "abc", 0, 999, -5, 10 ** 9, [], {}, True):
+            bridge._remember_inline_limit(bad)
+            self.assertEqual(bridge.learned_inline_limit(), 24000, repr(bad))
+
+    def test_threshold_is_min_of_config_and_learned(self):
+        CONFIG["inline_prompt_max_chars"] = 0         # = MAX_PROMPT_CHARS
+        bridge._remember_inline_limit(32000)
+        self.assertEqual(server._inline_max_chars(), 32000)
+        CONFIG["inline_prompt_max_chars"] = 20000
+        self.assertEqual(server._inline_max_chars(), 20000)
+        CONFIG["inline_prompt_max_chars"] = 50000
+        self.assertEqual(server._inline_max_chars(), 32000)
+
+    def test_use_learned_false_keeps_config(self):
+        CONFIG["inline_prompt_use_learned"] = False
+        CONFIG["inline_prompt_max_chars"] = 0
+        bridge._remember_inline_limit(32000)
+        self.assertEqual(server._inline_max_chars(), server.MAX_PROMPT_CHARS)
+
+    def test_status_exposes_learned_limit(self):
+        self.assertEqual(bridge.status()["inline_limit"], 0)
+        bridge._remember_inline_limit(31000)
+        self.assertEqual(bridge.status()["inline_limit"], 31000)
+
+    def test_config_zero_without_learned_stays_inline(self):
+        CONFIG["inline_prompt_max_chars"] = 0
+        fi, _out = server.prepare_large_prompt([
+            {"role": "user", "content": "x" * 40000},
+            {"role": "user", "content": "Thanks"}])
+        self.assertIsNone(fi)
+
+    def test_learned_limit_makes_python_split_with_real_companion(self):
+        CONFIG["inline_prompt_max_chars"] = 0
+        bridge._remember_inline_limit(32000)
+        msgs = [{"role": "system", "content": "S" * 20000},
+                {"role": "user", "content": "q1"},
+                {"role": "assistant", "content": "a" * 20000},
+                {"role": "user", "content": "Thanks"}]
+        fi, short = server.prepare_large_prompt(msgs)
+        try:
+            self.assertIsNotNone(fi)
+            self.assertEqual(short, [{"role": "user", "content": "Thanks"}])
+            self.assertEqual(fi["attachment_prompt"], "Thanks")
+            self.assertTrue(fi.get("sha256"))
+            self.assertGreater(fi.get("bytes", 0), 0)
+        finally:
+            server._remove_prompt_file(fi)
+
+    def test_whole_file_session_job_uses_session_companion(self):
+        from qwen_web2api import session as sess
+        CONFIG["inline_prompt_max_chars"] = 1000
+        msgs = [{"role": "user", "content": "Z" * 5000}]   # 1 message -> khong split duoc
+        plan = sess.Plan(sess.KIND_NEW, "test", [], "ctx", "chat", True)
+        fi, _prompt, _m = server._compose_prompt(plan, msgs, None, "auto", "")
+        try:
+            self.assertIsNotNone(fi)
+            self.assertIsNone(fi.get("attachment_prompt"))
+            self.assertIn("FULL conversation", fi["companion_prompt"])
+            comp = bridge._file_companion(fi)
+            self.assertTrue(comp.startswith("[Conversation file]"), comp)
+            self.assertNotIn(CONFIG["attachment_prompt"], comp)
+        finally:
+            server._remove_prompt_file(fi)
+
+    def test_legacy_whole_file_companion_unchanged(self):
+        fi = {"filename": "x.txt", "size": 10}
+        self.assertEqual(bridge._file_companion(fi), CONFIG["attachment_prompt"])
+
+
+class TestInlineLimitReporting(_Sandbox):
+    """Extension bao inline_limit qua /event ping va /poll (khong can endpoint moi)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = bridge._Server(("127.0.0.1", 0), bridge._Handler)
+        cls.port = cls.srv.server_address[1]
+        cls.thread = threading.Thread(target=cls.srv.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+        cls.thread.join(2)
+
+    def setUp(self):
+        super().setUp()
+        self._saved_limit = bridge._inline_limit
+        bridge._inline_limit = 0
+
+    def tearDown(self):
+        bridge._inline_limit = self._saved_limit
+        super().tearDown()
+
+    def _post(self, path, payload):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            c.request("POST", path, json.dumps(payload),
+                      {"Content-Type": "application/json",
+                       "Origin": "chrome-extension://x"})
+            r = c.getresponse()
+            return r.status, json.loads(r.read() or b"{}")
+        finally:
+            c.close()
+
+    def test_ping_carries_learned_limit(self):
+        st, _d = self._post("/event", {"kind": "ping", "inline_limit": 31000,
+                                       "tab": {"nonce": "N1"}})
+        self.assertEqual(st, 200)
+        self.assertEqual(bridge.learned_inline_limit(), 31000)
+
+    def test_poll_carries_learned_limit(self):
+        CONFIG["bridge_poll_wait"] = 0.05
+        st, _d = self._post("/poll", {"worker": "w", "inline_limit": 28000})
+        self.assertEqual(st, 200)
+        self.assertEqual(bridge.learned_inline_limit(), 28000)
+
+    def test_zero_and_garbage_are_ignored(self):
+        bridge._remember_inline_limit(30000)
+        self._post("/event", {"kind": "ping", "inline_limit": 0})
+        self._post("/event", {"kind": "ping", "inline_limit": "abc"})
+        self.assertEqual(bridge.learned_inline_limit(), 30000)
 
 
 if __name__ == "__main__":

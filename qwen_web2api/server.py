@@ -45,15 +45,26 @@ MAX_PROMPT_CHARS = 130000  # buffer an toàn dưới giới hạn 131072 ký t�
 
 def _inline_max_chars():
     """Nguong inline -> file (config inline_prompt_max_chars). <=0/sai = MAX_PROMPT_CHARS
-    (hanh vi cu). Khong vuot MAX_PROMPT_CHARS: inline > ~32k khong on dinh (Qwen doi
-    text thanh document / Send treo), xem INLINE_LIMIT_CAP trong extension."""
+    (hanh vi cu). Khong vuot MAX_PROMPT_CHARS.
+
+    Them: extension bao nguong that su dung duoc (bridge.learned_inline_limit -- learnInlineLimit
+    hoc khi Qwen doi paste dai thanh document / Send treo). Dung min(config, learned) de Python
+    TACH history -> file + companion that ngay tu dau. Neu de extension tu chuyen thi CA prompt
+    (ke ca tin user cuoi) vao 1 file: mat split, mat fingerprint, va dung nham cau companion.
+    inline_prompt_use_learned=false -> bo qua gia tri hoc duoc (chi dung config).
+    """
     try:
         v = int(float(CONFIG.get("inline_prompt_max_chars", MAX_PROMPT_CHARS)))
     except (TypeError, ValueError):
-        return MAX_PROMPT_CHARS
+        v = MAX_PROMPT_CHARS
     if v <= 0:
-        return MAX_PROMPT_CHARS
-    return min(v, MAX_PROMPT_CHARS)
+        v = MAX_PROMPT_CHARS
+    thr = min(v, MAX_PROMPT_CHARS)
+    if CONFIG.get("inline_prompt_use_learned", True):
+        learned = bridge.learned_inline_limit()
+        if learned > 0:
+            thr = min(thr, learned)
+    return thr
 _MSG_PREVIEW_CHARS = 200   # Option B: số ký tự preview mỗi message trong log
 
 
@@ -405,9 +416,16 @@ def _compose_prompt(plan, messages, tools, tool_choice, rf):
     prompt += pre
     if file_info and file_info.get("attachment_prompt"):
         file_info["attachment_prompt"] = prompt
-    elif file_info and (rf or pre):
-        # prompt nam toan bo trong file -> response_format/preamble phai vao composer.
-        file_info["extra_instructions"] = ((rf or "") + pre).strip()
+    elif file_info:
+        # Prompt nam TOAN BO trong file -> composer chi nhan cau companion. Session phai dung
+        # cau dung ngu canh (session.job_session), khong dung attachment_prompt cua config.
+        if plan is not None:
+            cp = str(plan.job_session().get("attach_prompt") or "").strip()
+            if cp:
+                file_info["companion_prompt"] = cp
+        if rf or pre:
+            # response_format/preamble phai vao composer (prompt chi la "[Attached file: ...]").
+            file_info["extra_instructions"] = ((rf or "") + pre).strip()
     if plan is not None:
         # Luot new = replay day du: tinh vao chars_sent de session_max_chars dung (truoc day
         # luot new chi tinh do dai cau tra loi, vd "chars=0" trong log).

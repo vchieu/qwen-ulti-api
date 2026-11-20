@@ -218,12 +218,51 @@
     if (savedLimit > 0) inlineMaxChars = savedLimit;
   } catch (e) { /* best-effort */ }
 
-  function learnInlineLimit(len) {
-    const n = Math.max(1000, Math.min(Number(len) - 1, INLINE_LIMIT_CAP));
-    if (!(n < inlineMaxChars)) return;
+  // Nguong inline chi GIAM. Python bao lai gia tri da biet qua /status.inline_limit de tab
+  // moi / phien moi cung dung nguong an toan nay (sessionStorage cua tab cu khong con).
+  function adoptInlineLimit(v) {
+    const n = Number(v);
+    if (!(n > 0) || !(n < inlineMaxChars)) return false;
     inlineMaxChars = n;
     try { sessionStorage.setItem(INLINE_LIMIT_KEY, String(n)); } catch (e) { /* best-effort */ }
+    return true;
+  }
+  function learnInlineLimit(len) {
+    const n = Math.max(1000, Math.min(Number(len) - 1, INLINE_LIMIT_CAP));
+    if (!adoptInlineLimit(n)) return;
     console.log("[qwen-ui-bridge] inline prompt limit learned:", n);
+    // Bao Python NGAY (ping co inline_limit): Python dung min(config, learned) de tach
+    // history -> file + companion that cho cac request sau. Khong cho poll/ping ke tiep vi
+    // job retry co the duoc tra ve truoc do (long-poll dang treo).
+    try { post("/event", { kind: "ping", inline_limit: n, tab: tabInfo() }).catch(() => {}); }
+    catch (e) { /* best-effort */ }
+  }
+  // Prompt inline >= nguong da hoc -> di duong attach file. Tra ve true neu da chuyen.
+  // file_info mang THEM bytes/sha256 (fingerprintText): thieu bytes thi classifyRequestFiles
+  // bo qua so size -> guard 'size' cua bridge_attachment_block im lang vo hieu.
+  // Companion uu tien: prompt Python da tach -> session.attach_prompt (dung ngu canh tung
+  // loai luot) -> attachment_prompt cua config (chi la fallback cuoi, kieu compaction).
+  async function maybeInlineToFile(job) {
+    if (!job || job.file_info) return false;
+    const text = String(job.prompt || "");
+    if (!(text.length >= inlineMaxChars)) return false;
+    const fp = await fingerprintText(text);
+    job.file_info = {
+      filename: "qwen_prompt_inline_" + job.id + ".txt",
+      size: text.length,
+      bytes: fp.bytes,
+      sha256: fp.sha256,
+      _inlineText: text,
+    };
+    const sessAp = job.session && job.session.attach_prompt;
+    const src = job.attachment_prompt ? "python" : (sessAp ? "session" : "config");
+    job.attachment_prompt = job.attachment_prompt || sessAp
+      || attachmentPrompt || ATTACHMENT_COMPANION_PROMPT;
+    send(job.id, { kind: "debug",
+      message: "prompt " + text.length + " ky tu >= nguong inline da hoc (" + inlineMaxChars
+        + "): dung duong attach file (bytes=" + fp.bytes + ", companion=" + src
+        + "/" + String(job.attachment_prompt).length + " ky tu)" });
+    return true;
   }
 
   // Job new/legacy prompt inline lon: retry an toan (chat moi) -> duoc phep stall-fallback.
@@ -596,6 +635,7 @@
     if (st && typeof st.debug === "boolean") {
       debugEnabled = st.debug;
     }
+    if (st) adoptInlineLimit(st.inline_limit);
     if (st && typeof st.temporary_reload === "boolean") {
       temporaryReloadEnabled = st.temporary_reload;
     }
@@ -3027,21 +3067,7 @@
   async function runJobInner(job) {
     current = job;
     saveJobState(job, "started", "Job " + job.id + " started");
-    if (!job.file_info && String(job.prompt || "").length >= inlineMaxChars) {
-      // Prompt inline tung bi Qwen doi thanh document ma khong dinh kem: di duong
-      // attach file (co kiem tra card), noi dung lay thang tu job.prompt.
-      job.file_info = {
-        filename: "qwen_prompt_inline_" + job.id + ".txt",
-        size: String(job.prompt).length,
-        _inlineText: String(job.prompt),
-      };
-      job.attachment_prompt = job.attachment_prompt
-        || (job.session && job.session.attach_prompt)
-        || attachmentPrompt || ATTACHMENT_COMPANION_PROMPT;
-      send(job.id, { kind: "debug",
-        message: "prompt " + job.file_info.size + " ky tu >= nguong inline da hoc ("
-          + inlineMaxChars + "): dung duong attach file" });
-    }
+    await maybeInlineToFile(job);
     let sendTimer = null;
     job._armSendTimer = () => {
       if (job.settled || job.attached) return;
@@ -3142,7 +3168,8 @@
   }
 
   setInterval(() => {
-    post("/event", { kind: "ping", tab: tabInfo() }).catch(() => {});
+    post("/event", { kind: "ping", tab: tabInfo(),
+      inline_limit: Number.isFinite(inlineMaxChars) ? Math.round(inlineMaxChars) : 0 }).catch(() => {});
     /* Job dang generate ma caller da ngat: khong cho event/delta ke tiep (Qwen "nghi" lau thi
        khong co delta nao) -> hoi /alive, settle de runJobInner bam Stop. */
     const j = current;
@@ -3173,7 +3200,8 @@
         await refreshModels(false);
         if (!(await idleModeCheck())) { await sleep(500); continue; }
         const r = await post("/poll", { worker: location.host, models: knownModels,
-          tab: tabInfo() });
+          tab: tabInfo(),
+          inline_limit: Number.isFinite(inlineMaxChars) ? Math.round(inlineMaxChars) : 0 });
         if (r && r.job) {
           active++;
           const job = {

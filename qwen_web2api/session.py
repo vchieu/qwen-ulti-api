@@ -91,6 +91,18 @@ DEFAULT_PROMPTS = {
         "[Message] The attached file contains my next message (too long to type). Read the "
         "ENTIRE file and reply to it as my next message in this chat, following the same "
         "output format as before. Do not summarize the file back to me."),
+    # Luot NEW (replay day du) ma toan bo prompt phai nam trong file: composer CHI nhan cau
+    # nay. Khac attach_fallback (delta = tin tiep theo trong chat DA co history): file chua CA
+    # hoi thoai ke ca system/tool definitions, va tin CUOI cung la tin can tra loi. Khong duoc
+    # de roi xuong attachment_prompt cua config ("compressed conversation history") -> model
+    # se tom tat lich su thay vi tra loi tin user cuoi.
+    "attach_full": (
+        "[Conversation file] The attached file contains the FULL conversation for this new "
+        "chat: system instructions, any tool definitions, every earlier message and tool "
+        "result, and it ENDS with the newest input. Read the ENTIRE file, then respond to "
+        "that LAST input exactly as the instructions and output format inside the file "
+        "require. Do not summarize the file back to me, and do not repeat work that is "
+        "already completed in it."),
     "attach_results": (
         "[Tool results] The attached file holds the system output of your previous tool_call(s) "
         "(not written by the human); each result sits between \"=== RESULT ... ===\" and "
@@ -372,6 +384,12 @@ class Plan:
             s["user_action"] = str(CONFIG.get("session_fork_user_action", "edit") or "")
         if self.kind in (KIND_CONTINUE, KIND_FORK):
             s["attach_prompt"] = self.attach_prompt or prompts()["attach_fallback"]
+        elif self.kind == KIND_NEW:
+            # Luot new = replay day du. Extension co the tu chuyen inline -> file (nguong da
+            # hoc); luc do composer CHI nhan cau nay -> phai noi ro file chua toan bo hoi thoai
+            # va tin CUOI trong file la tin can tra loi. Thieu key nay thi extension roi xuong
+            # attachment_prompt cua config (compaction) -> model tom tat lich su.
+            s["attach_prompt"] = self.attach_prompt or prompts()["attach_full"]
         return s
 
     def bridge_kwargs(self):

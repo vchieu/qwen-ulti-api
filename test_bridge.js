@@ -877,3 +877,118 @@ test("stopGenerationOnCancel: nut Stop khong tat -> toi da 3 lan bam", async (t)
   await fns.stopGenerationOnCancel({ cancelled: true, attached: true });
   assert.equal(state.clicks, 3);
 });
+
+// ================== F1/F2: nguong inline bao ve Python + companion + fingerprint ====
+function adoptEnv(opts = {}) {
+  const state = { posted: [], stored: [] };
+  const ctx = {
+    INLINE_LIMIT_KEY: "K",
+    INLINE_LIMIT_CAP: 32000,
+    inlineMaxChars: opts.limit === undefined ? Infinity : opts.limit,
+    sessionStorage: { setItem: (k, v) => state.stored.push([k, v]), getItem: () => null },
+    console: { log: () => {} },
+    post: (p, b) => { state.posted.push([p, b]); return Promise.resolve({}); },
+    tabInfo: () => ({ nonce: "N" }),
+  };
+  return { fns: loadFns(["adoptInlineLimit", "learnInlineLimit"], ctx), state };
+}
+
+test("adoptInlineLimit: chi giam, ghi sessionStorage, bo gia tri rac", (t) => {
+  const env = adoptEnv({ limit: 40000 });
+  if (!env.fns) return t.skip("adoptInlineLimit chua co trong bridge.js");
+  assert.equal(env.fns.adoptInlineLimit(32000), true);
+  assert.deepEqual(env.state.stored, [["K", "32000"]]);
+  assert.equal(env.fns.adoptInlineLimit(35000), false);   // khong nang len
+  assert.equal(env.fns.adoptInlineLimit(32000), false);   // bang nhau
+  for (const bad of [0, -1, "abc", null, undefined, NaN]) {
+    assert.equal(env.fns.adoptInlineLimit(bad), false, String(bad));
+  }
+  assert.equal(env.fns.adoptInlineLimit(30000), true);    // giam tiep tu 32000
+});
+
+test("learnInlineLimit: bao Python NGAY qua /event ping, khong bao lai khi khong giam", (t) => {
+  const env = adoptEnv();
+  if (!env.fns) return t.skip("learnInlineLimit chua co trong bridge.js");
+  env.fns.learnInlineLimit(95991);
+  assert.equal(env.state.posted.length, 1);
+  const [path, body] = env.state.posted[0];
+  assert.equal(path, "/event");
+  assert.equal(body.kind, "ping");
+  assert.equal(body.inline_limit, 32000);                 // tran INLINE_LIMIT_CAP
+  assert.deepEqual(body.tab, { nonce: "N" });
+  env.fns.learnInlineLimit(95991);
+  assert.equal(env.state.posted.length, 1);
+});
+
+function inlineFileEnv(opts = {}) {
+  const sent = [];
+  const ctx = {
+    inlineMaxChars: opts.limit === undefined ? 32000 : opts.limit,
+    attachmentPrompt: "CONFIG_COMPACTED_HISTORY",
+    ATTACHMENT_COMPANION_PROMPT: "COMP",
+    fingerprintText: async (txt) => ({
+      bytes: Buffer.byteLength(txt, "utf8"), sha256: "ab".repeat(32),
+    }),
+    send: (id, ev) => sent.push(ev),
+  };
+  return { fns: loadFns(["maybeInlineToFile"], ctx), sent };
+}
+
+test("maybeInlineToFile: file_info CO bytes/sha256 + companion uu tien session", async (t) => {
+  const env = inlineFileEnv();
+  if (!env.fns) return t.skip("maybeInlineToFile chua co trong bridge.js");
+  const text = "xin chào ".repeat(4000);                  // 36000 ky tu, 40000 byte
+  const job = { id: "j1", prompt: text,
+                session: { mode: "new", attach_prompt: "SESSION_FULL" } };
+  assert.equal(await env.fns.maybeInlineToFile(job), true);
+  assert.equal(job.file_info.filename, "qwen_prompt_inline_j1.txt");
+  assert.equal(job.file_info.size, text.length);
+  assert.equal(job.file_info.bytes, Buffer.byteLength(text, "utf8"));
+  assert.ok(job.file_info.bytes > job.file_info.size);
+  assert.equal(job.file_info.sha256, "ab".repeat(32));
+  assert.equal(job.file_info._inlineText, text);
+  assert.equal(job.attachment_prompt, "SESSION_FULL");    // KHONG dung config
+  assert.match(env.sent[0].message, /attach file/);
+  assert.match(env.sent[0].message, /companion=session\//);
+});
+
+test("maybeInlineToFile: khong session -> config; Python da tach -> giu nguyen", async (t) => {
+  const env = inlineFileEnv();
+  if (!env.fns) return t.skip("maybeInlineToFile chua co trong bridge.js");
+  const legacy = { id: "j2", prompt: "x".repeat(40000) };
+  assert.equal(await env.fns.maybeInlineToFile(legacy), true);
+  assert.equal(legacy.attachment_prompt, "CONFIG_COMPACTED_HISTORY");
+  const split = { id: "j3", prompt: "x".repeat(40000),
+                  attachment_prompt: "PYTHON_COMPANION",
+                  session: { mode: "new", attach_prompt: "SESSION_FULL" } };
+  assert.equal(await env.fns.maybeInlineToFile(split), true);
+  assert.equal(split.attachment_prompt, "PYTHON_COMPANION");
+});
+
+test("maybeInlineToFile: duoi nguong / da co file_info -> khong doi, khong log", async (t) => {
+  const env = inlineFileEnv();
+  if (!env.fns) return t.skip("maybeInlineToFile chua co trong bridge.js");
+  const small = { id: "a", prompt: "x".repeat(31999) };
+  assert.equal(await env.fns.maybeInlineToFile(small), false);
+  assert.equal(small.file_info, undefined);
+  const fi = { filename: "qwen_prompt_py.txt", bytes: 10 };
+  const hasFile = { id: "b", prompt: "x".repeat(50000), file_info: fi };
+  assert.equal(await env.fns.maybeInlineToFile(hasFile), false);
+  assert.equal(hasFile.file_info, fi);
+  assert.equal(env.sent.length, 0);
+});
+
+test("classifyRequestFiles: inline file co bytes -> guard size bat duoc lech", (t) => {
+  const e = requestEnv();
+  if (!e) return t.skip("helper request chua co trong bridge.js");
+  const name = "qwen_prompt_inline_j.txt";
+  const reqFile = (size) => ({
+    type: "file", id: "f1", name, size, status: "uploaded",
+    file: { id: "f1", filename: name,
+            meta: { name, size, content_type: "text/plain" } },
+  });
+  const job = { file_info: { filename: name, size: 36000, bytes: 40000 } };
+  const check = (size) => e.checkRequestFiles(job, e.collectRequestFiles(body([reqFile(size)])));
+  assert.deepEqual(check(40000), []);
+  assert.match(check(39000)[0], /THIEU/);
+});

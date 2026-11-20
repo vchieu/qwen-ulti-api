@@ -74,6 +74,10 @@ DEFAULT_CONFIG = {
     # dinh kem (prepare_large_prompt). 0/sai = MAX_PROMPT_CHARS (130000, hanh vi cu).
     # Mac dinh 30000: inline > ~32k khong on dinh (Qwen doi text thanh document, Send treo).
     "inline_prompt_max_chars": 30000,
+    # Dung nguong inline extension HOC duoc (bridge.learned_inline_limit) khi tinh
+    # inline_prompt_max_chars: thr = min(config, learned). false = chi dung config (extension
+    # van tu chuyen inline->file theo nguong no hoc, nhung Python khong tach truoc).
+    "inline_prompt_use_learned": True,
 
     "tool_retry_on_miss": True,
     "tool_retry_attempts": 1,
