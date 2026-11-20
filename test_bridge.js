@@ -520,3 +520,122 @@ test("rewriteRequestMode: null cung xoa o feature_config top-level", (t) => {
   assert.deepEqual(b.feature_config, { keep: 1 });
   assert.deepEqual(b.messages[0].feature_config, {});
 });
+
+// ------------------------------------------------------------------ session ----
+// Che do session (bridge_session_mode): helper thuan cua extension. Phan DOM/luong dieu khien
+// (runJobInner bo tryNewChat khi job continue/fork) khong test duoc o day -> thu tren
+// chat.qwen.ai that (xem AGENTS.md muc session).
+function sessEnv(extra = {}) {
+  const sent = [];
+  const ctx = Object.assign({
+    PAGE_NONCE: "NONCE-1",
+    location: { pathname: "/c/local" },
+    current: null,
+    active: 0,
+    send: (id, ev) => { sent.push([id, ev]); },
+    fwd: (job, kind, message) => { sent.push([job && job.id, { kind, message }]); },
+  }, extra);
+  const fns = loadFns(["urlChatId", "tabInfo", "sessionProblem", "sessionInfoOfBody",
+    "applyForkParent", "rewriteRequestSession", "announceSession"], ctx);
+  return { fns, sent };
+}
+
+test("urlChatId: /c/<id> -> id; /c/local, goc, query -> rong", (t) => {
+  const { fns } = sessEnv();
+  if (!fns) return t.skip("ham session chua co trong bridge.js");
+  assert.equal(fns.urlChatId("/c/1e814088-4969-4901-b03c-08dabdac8d50"), "1e814088-4969-4901-b03c-08dabdac8d50");
+  assert.equal(fns.urlChatId("/c/local"), "");
+  assert.equal(fns.urlChatId("/"), "");
+  assert.equal(fns.urlChatId(undefined), "");
+});
+
+test("tabInfo: nonce + path + chat_id + busy", (t) => {
+  const { fns } = sessEnv({ location: { pathname: "/c/abc" }, active: 1 });
+  if (!fns) return t.skip("ham session chua co trong bridge.js");
+  assert.deepEqual(fns.tabInfo(), { nonce: "NONCE-1", path: "/c/abc", chat_id: "abc", busy: true });
+});
+
+test("sessionProblem: nonce, chat_id va temporary", (t) => {
+  const { fns } = sessEnv();
+  if (!fns) return t.skip("ham session chua co trong bridge.js");
+  const sj = { nonce: "NONCE-1", chat_id: "C1" };
+  assert.equal(fns.sessionProblem(sj, "NONCE-1", "/c/C1", false), "");
+  assert.match(fns.sessionProblem(sj, "OTHER", "/c/C1", false), /nonce khac/);
+  assert.match(fns.sessionProblem(sj, "NONCE-1", "/c/C2", false), /khac chat cua session/);
+  assert.match(fns.sessionProblem(sj, "NONCE-1", "/", false), /khac chat cua session/);
+  // temporary: URL luon /c/local, khong doi chieu duoc chat_id; co id that tren URL -> sai chat
+  assert.equal(fns.sessionProblem(sj, "NONCE-1", "/c/local", true), "");
+  assert.match(fns.sessionProblem(sj, "NONCE-1", "/c/C2", true), /khong phai temporary/);
+  assert.match(fns.sessionProblem(null, "NONCE-1", "/", false), /nonce/);
+  assert.equal(fns.sessionProblem({ nonce: "NONCE-1", chat_id: "" }, "NONCE-1", "/c/X", false), "");
+});
+
+test("sessionInfoOfBody: lay chat_id/parent_id that (top-level uu tien, null -> rong)", (t) => {
+  const { fns } = sessEnv();
+  if (!fns) return t.skip("ham session chua co trong bridge.js");
+  assert.deepEqual(fns.sessionInfoOfBody({ chat_id: "C", parent_id: "P", parentId: "Q",
+    messages: [{ parent_id: "R" }] }), { chat_id: "C", parent_id: "P" });
+  assert.deepEqual(fns.sessionInfoOfBody({ chatId: "C", parent_id: null, parentId: "",
+    messages: [{ parent_id: null }] }), { chat_id: "C", parent_id: "" });
+  assert.deepEqual(fns.sessionInfoOfBody({ messages: [{ parentId: "M" }] }),
+    { chat_id: "", parent_id: "M" });
+  assert.deepEqual(fns.sessionInfoOfBody(null), { chat_id: "", parent_id: "" });
+});
+
+const forkBody = () => JSON.stringify({
+  chat_id: "C", chatId: "C", parent_id: "OLD", parentId: "OLD",
+  messages: [{ role: "user", content: "x", user_action: "chat", parent_id: "OLD", parentId: "OLD" }],
+});
+
+test("applyForkParent: ghi de du 4 cho parent_id + user_action, giu phan con lai", (t) => {
+  const { fns } = sessEnv();
+  if (!fns) return t.skip("ham session chua co trong bridge.js");
+  const req = JSON.parse(forkBody());
+  assert.equal(fns.applyForkParent(req, "NEW", "edit"), true);
+  assert.equal(req.parent_id, "NEW");
+  assert.equal(req.parentId, "NEW");
+  assert.equal(req.messages[0].parent_id, "NEW");
+  assert.equal(req.messages[0].parentId, "NEW");
+  assert.equal(req.messages[0].user_action, "edit");
+  assert.equal(req.chat_id, "C");
+  assert.equal(req.messages[0].content, "x");
+  const keep = JSON.parse(forkBody());
+  fns.applyForkParent(keep, "NEW", "");
+  assert.equal(keep.messages[0].user_action, "chat");
+  assert.equal(fns.applyForkParent(keep, "", "edit"), false);
+  assert.equal(fns.applyForkParent(null, "NEW", ""), false);
+});
+
+test("rewriteRequestSession: chi fork; continue/new/khong session -> null", (t) => {
+  const { fns, sent } = sessEnv();
+  if (!fns) return t.skip("ham session chua co trong bridge.js");
+  const init = { method: "POST", body: forkBody() };
+  const out = fns.rewriteRequestSession({ id: "j",
+    session: { mode: "fork", fork_parent_id: "P9", user_action: "edit" } }, init);
+  const b = JSON.parse(out.body);
+  assert.equal(b.parent_id, "P9");
+  assert.equal(b.messages[0].parentId, "P9");
+  assert.equal(out.method, "POST");
+  assert.match(sent[0][1].message, /parent_id -> P9/);
+  assert.equal(fns.rewriteRequestSession({ id: "j", session: { mode: "continue" } }, init), null);
+  assert.equal(fns.rewriteRequestSession({ id: "j", session: { mode: "new" } }, init), null);
+  assert.equal(fns.rewriteRequestSession({ id: "j" }, init), null);
+  // fork nhung thieu parent / body khong phai JSON -> null (caller chan request)
+  assert.equal(fns.rewriteRequestSession({ id: "j", session: { mode: "fork" } }, init), null);
+  assert.equal(fns.rewriteRequestSession({ id: "j", session: { mode: "fork", fork_parent_id: "P" } },
+    { body: "not json" }), null);
+});
+
+test("announceSession: gui event session voi nonce + id doc tu body (ke ca Request.clone)", async (t) => {
+  const { fns, sent } = sessEnv();
+  if (!fns) return t.skip("ham session chua co trong bridge.js");
+  await fns.announceSession({ id: "j", session: { mode: "continue" } }, null, { body: forkBody() });
+  assert.deepEqual(sent[0], ["j", { kind: "session", mode: "continue", nonce: "NONCE-1",
+    chat_id: "C", parent_id: "OLD" }]);
+  const req = { clone: () => ({ text: async () => forkBody() }) };
+  await fns.announceSession({ id: "k", session: { mode: "fork" } }, req, {});
+  assert.equal(sent[1][1].parent_id, "OLD");
+  await fns.announceSession({ id: "n" }, null, { body: forkBody() });   // job khong session
+  await fns.announceSession({ id: "m", session: { mode: "new" } }, null, { body: "{bad" });
+  assert.equal(sent.length, 2);
+});

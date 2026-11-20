@@ -14,3 +14,4 @@ qwen-raw.log
 *.bak*
 *.mhtml
 logs/
+*.xml

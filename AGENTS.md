@@ -14,6 +14,7 @@ từng thay đổi nằm ở `CHANGELOG.md` — đọc khi cần giải thích t
 python -m qwen_web2api                 # luôn bridge mode
 python -m qwen_web2api --port 8081     # override port API
 python -m unittest test_qwen_web2api -v
+python -m unittest test_session -v     # chế độ session (extension giả bằng _FakeTab)
 python -m pytest test_qwen_web2api.py -q
 node --check extension/bridge.js       # cú pháp content script
 node --test test_bridge.js              # test logic extension (Node >= 18, không cần browser)
@@ -28,6 +29,7 @@ Không có tab/worker → request trả 503.
 | --- | --- | --- |
 | `qwen_web2api/server.py` | HTTP OpenAI-compatible: `/v1/chat/completions`, `/v1/responses`, `/v1/models`, auth, CORS, SSE, `_run_turn` (tool retry/nudge), `prepare_large_prompt` | route, SSE response, auth, tool retry, file prompt |
 | `qwen_web2api/bridge.py` | Server 8083 cho extension: `/poll`, `/event`, `/status`, `/debug`, `/requeue`, `/file/*`, `/alive`, `/cancel`; queue job, stream event, `known_models()`, `temporary_chat_enabled()`, `job_cancelled()`, `job_alive()`, `cancel_job()` | job queue/timeout/requeue, liveness, file serving, models feed |
+| `qwen_web2api/session.py` | Chế độ session (`bridge_session_mode`): `SessionStore.plan/commit/fail`, hash chuỗi history, render delta, prompt (`DEFAULT_PROMPTS`). Thuần, không I/O | gửi tiếp vào chat Qwen thay vì replay |
 | `qwen_web2api/tools.py` | Flatten messages → prompt, chèn `# Tool Use`, parse tool_call, truncate theo byte | prompt render, tool_call parser |
 | `qwen_web2api/models.py` | `DEFAULT_MODELS`; `MODELS` đọc live từ config `models`; `@think=0/1` | tên model |
 | `qwen_web2api/config.py` | `DEFAULT_CONFIG` + `CONFIG` (global mutable), load/find config | giá trị mặc định, alias config key |
@@ -35,13 +37,15 @@ Không có tab/worker → request trả 503.
 | `qwen_web2api/__main__.py` | CLI, `_guard_bind` tự sinh API key khi bind ra ngoài loopback | khởi động, auth |
 | `extension/bridge.js` | MV3 content script (MAIN world): poll job, temporary/model/mode picker, gửi prompt, attach file, bắt native `tool_call`, hook fetch/XHR | mọi hành vi trong tab Qwen |
 | `test_qwen_web2api.py` | Toàn bộ unit test Python (stdlib `unittest`); `TestBridgeJs` gọi `test_bridge.js` | regression, mock endpoint |
+| `test_session.py` | Test `session.py` + nối vào server/bridge (e2e bằng `_FakeTab` thay extension) | session/fork/reset |
 | `test_bridge.js` | Test logic `extension/bridge.js` bằng `node:test` (cắt nguyên văn thân hàm + stub DOM) | huỷ giữa chừng khi attach, liveness, đối chiếu file |
 | `test_thinking_trace.js` | Scratch Node debug parser thinking (không phải test suite) | debug SSE shape upstream |
 | `CHANGELOG.md` | Lịch sử patch/finding | lý do thay đổi, triệu chứng cũ |
 
-Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` → `prepare_large_prompt` →
-`messages_to_prompt` → `_run_turn` → `bridge.generate` / `bridge.generate_stream` →
-`parse_tool_calls` → JSON hoặc SSE.
+Luồng chat: `do_POST` → `_handle_chat` / `_handle_responses` (bọc `sess.turn_guard()`) →
+`_session_plan` → `_compose_prompt` (`prepare_large_prompt` + `messages_to_prompt`, hoặc delta
+của session) → `_run_turn` → `bridge.generate` / `bridge.generate_stream` → `parse_tool_calls` →
+JSON hoặc SSE → `sess.STORE.commit`.
 
 ## Config chính
 
@@ -61,6 +65,12 @@ Giá trị mặc định và alias nằm trong `qwen_web2api/config.py`. Các ke
 - File/prompt: `prompt_max_bytes` (0 = không cắt), `prompt_hard_max_chars` (0),
   `file_prompt_max_chars` (mặc định 130000), `file_prompt_truncate` (false),
   `attachment_prompt` (mặc định `"Please read the text and action"`).
+- Session (xem "Chế độ session"): `bridge_session_mode` (**false**), `session_max_chars` (400000),
+  `session_max_turns` (60), `session_idle_ttl` (1800s), `session_file_threshold` (30000),
+  `session_reminder_every` (8), `session_strict_assistant` (false), `session_hash_ignore`
+  (regex bỏ khỏi nội dung trước khi hash; mặc định `<environment_details>…`), `session_prompts`
+  (ghi đè từng prompt trong `session.DEFAULT_PROMPTS`), `session_fork` (**false**, thử nghiệm),
+  `session_fork_user_action` (`"edit"`), `session_nudge_mode` (`append`|`fork`).
 - Liveness/retry: `bridge_cancel_on_disconnect` (true), `bridge_max_requeues` (8),
   `retry_attempts`, `retry_delay_sec`, `tool_retry_on_miss`, `tool_retry_attempts`,
   `tool_reject_bad_arguments` (true).
@@ -207,6 +217,49 @@ Một job có file để lại các dòng log sau (grep `job <8 ký tự đầu>
   hợp lệ. Tool built-in của Qwen (config `qwen_builtin_tools`, mặc định `code_interpreter`) bị extension bỏ
   qua để Qwen tự chạy.
 
+### Chế độ session (`bridge_session_mode`)
+
+Mục tiêu: coi chat Qwen đang mở là history của client; mỗi lượt chỉ gửi phần **mới** (delta)
+thay vì replay toàn bộ. Qwen dựng context phía server theo chuỗi `parent_id`, body completion
+chỉ mang **1** message mới.
+
+- `session.py` (thuần): `STORE.plan(messages, tools, tool_choice, tab, api)` → `Plan` kind
+  `new` (replay đầy đủ bằng đường cũ + preamble giao thức session) | `continue` (delta) |
+  `fork` (delta ở nhánh anh em). Khớp = `messages` của client bắt đầu bằng đúng chuỗi hash đã
+  "gộp" vào chat (kể cả tin assistant vừa trả). `canon_message`: system/user/tool = role + nội
+  dung (CRLF→LF, strip, bỏ `session_hash_ignore`); assistant có tool_calls = (id, name);
+  assistant text thuần = chỉ đếm (Cline hay strip), `session_strict_assistant` so cả nội dung.
+  `ctx_hash` = tool definitions.
+- Reset (`new`, log `[session] reset ... reason=`): hash lệch (`history_diverged@i/n`), client
+  retry/undo khi fork tắt, đổi tool, `api_changed`, quá `session_max_*`/`session_idle_ttl`, tab
+  reload (`nonce` khác), tab sang chat khác, delta chứa tin assistant, request lạ xen giữa
+  (title-gen... chạy ở chính tab này nên đằng nào chat cũng mất).
+- Giao thức Python↔extension: job mang `session` (`mode`, `nonce`, `chat_id`, `tools_active`,
+  `attach_prompt`, fork: `fork_parent_id`, `user_action`) + `tools_active` (delta không còn
+  `# Tool Use` nên không đoán từ prompt được). Extension báo `session` event ngay khi request
+  completion đi (kèm `nonce`, `chat_id`, `parent_id` đọc từ body thật) → Python coi là **đã gửi**:
+  job continue/fork **không retry** sau đó (gửi lại = nhân đôi delta); lỗi → `STORE.fail` reset,
+  client retry sẽ replay đầy đủ. `error` mang `session_lost:true` khi `verifySession` thất bại
+  (`sessionProblem`: nonce, URL `/c/<id>`; temporary chat luôn `/c/local`).
+  Job continue/fork **bỏ** `tryNewChat`/`ensureMode`/`waitPageReady` (không reload/đổi chat).
+  `/poll` và ping mang `tab:{nonce,path,chat_id,busy}` → `bridge.tab_state()` (TTL
+  `bridge_worker_ttl`); không có `nonce` (extension cũ) → không bao giờ tạo session.
+- Delta: tool result bọc `=== RESULT tool=<name> id=<id> ===` … `=== END RESULT <id> ===`
+  (thiếu result → `MISSING`) + dòng "tiếp tục, đừng lặp lại call"; tin user gửi nguyên văn
+  (mỗi `session_reminder_every` lượt thêm 1 dòng nhắc format). Delta > `session_file_threshold`
+  → file đính kèm với prompt riêng (`tool_results_file`/`message_file`); nếu extension tự chuyển
+  inline → file thì dùng `attach_prompt` (`attach_results`/`attach_fallback`), **không** dùng
+  `attachment_prompt` ("compressed conversation history" sai ngữ cảnh).
+- Nudge trong session (`_run_turn` lần 2+): `append` chỉ gửi `[Format error] …` vào chat (không
+  kèm file); `fork` (cần `session_fork`) gửi lại delta ở nhánh anh em. Chat Qwen chứa cả reply hỏng
+  + nudge nhưng hash client chỉ có reply cuối → vẫn khớp.
+- Fork (`session_fork`, thử nghiệm): extension ghi đè `parent_id` ở 4 chỗ (top-level
+  `parent_id`/`parentId`, `messages[].parent_id`/`parentId`) + `user_action` (hook fetch, như
+  `rewriteRequestMode`; XHR không hỗ trợ → lỗi). Dùng cho client retry cùng request, nudge,
+  client undo/edit (rewind về checkpoint `(n, parent_id)` có prefix khớp dài nhất).
+  Capture thật: sửa tin = completion thường với `user_action:"edit"` và `parent_id` của tin gốc;
+  context server theo chuỗi `parent_id` nên nhánh cũ bị bỏ (test ALPHA/BRAVO/CHARLIE).
+
 ### Tool protocol
 
 Fence ` ```tool_call `, chuẩn `{"name": "...", "arguments": {...}}`. Parser tự sửa shorthand,
@@ -217,6 +270,12 @@ arguments sai kiểu thay vì biến thành `{}`. Chi tiết lịch sử ở `CH
 
 ## Điểm dễ vỡ
 
+- Session: `parent_id` của lượt sau một fork do **app** tự tính (từ id assistant trong SSE) — chưa
+  chứng minh trên máy thật; `user_action:"edit"` có thật sự cần không cũng chưa rõ. Context
+  của một chat dài có giới hạn thật chưa đo (`session_max_chars` là số đoán). Tin
+  `Tool X does not exist` / reply sai format nằm lại trong chat (không tránh được). Harness đổi
+  system/env mỗi lượt → `history_diverged@0` liên tục (xem log `[session] reset`; thêm regex vào
+  `session_hash_ignore`). Selector/URL `/c/<id>` của app là capture, đổi → `session_lost`.
 - `extension/bridge.js` hardcode bridge port 8083.
 - DOM heuristics chưa có test UI thật: model picker, mode dropdown, captcha selector, nút Send.
   Qwen đổi layout → sửa `findModelTrigger` / `selectModel` / `findModeTrigger` / `captchaSignal`.

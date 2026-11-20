@@ -127,6 +127,35 @@ DEFAULT_CONFIG = {
     # Job co file: usage.input_tokens / so ky tu file < nguong nay -> warn "Qwen co the
     # chua doc file". 0 = tat warn (van log ty le).
     "attachment_usage_warn_ratio": 0.05,
+
+    # --- Che do session (qwen_web2api/session.py): chat Qwen hien hanh = history cua client ---
+    # true = chi gui phan MOI (delta) vao chat dang mo thay vi replay toan bo history moi luot.
+    # Can extension moi (nonce/tab/session event). Khop history that bai -> mo chat moi +
+    # replay day du (hanh vi cu), nen bat len khong lam hong gi, chi mat 1 lan replay.
+    "bridge_session_mode": False,
+    # Gioi han 1 session (vuot -> mo chat moi): tong ky tu da gui, so luot, giay khong dung.
+    "session_max_chars": 400000,
+    "session_max_turns": 60,
+    "session_idle_ttl": 1800,
+    # Delta (inline) dai hon nguong nay -> gui bang file dinh kem. 0 = luon inline.
+    "session_file_threshold": 30000,
+    # Cu moi N luot (delta chi la tin user) them 1 dong nhac format. 0 = tat.
+    "session_reminder_every": 8,
+    # true = so sanh ca NOI DUNG tin assistant (mac dinh chi dem; Cline hay strip whitespace).
+    "session_strict_assistant": False,
+    # Regex (re.DOTALL) bo khoi noi dung truoc khi hash, de phan dong (vd <environment_details>
+    # cua Cline doi moi luot) khong lam lech chuoi history. Sai regex bi bo qua.
+    "session_hash_ignore": ["<environment_details>.*?</environment_details>"],
+    # Ghi de tung prompt trong session.DEFAULT_PROMPTS (dict ten -> text).
+    "session_prompts": {},
+    # THU NGHIEM: nhanh (fork) bang cach ghi de parent_id trong body completion: retry cung
+    # request / nudge / client undo|edit khong can mo chat moi. Mac dinh tat.
+    "session_fork": False,
+    # Khi fork: user_action cua request ("edit" = giong sua tin trong UI; "" = giu nguyen).
+    "session_fork_user_action": "edit",
+    # Nudge sua loi trong session: "append" = gui them 1 tin nhac vao chat; "fork" = gui lai
+    # delta o nhanh anh em (can session_fork=true).
+    "session_nudge_mode": "append",
 }
 
 CONFIG = dict(DEFAULT_CONFIG)

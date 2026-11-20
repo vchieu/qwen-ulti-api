@@ -17,6 +17,7 @@ from .config import CONFIG
 from .models import MODELS, resolve_model, ui_mode_for_effort
 from .qwen import QwenError, log, debug_log, save_prompt_copy
 from . import bridge
+from . import session as sess
 from .tools import (_TRUNCATION_MARKER, build_response_format_instruction,
                     is_required_tool_choice,
                     looks_like_missed_tool_call, messages_to_prompt,
@@ -343,6 +344,61 @@ def _remove_prompt_file(file_info):
             os.unlink(path)
         except OSError:
             pass
+
+
+def _session_prompt_file(content, prompt):
+    """Delta session qua dai de go inline -> ghi file tam (cung co che prepare_large_prompt);
+    `prompt` (tin nhan di kem file) la companion o composer."""
+    _cleanup_old_temp_files()
+    fd, path = tempfile.mkstemp(suffix=".txt", prefix="qwen_prompt_")
+    with os.fdopen(fd, "w", encoding="utf-8", newline="\n") as f:
+        f.write(content)
+    paste_limit = _file_max_chars()
+    file_info = {
+        "path": path,
+        "filename": os.path.basename(path),
+        "size": len(content),
+        "attachment_prompt": prompt,
+        "paste_limit": paste_limit,
+        "over_paste_limit": len(content) > paste_limit,
+    }
+    _fingerprint_prompt_file(file_info, content, "layout=session-delta")
+    return file_info
+
+
+def _compose_prompt(plan, messages, tools, tool_choice, rf):
+    """Messages client -> (file_info, prompt, messages_da_tach).
+
+    plan None / new: duong cu (prepare_large_prompt + messages_to_prompt); plan new them
+    preamble giao thuc session vao CUOI prompt dau tien (file_info co attachment_prompt thi vao
+    composer cung prompt; file chua toan bo thi vao extra_instructions). continue/fork: chi
+    delta (plan.prompt, hoac file khi qua dai).
+    """
+    if plan is not None and plan.kind != sess.KIND_NEW:
+        prompt = plan.prompt + (rf or "")
+        file_info = None
+        if plan.file_text is not None:
+            file_info = _session_prompt_file(plan.file_text, prompt)
+        return file_info, prompt, messages
+    file_info, messages = prepare_large_prompt(messages, tools, tool_choice)
+    if file_info:
+        log(f"[bridge] large prompt detected ({file_info['size']} chars), "
+            f"created file: {file_info['filename']}")
+    prompt = messages_to_prompt(messages, tools, tool_choice)
+    pre = ("\n\n" + sess.STORE.preamble(plan.tools_active)) if plan is not None else ""
+    if rf:
+        prompt += rf
+    prompt += pre
+    if file_info and file_info.get("attachment_prompt"):
+        file_info["attachment_prompt"] = prompt
+    elif file_info and (rf or pre):
+        # prompt nam toan bo trong file -> response_format/preamble phai vao composer.
+        file_info["extra_instructions"] = ((rf or "") + pre).strip()
+    if plan is not None:
+        # Luot new = replay day du: tinh vao chars_sent de session_max_chars dung (truoc day
+        # luot new chi tinh do dai cau tra loi, vd "chars=0" trong log).
+        plan.delta_chars = (file_info["size"] if file_info else 0) + len(prompt)
+    return file_info, prompt, messages
 
 
 def _text_format(text_field):
@@ -741,7 +797,7 @@ class QwenHandler(BaseHTTPRequestHandler):
 
     def _run_turn(self, prompt, upstream, think, tools_active, allowed,
                   schemas, required_params, required_tool, client_gone=None,
-                  file_info=None, on_reasoning_delta=None):
+                  file_info=None, on_reasoning_delta=None, plan=None):
         """Huy job khi client ngat; tu choi tool_call co arguments hong."""
         stop_watch = None
         if client_gone is None:
@@ -749,6 +805,8 @@ class QwenHandler(BaseHTTPRequestHandler):
         extra = dict(self._mode_kw())
         if client_gone is not None:
             extra["cancel_event"] = client_gone
+        if plan is not None:
+            extra.update(plan.bridge_kwargs())
         attempts = 1
         if required_tool or (tools_active and CONFIG.get("tool_retry_on_miss")):
             attempts = 1 + max(0, int(CONFIG.get("tool_retry_attempts", 1)))
@@ -760,6 +818,11 @@ class QwenHandler(BaseHTTPRequestHandler):
                     raise QwenError("client disconnected; job cancelled", status=499)
                 call_prompt = prompt + nudge if nudge else prompt
                 call_file = _file_for_attempt(file_info, nudge)
+                kw = extra
+                if plan is not None and attempt > 0 and plan.kind != sess.KIND_NEW:
+                    # chat Qwen da co delta o lan 1: chi gui loi nhac (hoac fork).
+                    call_prompt, call_file, sj = plan.retry_call(prompt, file_info, nudge)
+                    kw = dict(extra, session=sj)
                 debug_log(f"run_turn attempt {attempt + 1}/{attempts} "
                           f"(tools_active={tools_active}, required_tool={bool(required_tool)})")
                 _t0 = time.time()
@@ -767,7 +830,7 @@ class QwenHandler(BaseHTTPRequestHandler):
                     content_parts, reasoning_parts, usage = [], [], {}
                     for kind, delta in bridge.generate_stream(
                             call_prompt, upstream, think, usage,
-                            file_info=call_file, **extra):
+                            file_info=call_file, **kw):
                         if client_gone is not None and client_gone.is_set():
                             break
                         if kind == "reasoning":
@@ -779,7 +842,7 @@ class QwenHandler(BaseHTTPRequestHandler):
                     reasoning = "".join(reasoning_parts)
                 else:
                     result = bridge.generate(call_prompt, upstream, think,
-                                             file_info=call_file, **extra)
+                                             file_info=call_file, **kw)
                     text, reasoning, usage = (result["content"], result["reasoning"],
                                               result["usage"])
                 if client_gone is not None and client_gone.is_set():
@@ -941,6 +1004,22 @@ class QwenHandler(BaseHTTPRequestHandler):
 
     # ---------------------------------------------------- chat completions --
     def _handle_chat(self, body):
+        with sess.turn_guard():
+            return self._handle_chat_locked(body)
+
+    def _session_plan(self, api, messages, tools, tool_choice, tools_active):
+        """Plan cua che do session (None khi tat). Loi bat ngo -> khong dung session."""
+        if not sess.enabled():
+            return None
+        try:
+            return sess.STORE.plan(messages, tools, tool_choice, tab=bridge.tab_state(),
+                                   api=api, tools_active=tools_active)
+        except Exception as e:
+            log(f"[session] plan error ({e}); chay khong session")
+            sess.STORE.reset("plan_error")
+            return None
+
+    def _handle_chat_locked(self, body):
         req = self._parse(body)
         if not isinstance(req, dict):
             return self.send_api_error(400, "invalid JSON body", ERR_INVALID)
@@ -958,24 +1037,15 @@ class QwenHandler(BaseHTTPRequestHandler):
                                        ERR_INVALID, "unsupported_value")
         tools = req.get("tools")
         tool_choice = req.get("tool_choice", "auto")
+        tools_active = bool(tools) and tool_choice != "none"
+        all_messages = messages
+        plan = self._session_plan("chat", all_messages, tools, tool_choice, tools_active)
 
         # Detect prompt lớn và tạo file tạm nếu cần (prepare_large_prompt tự check ngưỡng)
-        file_info, messages = prepare_large_prompt(messages, tools, tool_choice)
-        if file_info:
-            log(f"[bridge] large prompt detected ({file_info['size']} chars), "
-                f"created file: {file_info['filename']}")
-
-        prompt = messages_to_prompt(messages, tools, tool_choice)
         rf = build_response_format_instruction(req.get("response_format"))
-        if rf:
-            prompt += rf
-        if file_info and file_info.get("attachment_prompt"):
-            file_info["attachment_prompt"] = prompt
-        elif file_info and rf:
-            # prompt nam toan bo trong file ->
-            # response_format phai vao composer (file khong chua no).
-            file_info["extra_instructions"] = rf.strip()
+        file_info, prompt, messages = _compose_prompt(plan, messages, tools, tool_choice, rf)
         if not prompt.strip():
+            _remove_prompt_file(file_info)
             return self.send_api_error(400, "empty prompt", ERR_INVALID)
         stream = bool(req.get("stream"))
         debug_log(f"chat request: model={echo}, messages={len(messages)}, stream={stream}, tools={len(tools) if tools else 0}")
@@ -984,7 +1054,6 @@ class QwenHandler(BaseHTTPRequestHandler):
         include_usage = bool((req.get("stream_options") or {}).get("include_usage"))
         cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
         _log_messages(cid, req.get("messages", []), req.get("tools"))  # Option B: log messages gốc (trước khi split)
-        tools_active = bool(tools) and tool_choice != "none"
         required_tool = is_required_tool_choice(tool_choice)
         allowed = tool_names(tools) or None
         schemas = tool_parameters(tools) or None
@@ -993,7 +1062,7 @@ class QwenHandler(BaseHTTPRequestHandler):
         if stream and not rf and not tools_active:
             return self._stream_chat(cid, echo, prompt, upstream, think,
                                      stops, max_tokens, include_usage,
-                                     file_info=file_info)
+                                     file_info=file_info, plan=plan)
 
         stop_ping = gone = None
         streamed_reasoning = []
@@ -1013,8 +1082,10 @@ class QwenHandler(BaseHTTPRequestHandler):
             text, reasoning, calls, usage = self._run_turn(
                 prompt, upstream, think, tools_active, allowed, schemas,
                 required_params, required_tool, gone, file_info=file_info,
-                on_reasoning_delta=on_reasoning_delta if stream else None)
+                on_reasoning_delta=on_reasoning_delta if stream else None, plan=plan)
         except Exception as e:
+            if plan is not None:
+                sess.STORE.fail(plan, str(e))
             if stream:
                 try:
                     self._sse_error(*_map_error(e))
@@ -1037,6 +1108,8 @@ class QwenHandler(BaseHTTPRequestHandler):
         text = _apply_stop(text, stops)
         text, truncated = _apply_max_tokens(text, max_tokens)
         if not text and not calls and not reasoning:
+            if plan is not None:
+                sess.STORE.fail(plan, "empty response")
             if stream:
                 try:
                     self._sse_error(503, "empty response from upstream", ERR_API)
@@ -1045,6 +1118,8 @@ class QwenHandler(BaseHTTPRequestHandler):
                     pass
                 return
             return self.send_api_error(503, "empty response from upstream", ERR_API)
+        if plan is not None:
+            sess.STORE.commit(plan, text, calls)
         msg = {"role": "assistant", "content": text or None, "refusal": None}
         if reasoning:
             msg["reasoning_content"] = reasoning
@@ -1084,14 +1159,15 @@ class QwenHandler(BaseHTTPRequestHandler):
         })
 
     def _stream_chat(self, cid, model, prompt, upstream, think,
-                     stops, max_tokens, include_usage, file_info=None):
+                     stops, max_tokens, include_usage, file_info=None, plan=None):
         stop_ping, gone, _hb = self._start_sse()
         self._sse_chunk(cid, model, {"role": "assistant", "content": ""},
                         None, include_usage)
         full, finish, buf = "", "stop", ""
         hold = max((len(s) for s in stops), default=0)
+        sess_kw = plan.bridge_kwargs() if plan is not None else {}
         gen = bridge.generate_stream(prompt, upstream, think, file_info=file_info,
-                                     cancel_event=gone, **self._mode_kw())
+                                     cancel_event=gone, **self._mode_kw(), **sess_kw)
         _t_start = time.time()
         full_reasoning = []
         try:
@@ -1143,8 +1219,12 @@ class QwenHandler(BaseHTTPRequestHandler):
                                     None, include_usage)
         except ConnectionError:   # gom ca ConnectionAbortedError (Windows)
             gone.set()
+            if plan is not None:
+                sess.STORE.fail(plan, "client disconnected")
             return
         except Exception as e:
+            if plan is not None:
+                sess.STORE.fail(plan, str(e))
             log(f"stream error [{model}, prompt_len={len(prompt)}]: {e}")
             try:
                 self._sse_error(*_map_error(e))
@@ -1161,6 +1241,8 @@ class QwenHandler(BaseHTTPRequestHandler):
                     close()
                 except Exception:
                     pass
+        if plan is not None:
+            sess.STORE.commit(plan, full, None)
         self._sse_chunk(cid, model, {}, finish, include_usage)
         if include_usage:
             self._sse_usage(cid, model, prompt, full, None)
@@ -1169,6 +1251,10 @@ class QwenHandler(BaseHTTPRequestHandler):
 
     # ---------------------------------------------------------- responses --
     def _handle_responses(self, body):
+        with sess.turn_guard():
+            return self._handle_responses_locked(body)
+
+    def _handle_responses_locked(self, body):
         req = self._parse(body)
         if not isinstance(req, dict):
             return self.send_api_error(400, "invalid JSON body", ERR_INVALID)
@@ -1180,24 +1266,16 @@ class QwenHandler(BaseHTTPRequestHandler):
         messages = _responses_messages(req.get("input", []), req.get("instructions"))
         tool_choice = req.get("tool_choice") or "auto"
 
-        # Detect prompt lớn và tạo file tạm nếu cần (Responses API)
-        file_info, messages = prepare_large_prompt(messages, tools, tool_choice)
-        if file_info:
-            log(f"[bridge] large prompt detected ({file_info['size']} chars), "
-                f"created file: {file_info['filename']}")
+        tools_active = bool(tools) and tool_choice != "none"
+        plan = self._session_plan("responses", messages, tools, tool_choice, tools_active)
 
-        prompt = messages_to_prompt(messages, tools, tool_choice)
+        # Detect prompt lớn và tạo file tạm nếu cần (Responses API)
         rf = req.get("response_format") or _text_format(req.get("text"))
         rfi = build_response_format_instruction(rf)
-        if rfi:
-            prompt += rfi
-        if file_info and file_info.get("attachment_prompt"):
-            file_info["attachment_prompt"] = prompt
-        elif file_info and rfi:
-            file_info["extra_instructions"] = rfi.strip()
+        file_info, prompt, messages = _compose_prompt(plan, messages, tools, tool_choice, rfi)
         if not prompt.strip():
+            _remove_prompt_file(file_info)
             return self.send_api_error(400, "empty input", ERR_INVALID)
-        tools_active = bool(tools) and tool_choice != "none"
         required_tool = is_required_tool_choice(tool_choice)
         allowed = tool_names(tools) or None
         schemas = tool_parameters(tools) or None
@@ -1246,8 +1324,10 @@ class QwenHandler(BaseHTTPRequestHandler):
             text, _reasoning, calls, usage = self._run_turn(
                 prompt, upstream, think, tools_active, allowed, schemas,
                 required_params, required_tool, gone, file_info=file_info,
-                on_reasoning_delta=on_resp_reasoning if stream else None)
+                on_reasoning_delta=on_resp_reasoning if stream else None, plan=plan)
         except Exception as e:
+            if plan is not None:
+                sess.STORE.fail(plan, str(e))
             if stream:
                 try:
                     failed = resp_obj("failed", [], None)
@@ -1270,6 +1350,8 @@ class QwenHandler(BaseHTTPRequestHandler):
             text = strip_code_fence(text)
         text, truncated = _apply_max_tokens(text, req.get("max_output_tokens"))
         if not text and not calls:
+            if plan is not None:
+                sess.STORE.fail(plan, "empty response")
             if stream:
                 failed = resp_obj("failed", [], None)
                 failed["error"] = {"message": "empty response from upstream"}
@@ -1280,6 +1362,8 @@ class QwenHandler(BaseHTTPRequestHandler):
                 return
             return self.send_api_error(503, "empty response from upstream", ERR_API)
 
+        if plan is not None:
+            sess.STORE.commit(plan, text, calls)
         output = []
         for tc in calls or []:
             output.append({"type": "function_call", "id": tc["id"],

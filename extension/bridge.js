@@ -29,6 +29,11 @@
   // Mac dinh; Python gui danh sach that qua /status.builtin_tools (config qwen_builtin_tools).
   let qwenBuiltinTools = new Set(["code_interpreter"]);
   const ACTIVE_JOB_KEY = "qwenUIBridgeActiveJob";
+  // Nonce moi lan load trang (content script chay lai khi tab reload/navigate): Python doi chieu
+  // de biet chat cua session con nguyen ven khong (che do session, bridge_session_mode).
+  const PAGE_NONCE = (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function")
+    ? crypto.randomUUID()
+    : "n" + Date.now().toString(36) + Math.random().toString(36).slice(2);
 
   let pageLoadedAsTemporary = /[?&]temporary-chat=true/.test(location.search)
     || /[?&]temporary-chat=true/.test(location.href);
@@ -411,7 +416,9 @@
     if (err) {
       const msg = String((err && err.message) || err);
       log("job error:", msg);
-      send(job.id, { kind: "error", message: msg }).finally(() => job.reject(err));
+      const lost = !!(err && err.sessionLost);
+      send(job.id, lost ? { kind: "error", message: msg, session_lost: true }
+        : { kind: "error", message: msg }).finally(() => job.reject(err));
     } else {
       send(job.id, { kind: "done" }).finally(() => job.resolve());
     }
@@ -751,6 +758,100 @@
       fwd(job, "debug", "force mode '" + mode + "': " + diffs.join("; "));
       return Object.assign({}, init, { body: JSON.stringify(req) });
     } catch (e) { return null; }
+  }
+
+  // ---- Che do session: dung tiep chat dang mo thay vi mo chat moi ----
+  // chat_id tren URL (/c/<id>). Temporary chat giu /c/local -> khong co id that.
+  function urlChatId(pathname) {
+    const m = /\/c\/([^/?#]+)/.exec(String(pathname || ""));
+    return m && m[1] !== "local" ? m[1] : "";
+  }
+
+  // Trang thai tab gui kem /poll va ping de Python doi chieu session.
+  function tabInfo() {
+    return {
+      nonce: PAGE_NONCE,
+      path: location.pathname,
+      chat_id: urlChatId(location.pathname),
+      busy: !!current || active > 0,
+    };
+  }
+
+  // Tab hien tai con la chat cua session khong? "" = con; con lai la ly do (dung de bao
+  // session_lost -> Python mo chat moi + replay day du).
+  function sessionProblem(sj, nonce, pathname, temporary) {
+    if (!sj || !sj.nonce) return "job khong mang nonce session";
+    if (sj.nonce !== nonce) return "tab da reload/navigate (nonce khac)";
+    const id = urlChatId(pathname);
+    if (sj.chat_id) {
+      if (temporary) {
+        if (id) return "tab dang o chat " + id + ", khong phai temporary chat cua session";
+      } else if (id !== sj.chat_id) {
+        return "URL chat_id=" + (id || "-") + " khac chat cua session " + sj.chat_id;
+      }
+    }
+    return "";
+  }
+
+  // chat_id / parent_id THAT trong body completion (app tu tinh parent_id tu cay tin nhan).
+  function sessionInfoOfBody(req) {
+    const msgs = Array.isArray(req && req.messages) ? req.messages : [];
+    const last = msgs.length ? msgs[msgs.length - 1] : null;
+    const pick = (...v) => {
+      for (const x of v) if (typeof x === "string") return x;
+      return "";
+    };
+    return {
+      chat_id: pick(req && req.chat_id, req && req.chatId),
+      parent_id: pick(req && req.parent_id, req && req.parentId,
+        last && last.parent_id, last && last.parentId),
+    };
+  }
+
+  // Fork: ghi parent_id vao DUNG 4 cho app dat (top-level parent_id/parentId, messages[].parent_id/
+  // parentId) de tin moi thanh nhanh anh em cua nut do. userAction (vd "edit") ghi vao messages.
+  function applyForkParent(req, parentId, userAction) {
+    if (!req || typeof req !== "object" || !parentId) return false;
+    req.parent_id = parentId;
+    req.parentId = parentId;
+    for (const m of Array.isArray(req.messages) ? req.messages : []) {
+      if (!m || typeof m !== "object") continue;
+      m.parent_id = parentId;
+      m.parentId = parentId;
+      if (userAction) m.user_action = userAction;
+    }
+    return true;
+  }
+
+  // Job session.mode=fork: tra init moi voi parent_id da ghi de, hoac null neu khong ghi duoc
+  // (caller PHAI chan request, khong duoc de no di tiep tren nhanh chinh).
+  function rewriteRequestSession(job, init) {
+    try {
+      const sj = job && job.session;
+      if (!sj || sj.mode !== "fork" || !sj.fork_parent_id) return null;
+      if (!init || typeof init.body !== "string" || !init.body) return null;
+      const req = JSON.parse(init.body);
+      if (!applyForkParent(req, String(sj.fork_parent_id), String(sj.user_action || ""))) return null;
+      fwd(job, "debug", "session fork: parent_id -> " + sj.fork_parent_id
+        + " user_action=" + (sj.user_action || "(giu nguyen)"));
+      return Object.assign({}, init, { body: JSON.stringify(req) });
+    } catch (e) { return null; }
+  }
+
+  // Bao Python: request completion cua job session da di (= delta da vao chat Qwen), kem
+  // nonce + chat_id + parent_id doc tu body that.
+  async function announceSession(job, input, init) {
+    try {
+      if (!job || !job.session) return;
+      let body = init && init.body;
+      if (typeof body !== "string" && input && typeof input.clone === "function") {
+        body = await input.clone().text();
+      }
+      if (typeof body !== "string" || !body) return;
+      const info = sessionInfoOfBody(JSON.parse(body));
+      send(job.id, { kind: "session", mode: job.session.mode, nonce: PAGE_NONCE,
+        chat_id: info.chat_id, parent_id: info.parent_id });
+    } catch (e) { /* khong anh huong app */ }
   }
 
   // ---- Che do Thinking / Auto / Fast (dropdown canh o prompt) ----
@@ -1852,6 +1953,17 @@
         const forcedMode = rewriteRequestMode(jobRef, init);
         if (forcedMode) init = forcedMode;
       }
+      if (jobRef.session && jobRef.session.mode === "fork") {
+        const forked = rewriteRequestSession(jobRef, init);
+        if (!forked) {
+          const forkErr = new Error("session fork: khong ghi de duoc parent_id trong body completion");
+          forkErr.sessionLost = true;
+          fwd(jobRef, "warn", forkErr.message);
+          settle(jobRef, forkErr);
+          throw forkErr;
+        }
+        init = forked;
+      }
       /* strict -> chan request sai model / thieu file. */
       const strictMsg = await strictRequestProblem(jobRef, input, init);
       if (strictMsg) {
@@ -1861,6 +1973,7 @@
         throw strictErr;
       }
       inspectCompletionRequest(jobRef, input, init);
+      if (jobRef.session) announceSession(jobRef, input, init);
     }
     const resp = await origFetch.call(this, input, init);
     try {
@@ -1903,6 +2016,14 @@
           throw xErr;
         }
         inspectCompletionRequest(job, null, { body });
+        if (job.session && job.session.mode === "fork") {
+          const fErr = new Error("session fork: khong ghi de duoc parent_id qua XHR");
+          fErr.sessionLost = true;
+          fwd(job, "warn", fErr.message);
+          settle(job, fErr);
+          throw fErr;
+        }
+        if (job.session) announceSession(job, null, { body });
       } else if (!xhrBodyWarned) {
         xhrBodyWarned = true;
         fwd(job, "warn", "XHR completion body khong phai string (" + typeof body
@@ -2782,7 +2903,9 @@
         size: String(job.prompt).length,
         _inlineText: String(job.prompt),
       };
-      job.attachment_prompt = job.attachment_prompt || attachmentPrompt || ATTACHMENT_COMPANION_PROMPT;
+      job.attachment_prompt = job.attachment_prompt
+        || (job.session && job.session.attach_prompt)
+        || attachmentPrompt || ATTACHMENT_COMPANION_PROMPT;
       send(job.id, { kind: "debug",
         message: "prompt " + job.file_info.size + " ky tu >= nguong inline da hoc ("
           + inlineMaxChars + "): dung duong attach file" });
@@ -2812,11 +2935,26 @@
         if (!job.settled) settle(job, new Error("job cancelled (cho captcha)"));
         return;
       }
-      if ((await tryNewChat(job)) === false) return;  // dang reload; job da requeue
-      saveJobState(job, "new_chat_done", "New chat step finished");
-      if (!(await ensureMode(job))) return;
-      await ensureAlive(job, "sau ensureMode");
-      await waitPageReady(job);
+      const inChat = !!job.session
+        && (job.session.mode === "continue" || job.session.mode === "fork");
+      if (inChat) {
+        // Session: dung tiep chat dang mo -> KHONG new chat / reload / doi temporary mode.
+        const problem = sessionProblem(job.session, PAGE_NONCE, location.pathname,
+          isTemporaryPage(false));
+        if (problem) {
+          const lostErr = new Error("session: " + problem);
+          lostErr.sessionLost = true;
+          throw lostErr;
+        }
+        fwd(job, "debug", "session " + job.session.mode + ": dung tiep chat "
+          + (job.session.chat_id || "(temporary)") + " path=" + location.pathname);
+      } else {
+        if ((await tryNewChat(job)) === false) return;  // dang reload; job da requeue
+        saveJobState(job, "new_chat_done", "New chat step finished");
+        if (!(await ensureMode(job))) return;
+        await ensureAlive(job, "sau ensureMode");
+        await waitPageReady(job);
+      }
       await waitCaptchaClear(job, "sau khi trang san sang");
       await ensureAlive(job, "truoc selectModel");
       const modelOk = await selectModel(job);
@@ -2868,7 +3006,7 @@
     }
   }
 
-  setInterval(() => { post("/event", { kind: "ping" }).catch(() => {}); }, 5000);
+  setInterval(() => { post("/event", { kind: "ping", tab: tabInfo() }).catch(() => {}); }, 5000);
 
   async function loop() {
     log("started on", BASE, "->", BRIDGE);
@@ -2889,7 +3027,8 @@
       try {
         await refreshModels(false);
         if (!(await idleModeCheck())) { await sleep(500); continue; }
-        const r = await post("/poll", { worker: location.host, models: knownModels });
+        const r = await post("/poll", { worker: location.host, models: knownModels,
+          tab: tabInfo() });
         if (r && r.job) {
           active++;
           const job = {
@@ -2904,8 +3043,11 @@
             raw: r.job,
             mode_retries: r.job.mode_retries || 0,
             fresh_reloads: r.job.fresh_reloads || 0,
-            toolsActive: String(r.job.prompt || "").includes("# Tool Use")
-              || String(r.job.attachment_prompt || "").includes("# Tool Use"),
+            session: r.job.session && typeof r.job.session === "object" ? r.job.session : null,
+            // Job session: Python bao tools_active (delta khong con tool block de doan).
+            toolsActive: typeof r.job.tools_active === "boolean" ? r.job.tools_active
+              : String(r.job.prompt || "").includes("# Tool Use")
+                || String(r.job.attachment_prompt || "").includes("# Tool Use"),
             attached: false,
             settled: false,
           };

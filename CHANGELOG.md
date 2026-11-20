@@ -213,3 +213,25 @@ hiện tại thì đọc `AGENTS.md`.
 - Thêm dòng debug `file shape` + cảnh báo `FILE SHAPE/DOM` để đối chiếu key/card thật.
 - Còn lại (không sửa được từ client): chưa chứng minh Qwen đọc đủ nội dung; chỉ có heuristic
   `attach-check` (usage input_tokens / chars). XHR chưa có `rewriteRequestModel/Mode`.
+
+## Chế độ session: gửi tiếp vào chat hiện hành (`bridge_session_mode`)
+
+- Vấn đề: mỗi request OpenAI mang cả history nên proxy mở chat mới và replay toàn bộ (tốn
+  token/thời gian, file prompt lớn). Capture thật cho thấy Qwen dựng context phía server theo
+  chuỗi `parent_id`; body completion chỉ có 1 message mới (turn 2: `parent_id` = id assistant
+  trước, lặp ở 4 chỗ; temporary chat dùng cùng shape, URL luôn `/c/local`). Sửa tin = completion
+  thường với `user_action:"edit"` + `parent_id` của tin gốc, nhánh cũ bị bỏ khỏi context.
+- Sửa: `qwen_web2api/session.py` (plan/commit/fail theo hash chuỗi history, prompt delta cho
+  tool result/tin user) nối vào `server.py` (`_session_plan`, `_compose_prompt`, `_run_turn(plan)`,
+  commit sau mỗi lượt) và `bridge.py` (`session`/`tools_active` trong job, event `session`,
+  `session_lost`, `tab_state()`; job continue/fork không retry sau khi đã gửi). Extension:
+  `PAGE_NONCE`, `tabInfo` trong `/poll` + ping, `sessionProblem`, bỏ new-chat/reload cho job
+  trong chat, `announceSession`, `rewriteRequestSession` (fork). Mặc định tắt.
+- `tools_active` truyền tường minh: trước đây suy từ `"# Tool Use"` trong prompt (bridge.py +
+  extension `toolsActive`) — delta không có tool block nên native `tool_call` bị nuốt.
+- Hash bỏ `session_hash_ignore` (mặc định `<environment_details>`) để phần động của Cline không
+  làm lệch history; `attach_prompt` riêng cho delta chuyển file (không dùng `attachment_prompt`).
+- Còn lại: request lạ xen giữa (title-gen) vẫn reset session vì chạy chính trong tab này; tiếp tục
+  chat cũ bằng `/c/<chat_id>` chưa làm; fork chưa kiểm chứng trên máy thật.
+- Lượt `new` (replay đầy đủ) giờ tính độ dài prompt đã gửi vào `chars_sent` (trước đây chỉ tính
+  câu trả lời → log `chars=0`, `session_max_chars` hụt đúng bằng prompt đầu).

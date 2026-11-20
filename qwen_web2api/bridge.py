@@ -31,6 +31,10 @@ _pending = queue.Queue()
 _jobs = {}
 _models = []
 _last_seen = 0.0
+# Trang thai tab chat.qwen.ai (extension gui trong /poll va ping): nonce moi lan load trang,
+# path, chat_id tren URL. session.py doi chieu nonce de biet tab co bi reload khong.
+_tab = {}
+_tab_ts = 0.0
 # Reference to shared circular buffer in qwen.py
 _recent_log = qwen._recent_log
 
@@ -165,6 +169,34 @@ def _remember_models(items):
     if clean:
         with _lock:
             _models = clean
+
+
+def _remember_tab(tab):
+    """Luu trang thai tab tu extension. Chi giu nonce/path/chat_id (str) va busy (bool); khong
+    co nonce -> bo qua (extension cu)."""
+    global _tab, _tab_ts
+    if not isinstance(tab, dict):
+        return
+    clean = {}
+    for k in ("nonce", "path", "chat_id"):
+        v = tab.get(k)
+        if isinstance(v, str) and v:
+            clean[k] = v[:300]
+    if isinstance(tab.get("busy"), bool):
+        clean["busy"] = tab["busy"]
+    if not clean.get("nonce"):
+        return
+    with _lock:
+        _tab, _tab_ts = clean, time.time()
+
+
+def tab_state():
+    """Ban sao trang thai tab moi nhat, hoac None khi chua co / qua bridge_worker_ttl."""
+    with _lock:
+        if not _tab or (time.time() - _tab_ts) > _as_num(
+                CONFIG.get("bridge_worker_ttl"), 20):
+            return None
+        return dict(_tab)
 
 
 def _captcha_wait():
@@ -368,7 +400,7 @@ def _log_attach_report(jid, attempt, file_info, usage, content):
 
 
 def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=None,
-                    cancel_event=None):
+                    cancel_event=None, session=None, session_out=None, tools_active=None):
     """Yield (kind, text) -- interface server.py goi cho luong SSE.
 
       cancel_event (threading.Event): client ngat ket noi thi
@@ -378,8 +410,17 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=N
       warn model_mismatch/mode_mismatch + config strict -> loi.
       arguments hong giu nguyen de tools.py tu choi; chuoi
       nhieu JSON lien tiep thi tach thanh nhieu fence.
+
+      session (dict, session.Plan.job_session) -> job mang them `session` + `tools_active`;
+      session_out (dict) nhan nonce/chat_id/parent_id/sent/session_lost/dirty tu extension.
+      Job session continue/fork KHONG duoc retry sau khi request da gui (delta da nam trong
+      chat Qwen, gui lai se nhan doi). tools_active (khong None) thay cho viec doan tu
+      "# Tool Use" trong prompt (delta khong con tool block).
     """
     attempts = max(1, int(CONFIG.get("retry_attempts", 2)))
+    native_ok = (bool(tools_active) if tools_active is not None
+                 else "# Tool Use" in (prompt or ""))
+    in_chat = isinstance(session, dict) and session.get("mode") in ("continue", "fork")
     timeout = max(0.05, float(CONFIG.get("bridge_job_timeout", 300)))
     last_err = None
 
@@ -415,13 +456,18 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=N
                    f"attempt={attempt + 1}/{attempts}"
                    + (f", filename={file_info.get('filename')}"
                       if isinstance(file_info, dict) else "") + ")")
-        _pending.put({"job_id": jid, "model": model, "prompt": prompt,
-                      "think": bool(think), "ts": now,
-                      "deadline": now + timeout, "attempt": attempt,
-                      "mode": mode if mode in ("auto", "thinking", "fast") else None,
-                      "file_info": file_info,
-                      "attachment_prompt": att_prompt,
-                      "managed": True})
+        job = {"job_id": jid, "model": model, "prompt": prompt,
+               "think": bool(think), "ts": now,
+               "deadline": now + timeout, "attempt": attempt,
+               "mode": mode if mode in ("auto", "thinking", "fast") else None,
+               "file_info": file_info,
+               "attachment_prompt": att_prompt,
+               "managed": True}
+        if session is not None:
+            job["session"] = session
+            job["tools_active"] = bool(tools_active)
+        _pending.put(job)
+        job_sent = job_lost = False
         tracker = _Tracker()
         usage_seen = {}
         emitted = False
@@ -462,7 +508,7 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=N
                             emitted = True
                             yield k, d
                 elif kind == "tool_call":
-                    if "# Tool Use" not in (prompt or ""):
+                    if not native_ok:
                         continue
                     name = ev.get("name") or ""
                     if not name:
@@ -503,6 +549,17 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=N
                     if d:
                         emitted = True
                         yield "content", d
+                elif kind == "session":
+                    # Extension da gui request completion (chat_id/parent_id doc tu body that).
+                    job_sent = True
+                    if session_out is not None:
+                        for k in ("nonce", "chat_id", "parent_id"):
+                            if isinstance(ev.get(k), str):
+                                session_out[k] = ev[k]
+                        session_out["sent"] = True
+                    _debug_log(f"[job {jid[:8]}] session event: mode={ev.get('mode')} "
+                               f"chat={str(ev.get('chat_id') or '-')[:8]} "
+                               f"parent={str(ev.get('parent_id') or '-')[:8]}")
                 elif kind == "usage":
                     if isinstance(ev.get("usage"), dict):
                         usage_seen.update(ev["usage"])
@@ -525,6 +582,12 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=N
                             "browser bridge: khong chon duoc che do UI yeu cau ("
                             + str(ev.get("message") or mode) + ")", status=502)
                 elif kind == "error":
+                    if ev.get("session_lost"):
+                        job_lost = True
+                        if session_out is not None:
+                            session_out["session_lost"] = True
+                    if ev.get("dirty") and session_out is not None:
+                        session_out["dirty"] = True
                     raise qwen.QwenError(
                         "browser bridge: " + str(ev.get("message") or "unknown"),
                         status=502)
@@ -554,6 +617,11 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=N
             if emitted:
                 _debug_log(f"job {jid} raising after partial stream: {last_err}")
                 raise last_err
+            if in_chat and (job_sent or job_lost):
+                _log(f"job {jid}: session {session.get('mode')} "
+                     f"{'mat session' if job_lost else 'da gui request'} -> khong retry: "
+                     f"{last_err}")
+                raise last_err
             if attempt < attempts - 1:
                 _log(f"retry {attempt + 1}/{attempts}: {last_err}")
                 delay = max(0.0, _as_num(CONFIG.get("retry_delay_sec"), 2))
@@ -567,7 +635,8 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=N
     raise last_err
 
 
-def generate(prompt, model, think, file_info=None, mode=None, cancel_event=None):
+def generate(prompt, model, think, file_info=None, mode=None, cancel_event=None,
+             session=None, session_out=None, tools_active=None):
     """Nhan cancel_event de huy job; join bang "". Gop het delta thanh content."""
     t0 = time.monotonic()
     usage, content, reasoning = {}, [], []
@@ -576,6 +645,8 @@ def generate(prompt, model, think, file_info=None, mode=None, cancel_event=None)
         extra["mode"] = mode
     if cancel_event is not None:
         extra["cancel_event"] = cancel_event
+    if session is not None:
+        extra.update(session=session, session_out=session_out, tools_active=tools_active)
     for kind, text in generate_stream(prompt, model, think, usage,
                                       file_info=file_info, **extra):
         (reasoning if kind == "reasoning" else content).append(text)
@@ -673,7 +744,9 @@ class _Handler(BaseHTTPRequestHandler):
                          "bridge_job_timeout", "bridge_poll_wait", "bridge_worker_ttl",
                          "attachment_prompt", "log_file", "bridge_port", "port",
                          "models", "qwen_builtin_tools", "log_session_file", "log_dir",
-                         "log_save_prompt_files", "attachment_usage_warn_ratio")
+                         "log_save_prompt_files", "attachment_usage_warn_ratio",
+                         "bridge_session_mode", "session_max_chars", "session_max_turns",
+                         "session_idle_ttl", "session_file_threshold", "session_fork")
             cfg_snapshot = {k: CONFIG[k] for k in safe_keys if k in CONFIG}
             return self._json({
                 "config": cfg_snapshot,
@@ -710,6 +783,8 @@ class _Handler(BaseHTTPRequestHandler):
         _last_seen = time.time()
         if isinstance(data.get("models"), list):
             _remember_models(data["models"])
+        if isinstance(data.get("tab"), dict):
+            _remember_tab(data["tab"])
         if path == "/cancel":
             jid = data.get("job_id")
             if not isinstance(jid, str) or not jid.strip():
