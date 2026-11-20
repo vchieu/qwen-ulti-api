@@ -208,6 +208,9 @@
   }
   const INLINE_LIMIT_KEY = "qwenUIBridgeInlineLimit";
   const INLINE_LIMIT_CAP = 32000;   // 32775 ky tu tung chay inline OK -> nguong an toan ban dau sau loi
+  const INLINE_STALL_MIN_CHARS = 20000;  // prompt inline >= nguong nay moi xet stall sau Send
+  const INLINE_STALL_GRACE_MS = 8000;    // composer rong / nut Send bien mat qua lau -> fallback file
+  const TEMP_DOM_WAIT_MS = 3000;         // doi them temporary DOM (bounded) khi trang vua reload
   const PAGE_READY_MAX_MS = 8000;
   let inlineMaxChars = Infinity;    // hoc duoc: prompt inline >= nguong nay di duong attach file
   try {
@@ -221,6 +224,53 @@
     inlineMaxChars = n;
     try { sessionStorage.setItem(INLINE_LIMIT_KEY, String(n)); } catch (e) { /* best-effort */ }
     console.log("[qwen-ui-bridge] inline prompt limit learned:", n);
+  }
+
+  // Job new/legacy prompt inline lon: retry an toan (chat moi) -> duoc phep stall-fallback.
+  // continue/fork: delta co the da nam trong chat -> KHONG fallback (nhan doi delta).
+  function inlineStallWatch(job) {
+    return !!(job && !job.file_info
+      && !(job.session && (job.session.mode === "continue" || job.session.mode === "fork"))
+      && String(job.prompt || "").length >= INLINE_STALL_MIN_CHARS);
+  }
+  // Dem bubble chat dang hien (heuristic, co the dem trung node long nhau). Muc dich: phan biet
+  // "chua gui gi" (n=0) vs "da co tin user trong chat" (n>0) khi Send that bai.
+  function chatMessageStats() {
+    try {
+      const nodes = Array.from(document.querySelectorAll(
+        '[class*="message" i], [class*="bubble" i], [data-message-id], [class*="chat-item" i]'
+      )).filter((el) => visible(el) && (el.innerText || el.textContent || "").trim().length > 10);
+      const last = nodes.length
+        ? String(nodes[nodes.length - 1].innerText || "").replace(/\s+/g, " ").trim().slice(0, 60)
+        : "";
+      return { n: nodes.length, last: last };
+    } catch (e) {
+      return { n: -1, last: "" };
+    }
+  }
+  // Diag day du tai thoi diem Send that bai: pageDiag + lich su composer/click + card + bubble
+  // + temporary DOM. Khong bao gio throw (chan doan khong duoc lam hong job).
+  function sendDiag(job, composer) {
+    const bits = [];
+    try {
+      const c = composer || (job && job._composerEl) || null;
+      bits.push(pageDiag(c));
+      const t = job && job._sendTrace;
+      if (t) {
+        bits.push("clicks=" + t.clicks + " enters=" + t.enters
+          + " firstClick=" + (t.firstClickAt >= 0 ? "+" + t.firstClickAt + "ms" : "-")
+          + " emptyAt=" + (t.emptyAt >= 0 ? "+" + t.emptyAt + "ms" : "-"));
+        if ((t.samples || []).length) bits.push("composerLens=[" + t.samples.join(",") + "]");
+        if ((t.atClick || []).length) bits.push("lenAtClick=[" + t.atClick.join(",") + "]");
+      }
+      if (c) bits.push("cards=" + findActiveAttachmentElements(c).length);
+      const ms = chatMessageStats();
+      bits.push("chatMsgs=" + ms.n + (ms.last ? " last=" + JSON.stringify(ms.last) : ""));
+      bits.push("tempDom=" + !!temporaryEvidence().dom);
+    } catch (e) {
+      bits.push("sendDiag-error:" + ((e && e.message) || e));
+    }
+    return bits.join(" ");
   }
 
   // Kiem tra body request completion cua app TRUOC khi gui: prompt inline ma noi
@@ -248,14 +298,30 @@
     if (pageUsed) return;
     const t0 = Date.now();
     const targets = modelTargets(job && job.model);
-    let ok = false;
+    const wantTemp = isTemporaryPage(false);
+    let picker = false, composer = false, tempDom = false;
+    /* Cu: `selectModelEnabled === false || findModelTrigger(...)` -> khi bridge_select_model
+       = false vong lap break NGAY, khong kiem tra gi, chi sleep 1s. Log that: 2 job fail co
+       temporary evidence dom=false (trang chua hydrate) van duoc coi la "ready", composer
+       nhan text roi bi xoa ma khong co completion request. Gio doi composer + temporary DOM
+       (bounded boi TEMP_DOM_WAIT_MS) bat ke select_model, va warn neu van chua hydrate. */
     while (Date.now() - t0 < PAGE_READY_MAX_MS) {
-      if (selectModelEnabled === false || findModelTrigger(targets)) { ok = true; break; }
+      picker = !!findModelTrigger(targets);
+      composer = findComposers().length > 0;
+      tempDom = !wantTemp || !!temporaryEvidence().dom;
+      if (composer && (picker || selectModelEnabled === false)
+          && (tempDom || Date.now() - t0 >= TEMP_DOM_WAIT_MS)) break;
       await sleep(300);
     }
     await sleep(1000);   // de app gan xong handler cho composer/paste
     if (job) send(job.id, { kind: "debug",
-      message: "page ready: modelPicker=" + ok + " after " + (Date.now() - t0) + "ms" });
+      message: "page ready: modelPicker=" + picker + " composer=" + composer
+        + " tempDom=" + tempDom + " after " + (Date.now() - t0) + "ms" });
+    if (job && (!composer || !tempDom)) {
+      fwd(job, "warn", "trang co the CHUA hydrate xong khi dien prompt (composer=" + composer
+        + " tempDom=" + tempDom + " wantTemp=" + wantTemp
+        + " evidence=" + JSON.stringify(temporaryEvidence()) + ")");
+    }
   }
 
   let temporaryReloadEnabled = true;  // config temporary_chat_reload (qua /status)
@@ -2346,7 +2412,7 @@
     }
     if (!sent && job && !job.settled && !job.attached) {
       send(job.id, { kind: "warn",
-        message: "khong xac nhan duoc da bam Send (nut Send khong san sang) | " + pageDiag(composer) });
+        message: "khong xac nhan duoc da bam Send (nut Send khong san sang) | " + sendDiag(job, composer) });
     }
   }
 
@@ -2700,11 +2766,50 @@
       : "";
     if (job && job.file_info) timeoutMs = Math.max(timeoutMs, 90000);  // doi upload xong
     const deadline = Date.now() + timeoutMs;
-    let clicks = 0, enters = 0, noBtnSince = 0, lastEnter = 0;
+    let clicks = 0, enters = 0, noBtnSince = 0, lastEnter = 0, stallSince = 0, sawText = false;
+    /* Diag: lich su do dai composer + so click, de phan biet "text bi xoa TRUOC khi click"
+       vs "click roi app don composer ma khong gui request". Chi ghi khi co job. */
+    const trace = job ? (job._sendTrace = job._sendTrace || {
+      t0: Date.now(), clicks: 0, enters: 0, samples: [], atClick: [],
+      firstClickAt: -1, emptyAt: -1, lastSample: -1000,
+    }) : null;
+    const note = () => {
+      if (!trace) return;
+      const off = Date.now() - trace.t0;
+      const len = composerText(composer).trim().length;
+      trace.clicks = clicks;
+      trace.enters = enters;
+      if (trace.emptyAt < 0 && !len) trace.emptyAt = off;
+      if (off - trace.lastSample >= 1000 && trace.samples.length < 20) {
+        trace.lastSample = off;
+        trace.samples.push(off + ":" + len);
+      }
+    };
     while (Date.now() < deadline) {
       if (job && (job.attached || job.settled)) return !!job.attached;
       /* job het hieu luc -> dung, khong bam Send */
       if (job && !(await jobAlive(job, true))) return false;   /* bo cache */
+      note();
+      /* Inline prompt lon: composer rong sau Send / nut Send bien mat ma khong co
+         completion request -> hoc nguong inline + bao loi SOM de Python retry di duong
+         attach file, thay vi cho het 60s vong Send + 90s send-timeout. Chi new/legacy. */
+      if (inlineStallWatch(job) && sawText && !job.attached) {
+        const emptyNow = !composerText(composer).trim();
+        const stuck = emptyNow || (noBtnSince && !findStopButton());
+        if (stuck) {
+          if (!stallSince) stallSince = Date.now();
+          if (Date.now() - stallSince >= INLINE_STALL_GRACE_MS) {
+            learnInlineLimit(String(job.prompt).length);
+            throw new Error("inline prompt " + String(job.prompt).length
+              + " ky tu: " + (emptyNow ? "composer rong" : "nut Send bien mat")
+              + " sau Send nhung khong co completion request sau "
+              + Math.round(INLINE_STALL_GRACE_MS / 1000)
+              + "s; se dung duong attach file o lan retry | " + sendDiag(job, composer));
+          }
+        } else {
+          stallSince = 0;
+        }
+      }
       const btn = findSendButton(composer);
       if (!btn) {
         // Khong co nut Send: UI dang generate/upload. Neu UI da ranh ma van khong
@@ -2760,13 +2865,18 @@
       if (job && !(await jobAlive(job, true))) return false;
       saveJobState(job, "sending", "Clicking send button (click #" + (clicks + 1) + ")");
       const hadText = !!composerText(composer).trim();
+      if (hadText) sawText = true;
+      if (trace) {
+        if (trace.firstClickAt < 0) trace.firstClickAt = Date.now() - trace.t0;
+        if (trace.atClick.length < 20) trace.atClick.push(composerText(composer).trim().length);
+      }
       btn.click();
       clicks++;
       log("send click", clicks);
       await sleep(1500);
       if (job && job.attached) return true;      // da bat duoc completion: dung click them
-      if (!findSendButton(composer)) return true;
-      if (hadText && !composerText(composer).trim()) return true;
+      if (!findSendButton(composer) && !inlineStallWatch(job)) return true;
+      if (hadText && !composerText(composer).trim() && !inlineStallWatch(job)) return true;
       if (clicks >= 15) break;
     }
     return !!(job && job.attached);
@@ -2795,6 +2905,28 @@
       if (isStopButton(el)) return el;
     }
     return null;
+  }
+
+  // Client huy (ngat ket noi / HTTP abort) hoac job het han khi Qwen DANG generate: bam Stop de
+  // chat Qwen dung that. Truoc day chi nha reader -> Qwen chay tiep den het (tren chat session
+  // thanh tin assistant thua cua turn bi huy). Chi khi job da gui request (attached) va bi huy.
+  async function stopGenerationOnCancel(job) {
+    if (!job || !job.cancelled || !job.attached) return false;
+    let clicked = 0;
+    try {
+      for (let i = 0; i < 3; i++) {
+        let stop = findStopButton();
+        if (!stop && i === 0) {   // nut Stop hien cham sau khi request di
+          for (let w = 0; w < 5 && !stop; w++) { await sleep(300); stop = findStopButton(); }
+        }
+        if (!stop) break;
+        stop.click();
+        clicked++;
+        await sleep(700);
+      }
+    } catch (e) { /* best-effort */ }
+    if (clicked) log("job huy: da bam Stop tren Qwen (" + clicked + " lan)");
+    return clicked > 0;
   }
 
   // Qwen co the van generate sau khi job truoc da settle (vd. native tool_call
@@ -2915,7 +3047,7 @@
       if (job.settled || job.attached) return;
       if (sendTimer) clearTimeout(sendTimer);
       sendTimer = setTimeout(() => {
-        settle(job, new Error("UI send timeout: khong bat duoc completion response | " + pageDiag(null)));
+        settle(job, new Error("UI send timeout: khong bat duoc completion response | " + sendDiag(job, null)));
       }, job.file_info ? SEND_TIMEOUT_FILE_MS : SEND_TIMEOUT_MS);
     };
     job._armSendTimer();
@@ -2980,6 +3112,7 @@
       send(job.id, { kind: "debug",
         message: "temporary evidence: " + JSON.stringify(temporaryEvidence()) });
       const composer = await waitComposer();
+      job._composerEl = composer;   // sendDiag dung khi send-timeout khong co composer trong scope
       saveJobState(job, "composer_ready", "Composer found");
       pageUsed = true;  // tu day trang nay co tin nhan
 
@@ -2998,6 +3131,8 @@
     } catch (e) {
       settle(job, e);
     } finally {
+      /* caller huy khi Qwen dang generate -> bam Stop (best-effort, toi ~4s) */
+      try { await stopGenerationOnCancel(job); } catch (e) { /* best-effort */ }
       if (typeof job._clearSendTimer === "function") job._clearSendTimer();
       /* watchdog XHR khong duoc song qua job. */
       if (job._xhrTimer) { clearTimeout(job._xhrTimer); job._xhrTimer = null; }
@@ -3006,7 +3141,17 @@
     }
   }
 
-  setInterval(() => { post("/event", { kind: "ping", tab: tabInfo() }).catch(() => {}); }, 5000);
+  setInterval(() => {
+    post("/event", { kind: "ping", tab: tabInfo() }).catch(() => {});
+    /* Job dang generate ma caller da ngat: khong cho event/delta ke tiep (Qwen "nghi" lau thi
+       khong co delta nao) -> hoi /alive, settle de runJobInner bam Stop. */
+    const j = current;
+    if (j && j.attached && !j.settled && !j.cancelled) {
+      jobAlive(j, true).then((ok) => {
+        if (!ok && !j.settled) settle(j, new Error("job het hieu luc (caller da ngat/huy)"));
+      }).catch(() => {});
+    }
+  }, 5000);
 
   async function loop() {
     log("started on", BASE, "->", BRIDGE);

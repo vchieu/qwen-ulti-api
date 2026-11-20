@@ -233,5 +233,45 @@ hiện tại thì đọc `AGENTS.md`.
   làm lệch history; `attach_prompt` riêng cho delta chuyển file (không dùng `attachment_prompt`).
 - Còn lại: request lạ xen giữa (title-gen) vẫn reset session vì chạy chính trong tab này; tiếp tục
   chat cũ bằng `/c/<chat_id>` chưa làm; fork chưa kiểm chứng trên máy thật.
+- Client interrupt giữa chừng (vd bấm interrupt rồi gõ "tiếp đi") trước đây reset session → reload
+  trang + replay (log `reset ... turn_failed: client disconnected`, rồi `plan new reason=no_session`).
+  Giờ `fail()` giữ session với hash đặc biệt `INTERRUPTED` ở cuối: luot sau (hai tin user liền
+  nhau, hoặc client giữ lại bản assistant dở) chỉ gửi phần mới (`why=after_interrupt`). `history_diverged`
+  / `retry_or_rewind` ghi thêm `client[i]=... session[i]=...` để biết tin nào lệch.
 - Lượt `new` (replay đầy đủ) giờ tính độ dài prompt đã gửi vào `chars_sent` (trước đây chỉ tính
   câu trả lời → log `chars=0`, `session_max_chars` hụt đúng bằng prompt đầu).
+
+Session patch 3: hydrate wait thật + chẩn đoán Send + ngưỡng inline→file (normal mode)
+Vấn đề (log server-20261120-150311-6156.log): undo lượt chat khi `session_fork=false` →
+`history_diverged@11/17` → plan `new` → replay 47043 ký tự inline. Composer nhận đủ text
+(`composerAfter=47043 sendBtn=true`) nhưng 60s sau `composer=0 sendBtn=false stopBtn=false`,
+KHÔNG có dòng `completion request:` / `session event:` ⇒ app không phát request completions
+(attempt 3 cùng tab cùng hook lại bắt được ⇒ không phải hook hụt). Mỗi attempt cháy 60s vòng
+Send + 90s `SEND_TIMEOUT_MS`, ×3 ≈ 213s.
+Manh mối quyết định: `temporary evidence dom=false` ở ĐÚNG 2 job fail; 8 job thành công đều
+`dom=true`. `waitPageReady` có `selectModelEnabled === false || findModelTrigger(...)` → khi
+`bridge_select_model=false` vòng lặp break NGAY, không kiểm tra gì, chỉ `sleep(1000)`; log
+`modelPicker=true after ~1000ms` KHÔNG chứng minh trang đã hydrate. Nghi ngờ: composer nhận
+`insertText` rồi bị re-render xoá mất / handler Send chưa gắn.
+Sửa: (1) `waitPageReady` đợi composer + temporary DOM (bounded `TEMP_DOM_WAIT_MS`=3s, tổng
+trần `PAGE_READY_MAX_MS`=8s) bất kể `select_model`, warn khi vẫn chưa hydrate. (2) `sendDiag`
++ `job._sendTrace`: clicks/enters, `composerLens` theo thời gian, `lenAtClick`, `emptyAt`,
+attachment card, `chatMsgs` (bubble), `tempDom` — gắn vào warn 60s, lỗi send-timeout 90s và
+lỗi stall; phân biệt "text bị xoá trước click" vs "click rồi app dọn composer".
+(3) `inline_prompt_max_chars` (default 30000, 0 = trần cũ 130000, không vượt `MAX_PROMPT_CHARS`)
+dùng cho cả quyết định inline lẫn điều kiện tách companion; stall-detector 8s cho job
+new/legacy prompt ≥ 20000 → `learnInlineLimit` + throw sớm, retry đi đường attach file.
+Không áp dụng continue/fork (retry có thể nhân đôi delta). Không đụng logic fork.
+Đường file đã ổn định 2/2 lần trong chính log này (34919 & 46176 chars, paste-file ~2s,
+`status=uploaded`, usage_in 25179/28470). Test: `TestInlinePromptThreshold` + 11 test Node.
+
+Interrupt ở client không dừng generate trên Qwen
+Vấn đề: ngắt request ở client (OpenCode) khi model đang chạy → Python huỷ job (`/alive` false,
+event `stale`) nhưng extension chỉ nhả reader (`pumpFetch`), không bấm Stop → Qwen chạy tiếp đến hết;
+trên chat session thành tin assistant thừa, chỉ được dọn khi job kế `waitUiIdle` bấm Stop.
+Sửa: `stopGenerationOnCancel(job)` trong `finally` của `runJobInner` (chỉ job `cancelled` và đã
+`attached`; tối đa 3 lần bấm, đợi nút Stop hiện); ping 5s gọi `jobAlive(current, true)` cho job
+đang generate để huỷ không phải chờ delta kế tiếp. Test Node: 5 test `stopGenerationOnCancel`.
+Kèm: test `sendPromptEnv` của session_patch3 thiếu `sendDiag` trong `loadFns` → 2 test Node fail
+(`ReferenceError: sendDiag is not defined`); đã thêm `sendDiag`.
+

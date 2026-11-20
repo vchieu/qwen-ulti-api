@@ -739,7 +739,7 @@ class _Handler(BaseHTTPRequestHandler):
             safe_keys = ("debug", "log_requests", "temporary_chat", "temporary-chat",
                          "bridge_select_model", "temporary_chat_reload", "captcha_wait_seconds", "default_model",
                          "bridge_select_mode", "bridge_force_request_model", "prompt_max_bytes",
-                         "file_prompt_max_chars",
+                         "file_prompt_max_chars", "inline_prompt_max_chars",
                          "retry_attempts",
                          "bridge_job_timeout", "bridge_poll_wait", "bridge_worker_ttl",
                          "attachment_prompt", "log_file", "bridge_port", "port",

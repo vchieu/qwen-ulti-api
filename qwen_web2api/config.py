@@ -70,6 +70,10 @@ DEFAULT_CONFIG = {
     # 0 = KHONG cat prompt (Qwen context lon; gioi han that la 131072 ky tu cua paste->file,
     # xem file_prompt_max_chars). Dat so > 0 neu muon ep tran byte.
     "prompt_max_bytes": 0,
+    # Nguong inline -> file prompt (ky tu). Prompt dai hon -> tach history sang file
+    # dinh kem (prepare_large_prompt). 0/sai = MAX_PROMPT_CHARS (130000, hanh vi cu).
+    # Mac dinh 30000: inline > ~32k khong on dinh (Qwen doi text thanh document, Send treo).
+    "inline_prompt_max_chars": 30000,
 
     "tool_retry_on_miss": True,
     "tool_retry_attempts": 1,

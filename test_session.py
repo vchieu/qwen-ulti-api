@@ -965,5 +965,228 @@ class TestFakeTabIsolation(_HttpSandbox):
             srv.server_close()
 
 
+class TestInterruptRecovery(_Sandbox):
+    """Client huy giua chung (interrupt) roi go tiep: tiep tuc trong chat, khong reload/replay."""
+    Q0 = [{"role": "user", "content": "q0"}]
+
+    def _interrupted_session(self, tools=None, **plan_out):
+        _commit_new(sess.STORE, self.Q0, "a0", None, tools=tools)
+        msgs = self.Q0 + [{"role": "assistant", "content": "a0"},
+                          {"role": "user", "content": "python co ok hon node khong"}]
+        plan = sess.STORE.plan(msgs, tools, "auto", tab=TAB)
+        self.assertEqual(plan.kind, "continue")
+        plan.out.update({"nonce": "N1", "chat_id": "C1", "parent_id": "A0", "sent": True})
+        plan.out.update(plan_out)
+        sess.STORE.fail(plan, "client disconnected; job cancelled")
+        return msgs
+
+    def test_interrupt_keeps_session_marks_interrupted(self):
+        self._interrupted_session()
+        s = sess.STORE.get()
+        self.assertIsNotNone(s)
+        self.assertEqual(s.hashes[-1], sess.INTERRUPTED)
+        self.assertEqual(len(s.hashes), 4)
+        self.assertEqual(s.labels[-1], "assistant(interrupted)")
+        self.assertEqual(s.checkpoints[-1], {"n": 2, "parent": "A0"})
+
+    def test_two_consecutive_user_messages_continue_with_second_only(self):
+        msgs = self._interrupted_session()
+        nxt = msgs + [{"role": "user", "content": "tiep di ban"}]
+        plan = sess.STORE.plan(nxt, None, "auto", tab=TAB)
+        self.assertEqual((plan.kind, plan.reason), ("continue", "after_interrupt"))
+        self.assertEqual(plan.base_n, 3)
+        self.assertEqual(plan.prompt, "tiep di ban")
+
+    def test_client_keeping_partial_assistant_text_is_skipped_over(self):
+        msgs = self._interrupted_session()
+        nxt = msgs + [{"role": "assistant", "content": "Node thi..."},
+                      {"role": "user", "content": "tiep di ban"}]
+        plan = sess.STORE.plan(nxt, None, "auto", tab=TAB)
+        self.assertEqual((plan.kind, plan.base_n), ("continue", 4))
+        self.assertEqual(plan.prompt, "tiep di ban")
+
+    def test_commit_after_interrupt_then_normal_continue(self):
+        msgs = self._interrupted_session()
+        nxt = msgs + [{"role": "user", "content": "tiep di ban"}]
+        plan = sess.STORE.plan(nxt, None, "auto", tab=TAB)
+        plan.out.update({"nonce": "N1", "chat_id": "C1", "parent_id": "A1", "sent": True})
+        s = sess.STORE.commit(plan, "Python thi...", None)
+        self.assertEqual(len(s.hashes), 5)
+        self.assertNotIn(sess.INTERRUPTED, s.hashes)
+        after = nxt + [{"role": "assistant", "content": "Python thi..."},
+                       {"role": "user", "content": "cam on"}]
+        p2 = sess.STORE.plan(after, None, "auto", tab=TAB)
+        self.assertEqual((p2.kind, p2.prompt), ("continue", "cam on"))
+
+    def test_nothing_new_or_diverged_after_interrupt_resets(self):
+        msgs = self._interrupted_session()
+        p = sess.STORE.plan(msgs, None, "auto", tab=TAB)        # client gui lai y het: retry
+        self.assertEqual(p.kind, "new")
+        self.assertIn("after_interrupt", p.reason)
+        self.assertIn("client[", p.reason)
+        self._interrupted_session()
+        edited = [{"role": "user", "content": "EDITED"}, {"role": "assistant", "content": "a0"},
+                  {"role": "user", "content": "x"}, {"role": "user", "content": "y"}]
+        self.assertEqual(sess.STORE.plan(edited, None, "auto", tab=TAB).kind, "new")
+
+    def test_assistant_with_tool_calls_after_interrupt_resets(self):
+        msgs = self._interrupted_session()
+        nxt = msgs + [asst_calls("c9"), {"role": "user", "content": "y"}]
+        self.assertEqual(sess.STORE.plan(nxt, None, "auto", tab=TAB).kind, "new")
+
+    def test_other_failures_still_reset(self):
+        _commit_new(sess.STORE, self.Q0, "a0", None, tools=None)
+        msgs = self.Q0 + [{"role": "assistant", "content": "a0"},
+                          {"role": "user", "content": "q1"}]
+        plan = sess.STORE.plan(msgs, None, "auto", tab=TAB)
+        plan.out.update({"nonce": "N1", "sent": True})
+        sess.STORE.fail(plan, "stream died")
+        self.assertIsNone(sess.STORE.get())
+
+    def test_interrupt_before_send_keeps_session_untouched(self):
+        _commit_new(sess.STORE, self.Q0, "a0", None, tools=None)
+        msgs = self.Q0 + [{"role": "assistant", "content": "a0"},
+                          {"role": "user", "content": "q1"}]
+        plan = sess.STORE.plan(msgs, None, "auto", tab=TAB)
+        sess.STORE.fail(plan, "client disconnected")            # chua gui gi
+        self.assertNotEqual(sess.STORE.get().hashes[-1], sess.INTERRUPTED)
+
+    def test_interrupt_with_tab_reloaded_resets(self):
+        self._interrupted_session()                              # session hop le
+        _commit = sess.STORE.get()
+        sess.STORE.reset("x")
+        _commit_new(sess.STORE, self.Q0, "a0", None, tools=None)
+        msgs = self.Q0 + [{"role": "assistant", "content": "a0"},
+                          {"role": "user", "content": "q1"}]
+        plan = sess.STORE.plan(msgs, None, "auto", tab=TAB)
+        plan.out.update({"nonce": "OTHER", "chat_id": "C1", "sent": True})
+        sess.STORE.fail(plan, "client disconnected")
+        self.assertIsNone(sess.STORE.get())
+
+    def test_interrupt_of_first_turn_keeps_new_session(self):
+        plan = sess.STORE.plan(self.Q0, None, "auto", tab=None)
+        plan.delta_chars = 500
+        plan.out.update({"nonce": "N1", "chat_id": "C1", "sent": True})
+        sess.STORE.fail(plan, "client disconnected; job cancelled")
+        s = sess.STORE.get()
+        self.assertEqual((s.hashes[-1], len(s.hashes)), (sess.INTERRUPTED, 2))
+        nxt = self.Q0 + [{"role": "user", "content": "tiep"}]
+        p = sess.STORE.plan(nxt, None, "auto", tab=TAB)
+        self.assertEqual((p.kind, p.base_n, p.prompt), ("continue", 1, "tiep"))
+
+    def test_divergence_reason_names_the_differing_messages(self):
+        m = [{"role": "system", "content": "sys"}, {"role": "user", "content": "go"}]
+        _commit_new(sess.STORE, m, "", [call("c1")])
+        hist = m + [asst_calls("c1")]
+        plan = sess.STORE.plan(hist + [tool("c1", "R")], TOOLS, "auto", tab=TAB)
+        plan.out.update({"nonce": "N1", "chat_id": "C1", "sent": True})
+        sess.STORE.commit(plan, "final", None)
+        new = hist + [{"role": "user", "content": "dung python co loi hon node khong"}]
+        p = sess.STORE.plan(new, TOOLS, "auto", tab=TAB)
+        self.assertEqual(p.kind, "new")
+        self.assertIn("client[3]=user(", p.reason)
+        self.assertIn("'dung python co loi hon node kh'", p.reason)
+        self.assertIn("session[3]=tool(1c)", p.reason)
+        self.assertNotIn("fork:", p.reason)
+
+    def test_fork_miss_lists_checkpoints(self):
+        CONFIG["session_fork"] = True
+        m = [{"role": "system", "content": "sys"}, {"role": "user", "content": "go"}]
+        _commit_new(sess.STORE, m, "", [call("c1")])
+        hist = m + [asst_calls("c1")]
+        plan = sess.STORE.plan(hist + [tool("c1", "R")], TOOLS, "auto", tab=TAB)
+        plan.out.update({"nonce": "N1", "chat_id": "C1", "parent_id": "A1", "sent": True})
+        sess.STORE.commit(plan, "final", None)
+        edited = [{"role": "system", "content": "sys"}, {"role": "user", "content": "EDITED"},
+                  asst_calls("c1"), tool("c1", "R")]
+        p = sess.STORE.plan(edited, TOOLS, "auto", tab=TAB)
+        self.assertEqual(p.kind, "new")
+        self.assertIn("ckpts=[0, 3]", p.reason)
+
+
+class TestInterruptHttp(_HttpSandbox):
+    def setUp(self):
+        super().setUp()
+        self._ping = server.SSE_PING_INTERVAL
+        server.SSE_PING_INTERVAL = 0.2          # heartbeat phat hien client ngat nhanh hon
+
+    def tearDown(self):
+        server.SSE_PING_INTERVAL = self._ping
+        super().tearDown()
+
+    def test_reason_strings_from_bridge_and_server_are_recognized(self):
+        for r in ("browser bridge: client da ngat ket noi, job bi huy",
+                  "client disconnected; job cancelled", "Client Disconnected"):
+            self.assertTrue(sess._client_cancelled(r), r)
+        for r in ("browser bridge: tab khong tra ket qua (timeout)", "job cancelled: extension cancel",
+                  "UI send timeout", ""):
+            self.assertFalse(sess._client_cancelled(r), r)
+
+    def test_stream_disconnect_then_follow_up_continues_in_same_chat(self):
+        self._interrupt_flow(40)           # server dang ghi delta -> loi ghi socket
+
+    def test_idle_stream_disconnect_detected_by_heartbeat_continues_too(self):
+        self._interrupt_flow(2)            # im lang sau part1 -> chi heartbeat phat hien
+
+    def _interrupt_flow(self, n_deltas):
+        self.tab.push("a0")
+        q0 = [{"role": "user", "content": "q0"}]
+        self.chat(q0, tools=None)
+        a = {"role": "user", "content": "python co ok hon node khong"}
+        orig_put = self.tab.put
+
+        def slow_put(job):
+            if len(self.tab.jobs) != 1:
+                return orig_put(job)
+            self.tab.jobs.append(job)
+            q = bridge._jobs[job["job_id"]]
+            q.put({"kind": "session", "mode": "continue", "nonce": "N1",
+                   "chat_id": "CHAT-1", "parent_id": "ASSIST0"})
+
+            def later():
+                for i in range(n_deltas):
+                    time.sleep(0.1)
+                    q.put({"kind": "delta", "text": f"part{i} "})
+            threading.Thread(target=later, daemon=True).start()
+        self.tab.put = slow_put
+
+        import socket as _socket
+        body = json.dumps({"model": "qwen3.7-plus", "stream": True,
+                           "messages": q0 + [{"role": "assistant", "content": "a0"}, a]}
+                          ).encode()
+        sock = _socket.create_connection(("127.0.0.1", self.port), timeout=30)
+        sock.sendall(b"POST /v1/chat/completions HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                     b"Content-Type: application/json\r\nContent-Length: "
+                     + str(len(body)).encode() + b"\r\n\r\n" + body)
+        buf = b""
+        while b"part1" not in buf:
+            chunk = sock.recv(4096)
+            self.assertTrue(chunk, "server dong ket noi truoc khi stream")
+            buf += chunk
+        sock.shutdown(_socket.SHUT_RDWR)                  # = nguoi dung bam interrupt
+        sock.close()
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            cur = sess.STORE.get()
+            if cur is not None and cur.hashes and cur.hashes[-1] == sess.INTERRUPTED:
+                break
+            time.sleep(0.1)
+        cur = sess.STORE.get()
+        self.assertIsNotNone(cur, "session bi reset khi client interrupt")
+        self.assertEqual(cur.hashes[-1], sess.INTERRUPTED)
+
+        self.tab.put = orig_put
+        self.tab.push("Python thi...")
+        msgs3 = q0 + [{"role": "assistant", "content": "a0"}, a,
+                      {"role": "user", "content": "tiep di ban"}]
+        st, r3 = self.chat(msgs3, tools=None)
+        self.assertEqual(st, 200)
+        j = self.tab.jobs[-1]
+        self.assertEqual(j["session"]["mode"], "continue")
+        self.assertEqual(j["prompt"], "tiep di ban")
+        self.assertEqual(j["session"]["chat_id"], "CHAT-1")
+        self.assertEqual(sess.STORE.get().turns, 3)
+
+
 if __name__ == "__main__":
     unittest.main()

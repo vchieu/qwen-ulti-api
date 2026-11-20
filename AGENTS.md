@@ -62,7 +62,7 @@ Giá trị mặc định và alias nằm trong `qwen_web2api/config.py`. Các ke
   `bridge_require_model` / `bridge_require_mode` (false; `require_mode` chỉ có nghĩa khi
   `bridge_select_mode=true`), `bridge_require_attachment` (true),
   `bridge_attachment_block` (`["name","size","status","count","content"]`; `stale` opt-in; `[]` = chỉ cảnh báo).
-- File/prompt: `prompt_max_bytes` (0 = không cắt), `prompt_hard_max_chars` (0),
+- File/prompt: `prompt_max_bytes` (0 = không cắt), `prompt_hard_max_chars` (0), `inline_prompt_max_chars` (30000; 0 = trần cũ 130000),
   `file_prompt_max_chars` (mặc định 130000), `file_prompt_truncate` (false),
   `attachment_prompt` (mặc định `"Please read the text and action"`).
 - Session (xem "Chế độ session"): `bridge_session_mode` (**false**), `session_max_chars` (400000),
@@ -155,7 +155,8 @@ Giá trị mặc định và alias nằm trong `qwen_web2api/config.py`. Các ke
 
 ### File prompt & attach
 
-- `prepare_large_prompt` cắt bằng `_render_fit` (`FILE_MAX_CHARS`=130000, giữ đầu + tin mới
+- Ngưỡng inline→file: `inline_prompt_max_chars` (mặc định 30000, trần cứng `MAX_PROMPT_CHARS`=130000) — prompt replay lớn (vd 47k sau undo) tách history sang file, không inline. Extension: `sendPrompt` có stall-detector cho job new/legacy prompt ≥ 20000 (composer rỗng / nút Send biến mất quá 8s không request → `learnInlineLimit` + throw sớm, retry đi đường attach file; không áp dụng continue/fork).
+`prepare_large_prompt` cắt bằng `_render_fit` (`FILE_MAX_CHARS`=130000, giữ đầu + tin mới
   nhất, chèn `[...truncated...]`). `messages_to_prompt(max_bytes=...)` ép trần byte. CRLF được
   chuẩn hoá LF.
 - Nhiều tin nhắn và lượt cuối là user (<= 130000): lượt cuối (+ tool definitions /
@@ -213,6 +214,12 @@ Một job có file để lại các dòng log sau (grep `job <8 ký tự đầu>
 - `_watch_disconnect` + heartbeat SSE đánh dấu `gone` cho lỗi socket xác định (`_is_disconnect_error`).
   `bridge_cancel_on_disconnect` huỷ job non-stream. `tab_reloaded` → fail nhanh 502 + retry;
   `tab_reloading` chỉ warn. Job orphan (caller ngắt/TTL) bị `/poll` drop.
+- Caller huỷ khi Qwen đang generate (client ngắt/abort): job `cancelled` + đã `attached` →
+  `runJobInner` (finally) gọi `stopGenerationOnCancel` bấm nút Stop trên Qwen (tối đa 3 lần, đợi
+  nút hiện tới ~1.5s). Ping 5s hỏi `/alive` cho job đang generate để không phải chờ delta kế tiếp
+  (Qwen "nghĩ" lâu thì không có delta). Trước đây chỉ nhả reader → Qwen chạy tiếp đến hết và chỉ
+  được dọn khi job sau `waitUiIdle` bấm Stop. Session mode: lượt bị huy đã gửi request nên session
+  reset (`STORE.fail`), lượt sau replay đầy đủ.
 - Tool drop (undeclared / `body is not valid JSON`) → `_run_turn` nudge retry kèm lý do + tool
   hợp lệ. Tool built-in của Qwen (config `qwen_builtin_tools`, mặc định `code_interpreter`) bị extension bỏ
   qua để Qwen tự chạy.

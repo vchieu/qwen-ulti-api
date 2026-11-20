@@ -2811,5 +2811,67 @@ class TestForceModeConfig(_Sandbox):
         self.assertEqual(bridge.mode_feature_config(), {})
 
 
+
+class TestInlinePromptThreshold(_Sandbox):
+    """session_patch3: nguong inline->file cau hinh duoc (inline_prompt_max_chars)."""
+
+    def test_default_and_helper(self):
+        self.assertEqual(DEFAULT_CONFIG["inline_prompt_max_chars"], 30000)
+        self.assertEqual(server._inline_max_chars(), 30000)
+        for bad in ("abc", None, -1, 0):
+            CONFIG["inline_prompt_max_chars"] = bad
+            self.assertEqual(server._inline_max_chars(), server.MAX_PROMPT_CHARS)
+
+    def test_capped_by_module_max(self):
+        CONFIG["inline_prompt_max_chars"] = 200000
+        self.assertEqual(server._inline_max_chars(), server.MAX_PROMPT_CHARS)
+        with mock.patch.object(server, "MAX_PROMPT_CHARS", 50):
+            self.assertEqual(server._inline_max_chars(), 50)   # test cu patch hang so van dung
+
+    def test_35k_goes_file_by_default(self):
+        msgs = [{"role": "user", "content": "x" * 35000}]
+        fi, _short = server.prepare_large_prompt(msgs)
+        try:
+            self.assertIsNotNone(fi)
+            self.assertEqual(fi["size"], 35000)
+        finally:
+            server._remove_prompt_file(fi)
+
+    def test_zero_keeps_legacy_inline(self):
+        CONFIG["inline_prompt_max_chars"] = 0
+        msgs = [{"role": "user", "content": "x" * 35000}]
+        fi, out = server.prepare_large_prompt(msgs)
+        self.assertIsNone(fi)
+        self.assertIs(out, msgs)
+
+    def test_split_companion_over_threshold_whole_file(self):
+        CONFIG["inline_prompt_max_chars"] = 1000
+        msgs = [{"role": "user", "content": "h" * 2000},
+                {"role": "assistant", "content": "a"},
+                {"role": "user", "content": "q" * 1500}]
+        fi, short = server.prepare_large_prompt(msgs)
+        try:
+            self.assertIsNotNone(fi)
+            self.assertIsNone(fi.get("attachment_prompt"))   # companion qua nguong -> ca file
+            self.assertIn("[Attached file:", short[0]["content"])
+        finally:
+            server._remove_prompt_file(fi)
+
+    def test_replay_47k_splits_history_keeps_small_companion(self):
+        """Giong ca undo trong log: history lon + tin user cuoi ngan -> tach file."""
+        msgs = [{"role": "system", "content": "S" * 20000},
+                {"role": "user", "content": "q1"},
+                {"role": "assistant", "content": "a" * 26000},
+                {"role": "user", "content": "dung python co loi hon node khong"}]
+        fi, short = server.prepare_large_prompt(msgs)
+        try:
+            self.assertIsNotNone(fi)
+            self.assertEqual(len(short), 1)
+            self.assertEqual(short[0]["content"], "dung python co loi hon node khong")
+            self.assertEqual(fi.get("attachment_prompt"), "dung python co loi hon node khong")
+        finally:
+            server._remove_prompt_file(fi)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

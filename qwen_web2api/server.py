@@ -41,6 +41,19 @@ def _file_max_chars():
         return FILE_MAX_CHARS
     return v if v > 0 else FILE_MAX_CHARS
 MAX_PROMPT_CHARS = 130000  # buffer an toàn dưới giới hạn 131072 ký tự của Qwen Web
+
+
+def _inline_max_chars():
+    """Nguong inline -> file (config inline_prompt_max_chars). <=0/sai = MAX_PROMPT_CHARS
+    (hanh vi cu). Khong vuot MAX_PROMPT_CHARS: inline > ~32k khong on dinh (Qwen doi
+    text thanh document / Send treo), xem INLINE_LIMIT_CAP trong extension."""
+    try:
+        v = int(float(CONFIG.get("inline_prompt_max_chars", MAX_PROMPT_CHARS)))
+    except (TypeError, ValueError):
+        return MAX_PROMPT_CHARS
+    if v <= 0:
+        return MAX_PROMPT_CHARS
+    return min(v, MAX_PROMPT_CHARS)
 _MSG_PREVIEW_CHARS = 200   # Option B: số ký tự preview mỗi message trong log
 
 
@@ -271,7 +284,8 @@ def prepare_large_prompt(messages, tools=None, tool_choice=None):
     if hard > 0 and len(full_prompt) > hard:
         raise QwenError(f"prompt too large: {len(full_prompt)} chars > "
                         f"prompt_hard_max_chars={hard}", status=413)
-    if len(full_prompt) <= MAX_PROMPT_CHARS:
+    thr = _inline_max_chars()
+    if len(full_prompt) <= thr:
         return None, messages
     _cleanup_old_temp_files()
     paste_limit = _file_max_chars()
@@ -282,7 +296,7 @@ def prepare_large_prompt(messages, tools=None, tool_choice=None):
             and messages[-1].get("role") == "user":
         last_msg = messages[-1]
         companion_prompt = messages_to_prompt([last_msg], tools, tool_choice)
-        if len(companion_prompt) <= MAX_PROMPT_CHARS:
+        if len(companion_prompt) <= thr:
             can_split = True
     if can_split:
         history = messages[:-1]
@@ -310,7 +324,7 @@ def prepare_large_prompt(messages, tools=None, tool_choice=None):
     reason = ("only 1 message" if len(messages) <= 1
               else f"last msg role={last_role!r}, not user"
               if last_role != "user"
-              else f"last msg itself > MAX_PROMPT_CHARS ({len(companion_prompt)} chars)")
+              else f"last msg itself > inline threshold ({len(companion_prompt)} chars)")
     log(f"[bridge] large prompt: cannot split ({reason}), writing full prompt to file")
     full_prompt = _render_fit(messages, tools, tool_choice)
     fd, path = tempfile.mkstemp(suffix=".txt", prefix="qwen_prompt_")

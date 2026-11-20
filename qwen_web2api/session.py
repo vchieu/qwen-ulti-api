@@ -25,6 +25,18 @@ KIND_NEW = "new"
 KIND_CONTINUE = "continue"
 KIND_FORK = "fork"
 _MAX_CHECKPOINTS = 200
+# Hash dac biet o CUOI session.hashes: client huy giua chung (interrupt) sau khi request da vao
+# chat Qwen -> chat co delta + 1 ban tra loi dang do ma client khong biet. Khop 0 hoac 1 tin
+# assistant o luot sau (xem _plan) thay vi reset.
+INTERRUPTED = "interrupted-reply"
+# Cac thong diep loi cho biet CLIENT chu dong huy (server.py/bridge.py): bridge ghi tieng Viet
+# "client da ngat ket noi", duong non-stream ghi "client disconnected; job cancelled".
+_CLIENT_CANCEL_MARKERS = ("client disconnected", "client da ngat ket noi")
+
+
+def _client_cancelled(reason):
+    r = str(reason or "").lower()
+    return any(m in r for m in _CLIENT_CANCEL_MARKERS)
 
 # --------------------------------------------------------------- prompts ----
 # Qwen da co san trong chat: system, tool block va chinh cac tool_call no tung sinh -> delta
@@ -212,6 +224,23 @@ def hash_messages(messages, strict_assistant=False):
     return [canon_message(m, strict_assistant) for m in messages or []]
 
 
+def label_message(m):
+    """Nhan ngan de CHAN DOAN khi history lech (vd `user(33c) 'dung python...'`); khong dung
+    de so khop."""
+    if not isinstance(m, dict):
+        return "?"
+    role = _role(m)
+    if role == "assistant" and m.get("tool_calls"):
+        names = [str(((tc or {}).get("function") or {}).get("name") or "?")
+                 for tc in m["tool_calls"] if isinstance(tc, dict)]
+        return "assistant<" + ",".join(names) + ">"
+    text = _stringify_content(m.get("content"))
+    if role == "tool":
+        return f"tool({len(text)}c)"
+    flat = " ".join(text.split())[:30]
+    return f"{role}({len(text)}c) {flat!r}"
+
+
 def ctx_hash(tools):
     """Dau van tay tool definitions. Doi tool => tool block trong chat cu het hieu luc."""
     defs = []
@@ -326,6 +355,7 @@ class Plan:
         self.prompt = None              # inline / composer text (continue/fork)
         self.file_text = None           # != None -> delta di bang file
         self.delta_chars = 0
+        self.labels = []                # label_message cua MOI message client (chan doan)
         self.attach_prompt = ""         # composer text neu extension chuyen inline -> file
         self.summary = ""
         self.out = {}                   # bridge.generate_stream ghi chat_id/nonce/sent/...
@@ -378,6 +408,7 @@ class Session:
         self.chars_sent = 0
         self.created = self.last_used = time.time()
         self.checkpoints = []           # [{"n": so msg truoc delta, "parent": nut cha}]
+        self.labels = []                # nhan chan doan song song voi hashes
 
     def describe(self):
         return (f"sid={self.sid} chat={str(self.chat_id or '-')[:8]} "
@@ -420,6 +451,22 @@ class SessionStore:
     # ------------------------------------------------------------ planning --
     def plan(self, messages, tools=None, tool_choice=None, tab=None, api="chat",
              tools_active=None, now=None):
+        labels = [label_message(m) for m in messages or []]
+        p = self._plan(messages, tools, tool_choice, tab, api, tools_active, now, labels)
+        p.labels = labels
+        return p
+
+    def _diff_note(self, cur, labels, lcp):
+        """Cho biet message nao lech: client[i] vs session[i] + checkpoint (neu bat fork)."""
+        def at(seq, i):
+            return seq[i] if 0 <= i < len(seq) else "-"
+        note = f" client[{lcp}]={at(labels, lcp)} session[{lcp}]={at(cur.labels, lcp)}"
+        if fork_enabled():
+            note += " fork:khong co checkpoint hop le, ckpts=" + str(
+                [c.get("n") for c in cur.checkpoints][-12:])
+        return note
+
+    def _plan(self, messages, tools, tool_choice, tab, api, tools_active, now, labels):
         now = time.time() if now is None else now
         strict = bool(CONFIG.get("session_strict_assistant", False))
         hashes = hash_messages(messages, strict)
@@ -457,6 +504,24 @@ class SessionStore:
                 return new("tools_changed")
             if cur.api != api:
                 return new("api_changed")
+            if cur.hashes and cur.hashes[-1] == INTERRUPTED:
+                # Luot truoc bi client huy sau khi da gui: chat Qwen co ...+delta+ban tra loi do.
+                # Client thuong bo ban do (hai tin user lien tiep) hoac giu lai nhu 1 tin
+                # assistant van ban -> gui tiep phan con lai vao chat nay, khong reset.
+                m = len(cur.hashes) - 1
+                lcp_i = common_prefix(hashes, cur.hashes[:m])
+                if lcp_i == m and len(messages) > m:
+                    base = m
+                    nxt = messages[m]
+                    if isinstance(nxt, dict) and _role(nxt) == "assistant" \
+                            and not nxt.get("tool_calls"):
+                        base = m + 1
+                    if len(messages) > base:
+                        return self._continue_plan(cur, messages, hashes, ch, tools,
+                                                   tool_choice, api, tools_active, base,
+                                                   KIND_CONTINUE, None, "after_interrupt")
+                return new(f"history_diverged_after_interrupt@{lcp_i}/{m} msgs={len(messages)}"
+                           + self._diff_note(cur, labels, lcp_i))
             n = len(cur.hashes)
             lcp = common_prefix(hashes, cur.hashes)
             if lcp == n and len(hashes) > n:
@@ -478,9 +543,10 @@ class SessionStore:
                                             api, tools_active, base, KIND_FORK,
                                             ck["parent"], why)
                     return p
+            note = self._diff_note(cur, labels, lcp)
             if lcp == len(hashes):
-                return new(f"retry_or_rewind len={len(hashes)}/{n}")
-            return new(f"history_diverged@{lcp}/{n} msgs={len(messages)}")
+                return new(f"retry_or_rewind len={len(hashes)}/{n}{note}")
+            return new(f"history_diverged@{lcp}/{n} msgs={len(messages)}{note}")
 
     def _continue_plan(self, cur, messages, hashes, ch, tools, tool_choice, api,
                        tools_active, base_n, kind, parent, reason):
@@ -538,6 +604,7 @@ class SessionStore:
         if calls:
             asst["tool_calls"] = calls
         new_hashes = list(plan.hashes)
+        new_labels = list(plan.labels)
         if plan.api == "responses" and calls and text:
             # Responses API: function_call va message la 2 item rieng -> client gui lai 2 msg.
             new_hashes.append(canon_message({"role": "assistant", "content": None,
@@ -545,6 +612,7 @@ class SessionStore:
             new_hashes.append(canon_message({"role": "assistant", "content": text}, strict))
         else:
             new_hashes.append(canon_message(asst, strict))
+        new_labels += [label_message(asst)] * (len(new_hashes) - len(new_labels))
         with self._lock:
             cur = self.current
             if plan.kind == KIND_NEW:
@@ -556,6 +624,7 @@ class SessionStore:
                     return None
                 s = Session(out.get("chat_id"), nonce, new_hashes, plan.ctx, plan.api)
                 s.turns = 1
+                s.labels = new_labels
                 s.chars_sent = plan.delta_chars + len(text or "")
                 s.checkpoints = [{"n": 0, "parent": None}]
                 self.current = s
@@ -577,6 +646,7 @@ class SessionStore:
             cur.checkpoints = [c for c in cur.checkpoints if c["n"] < plan.base_n] + [ck]
             cur.checkpoints = cur.checkpoints[-_MAX_CHECKPOINTS:]
             cur.hashes = new_hashes
+            cur.labels = new_labels
             cur.turns += 1
             cur.chars_sent += plan.delta_chars + len(text or "")
             cur.last_used = time.time()
@@ -586,11 +656,48 @@ class SessionStore:
     def fail(self, plan, reason):
         """Luot loi. Da gui (sent) hoac extension bao session_lost -> chat da/khong ro trang thai
         => reset (client retry se tu replay day du). Chua gui gi thi giu session."""
-        if plan is None or plan.kind == KIND_NEW:
+        if plan is None:
             return
         out = plan.out or {}
+        if out.get("sent") and not out.get("session_lost") and not out.get("dirty") \
+                and _client_cancelled(reason) and out.get("nonce"):
+            # Client huy giua chung (vd bam interrupt): extension da bam Stop, chat giu delta +
+            # ban tra loi do -> danh dau INTERRUPTED de luot sau gui tiep o chat nay.
+            if self._mark_interrupted(plan, out):
+                return
+        if plan.kind == KIND_NEW:
+            return
         if out.get("sent") or out.get("session_lost") or out.get("dirty"):
             self.reset(f"turn_failed: {reason}")
+
+    def _mark_interrupted(self, plan, out):
+        nonce = out.get("nonce")
+        hashes = list(plan.hashes) + [INTERRUPTED]
+        labels = list(plan.labels) + ["assistant(interrupted)"]
+        with self._lock:
+            cur = self.current
+            if plan.kind == KIND_NEW:
+                s = Session(out.get("chat_id"), nonce, hashes, plan.ctx, plan.api)
+                s.turns = 1
+                s.chars_sent = plan.delta_chars
+                s.checkpoints = [{"n": 0, "parent": None}]
+                s.labels = labels
+                self.current = s
+                log(f"[session] interrupted (turn dau): giu {s.describe()}, luot sau gui tiep")
+                return True
+            if cur is None or cur is not plan.session or nonce != cur.nonce \
+                    or (cur.chat_id and out.get("chat_id")
+                        and out.get("chat_id") != cur.chat_id):
+                return False
+            ck = {"n": plan.base_n, "parent": out.get("parent_id") or plan.parent_id}
+            cur.checkpoints = [c for c in cur.checkpoints if c["n"] < plan.base_n] + [ck]
+            cur.checkpoints = cur.checkpoints[-_MAX_CHECKPOINTS:]
+            cur.hashes, cur.labels = hashes, labels
+            cur.turns += 1
+            cur.chars_sent += plan.delta_chars
+            cur.last_used = time.time()
+            log(f"[session] interrupted: giu {cur.describe()}, luot sau gui tiep o chat nay")
+            return True
 
 
 STORE = SessionStore()

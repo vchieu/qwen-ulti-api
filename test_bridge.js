@@ -639,3 +639,241 @@ test("announceSession: gui event session voi nonce + id doc tu body (ke ca Reque
   await fns.announceSession({ id: "m", session: { mode: "new" } }, null, { body: "{bad" });
   assert.equal(sent.length, 2);
 });
+
+// =============================== session_patch3: hydrate / diag / stall ======
+function pageReadyEnv(opts = {}) {
+  const state = { now: 1000, sent: [], warns: [] };
+  const ctx = {
+    PAGE_READY_MAX_MS: 8000,
+    TEMP_DOM_WAIT_MS: 3000,
+    pageUsed: !!opts.pageUsed,
+    selectModelEnabled: false,          // giong config that: bridge_select_model=false
+    Date: { now: () => state.now },
+    sleep: async (ms) => { state.now += ms; },
+    modelTargets: () => [],
+    findModelTrigger: () => (opts.picker ? {} : null),
+    findComposers: () => (opts.noComposer ? [] : [{}]),
+    isTemporaryPage: () => opts.temporary !== false,
+    temporaryEvidence: () => ({
+      dom: opts.domAt ? state.now >= opts.domAt : !!opts.dom,
+    }),
+    send: (_id, ev) => { state.sent.push(ev); },
+    fwd: (_job, kind, msg) => { state.warns.push([kind, msg]); },
+  };
+  return { fns: loadFns(["waitPageReady"], ctx), state };
+}
+
+test("waitPageReady: select_model=false VAN phai doi temporary DOM (khong break ngay)", async (t) => {
+  const env = pageReadyEnv({ dom: false });          // trang chua hydrate
+  if (!env.fns) return t.skip("waitPageReady chua co trong bridge.js");
+  await env.fns.waitPageReady({ id: "j" });
+  const elapsed = env.state.now - 1000;
+  assert.ok(elapsed >= 3000, "phai doi it nhat TEMP_DOM_WAIT_MS, khong chi sleep 1s");
+  assert.equal(env.state.warns.length, 1, "phai warn trang chua hydrate");
+  assert.match(env.state.warns[0][1], /CHUA hydrate/);
+  assert.match(env.state.sent[0].message, /tempDom=false/);
+});
+
+test("waitPageReady: temporary DOM xuat hien -> di tiep som, khong warn", async (t) => {
+  const env = pageReadyEnv({ domAt: 2000 });
+  if (!env.fns) return t.skip("waitPageReady chua co trong bridge.js");
+  await env.fns.waitPageReady({ id: "j" });
+  assert.ok(env.state.now - 1000 < 3000, "hydrate xong thi khong cho het nguong");
+  assert.deepEqual(env.state.warns, []);
+  assert.match(env.state.sent[0].message, /tempDom=true/);
+});
+
+test("waitPageReady: che do thuong (khong temporary) khong doi temp DOM", async (t) => {
+  const env = pageReadyEnv({ temporary: false, dom: false });
+  if (!env.fns) return t.skip("waitPageReady chua co trong bridge.js");
+  await env.fns.waitPageReady({ id: "j" });
+  assert.ok(env.state.now - 1000 <= 1200);
+  assert.deepEqual(env.state.warns, []);
+});
+
+test("waitPageReady: khong thay composer -> cho het nguong + warn", async (t) => {
+  const env = pageReadyEnv({ noComposer: true, dom: true });
+  if (!env.fns) return t.skip("waitPageReady chua co trong bridge.js");
+  await env.fns.waitPageReady({ id: "j" });
+  assert.ok(env.state.now - 1000 >= 8000);
+  assert.match(env.state.warns[0][1], /composer=false/);
+});
+
+test("waitPageReady: pageUsed=true -> bo qua (khong doi, khong log)", async (t) => {
+  const env = pageReadyEnv({ pageUsed: true });
+  if (!env.fns) return t.skip("waitPageReady chua co trong bridge.js");
+  await env.fns.waitPageReady({ id: "j" });
+  assert.equal(env.state.now, 1000);
+  assert.deepEqual(env.state.sent, []);
+});
+
+test("chatMessageStats: dem bubble visible + du dai, bo node ngan/an", (t) => {
+  const nodes = [
+    { innerText: "ngan", hidden: false },
+    { innerText: "z".repeat(40), hidden: true },
+    { innerText: "a".repeat(40), hidden: false },
+    { innerText: "b".repeat(40), hidden: false },
+  ];
+  const fns = loadFns(["chatMessageStats"], {
+    document: { querySelectorAll: () => nodes },
+    visible: (el) => !el.hidden,
+  });
+  if (!fns) return t.skip("chatMessageStats chua co trong bridge.js");
+  const st = fns.chatMessageStats();
+  assert.equal(st.n, 2);
+  assert.ok(st.last.startsWith("b"));
+});
+
+test("sendDiag: gom trace + card + bubble + tempDom", (t) => {
+  const job = {
+    _composerEl: {},
+    _sendTrace: {
+      clicks: 2, enters: 1, firstClickAt: 120, emptyAt: 900,
+      samples: ["0:25000", "1000:0"], atClick: [25000, 0],
+    },
+  };
+  const fns = loadFns(["sendDiag"], {
+    pageDiag: () => "PD",
+    findActiveAttachmentElements: () => [1, 2],
+    chatMessageStats: () => ({ n: 0, last: "" }),
+    temporaryEvidence: () => ({ dom: false }),
+  });
+  if (!fns) return t.skip("sendDiag chua co trong bridge.js");
+  const out = fns.sendDiag(job, null);
+  assert.match(out, /PD/);
+  assert.match(out, /clicks=2 enters=1/);
+  assert.match(out, /firstClick=\+120ms/);
+  assert.match(out, /emptyAt=\+900ms/);
+  assert.match(out, /composerLens=\[0:25000,1000:0\]/);
+  assert.match(out, /lenAtClick=\[25000,0\]/);
+  assert.match(out, /cards=2/);
+  assert.match(out, /chatMsgs=0/);
+  assert.match(out, /tempDom=false/);
+});
+
+function sendPromptEnv(opts = {}) {
+  const state = { now: 1000, text: "hello", btn: true, clicks: 0, learned: [] };
+  const job = Object.assign({
+    id: "j1", prompt: opts.prompt || "hello", attached: false, settled: false,
+  }, opts.job || {});
+  const ctx = {
+    INLINE_STALL_MIN_CHARS: 20000,
+    INLINE_STALL_GRACE_MS: 8000,
+    attachmentPrompt: "AP",
+    ATTACHMENT_COMPANION_PROMPT: "COMP",
+    Date: { now: () => state.now },
+    sleep: async (ms) => { state.now += ms; },
+    jobAlive: async () => true,
+    findSendButton: () => (state.btn ? {
+      click: () => { state.clicks++; if (opts.onClick) opts.onClick(state, job); },
+    } : null),
+    findStopButton: () => null,
+    composerText: () => state.text,
+    setComposerClean: (_c, t) => { state.text = t; },
+    findActiveAttachmentElements: () => [],
+    pressEnter: () => {},
+    saveJobState: () => {},
+    send: () => {},
+    log: () => {},
+    learnInlineLimit: (n) => { state.learned.push(n); },
+    pageDiag: () => "PD",
+    chatMessageStats: () => ({ n: 0, last: "" }),
+    temporaryEvidence: () => ({ dom: false }),
+  };
+  return { fns: loadFns(["inlineStallWatch", "sendDiag", "sendPrompt"], ctx), state, job };
+}
+
+test("sendPrompt: inline lon + composer rong/nut Send mat -> hoc nguong + throw som + diag", async (t) => {
+  const env = sendPromptEnv({
+    prompt: "x".repeat(25000),
+    onClick: (st) => { st.text = ""; st.btn = false; },
+  });
+  if (!env.fns) return t.skip("sendPrompt/inlineStallWatch chua co trong bridge.js");
+  await assert.rejects(() => env.fns.sendPrompt({}, 60000, null, env.job), /attach file/);
+  assert.deepEqual(env.state.learned, [25000]);
+  assert.ok(env.state.now - 1000 < 20000, "phai fail trong ~8-10s, khong cho het 60s");
+  const tr = env.job._sendTrace;
+  assert.ok(tr && tr.atClick.length >= 1, "phai ghi lai len luc click");
+  assert.equal(tr.atClick[0], 5, "len truoc click phai la text cu");
+  assert.ok(tr.emptyAt >= 0, "phai ghi thoi diem composer rong");
+});
+
+test("sendPrompt: inline lon + nut Send bien mat (text con) -> throw som", async (t) => {
+  const env = sendPromptEnv({
+    prompt: "x".repeat(25000),
+    onClick: (st) => { st.btn = false; },
+  });
+  if (!env.fns) return t.skip("sendPrompt/inlineStallWatch chua co trong bridge.js");
+  await assert.rejects(() => env.fns.sendPrompt({}, 60000, null, env.job), /attach file/);
+  assert.deepEqual(env.state.learned, [25000]);
+});
+
+test("sendPrompt: continue session KHONG stall-fallback (retry co the nhan doi delta)", async (t) => {
+  const env = sendPromptEnv({
+    prompt: "x".repeat(25000),
+    job: { session: { mode: "continue" } },
+    onClick: (st) => { st.text = ""; },
+  });
+  if (!env.fns) return t.skip("sendPrompt/inlineStallWatch chua co trong bridge.js");
+  assert.equal(await env.fns.sendPrompt({}, 60000, null, env.job), true);  // hanh vi cu
+  assert.deepEqual(env.state.learned, []);
+});
+
+test("sendPrompt: prompt nho khong stall-fallback", async (t) => {
+  const env = sendPromptEnv({ prompt: "hello", onClick: (st) => { st.text = ""; } });
+  if (!env.fns) return t.skip("sendPrompt/inlineStallWatch chua co trong bridge.js");
+  assert.equal(await env.fns.sendPrompt({}, 60000, null, env.job), true);
+  assert.deepEqual(env.state.learned, []);
+});
+
+// -------------------------------------------------- stopGenerationOnCancel ----
+function stopEnv(opts = {}) {
+  const state = { clicks: 0, sleeps: 0, logs: [] };
+  const btn = { click: () => { state.clicks++; if (!opts.sticky) state.visible = false; } };
+  state.visible = opts.visible !== false;
+  state.appearAfter = opts.appearAfter || 0;   // so lan sleep truoc khi nut Stop hien
+  const ctx = {
+    findStopButton: () => ((state.visible && state.sleeps >= state.appearAfter) ? btn : null),
+    sleep: async () => { state.sleeps++; },
+    log: (m) => { state.logs.push(m); },
+  };
+  return { fns: loadFns(["stopGenerationOnCancel"], ctx), state };
+}
+
+test("stopGenerationOnCancel: job huy + da attached + dang generate -> bam Stop", async (t) => {
+  const { fns, state } = stopEnv();
+  if (!fns) return t.skip("stopGenerationOnCancel chua co trong bridge.js");
+  assert.equal(await fns.stopGenerationOnCancel({ cancelled: true, attached: true }), true);
+  assert.equal(state.clicks, 1);
+  assert.match(state.logs[0], /bam Stop/);
+});
+
+test("stopGenerationOnCancel: khong huy / chua gui request / khong co job -> khong bam", async (t) => {
+  const { fns, state } = stopEnv();
+  if (!fns) return t.skip("stopGenerationOnCancel chua co trong bridge.js");
+  assert.equal(await fns.stopGenerationOnCancel({ cancelled: false, attached: true }), false);
+  assert.equal(await fns.stopGenerationOnCancel({ cancelled: true, attached: false }), false);
+  assert.equal(await fns.stopGenerationOnCancel(null), false);
+  assert.equal(state.clicks, 0);
+});
+
+test("stopGenerationOnCancel: nut Stop hien cham -> doi toi ~1.5s roi bam", async (t) => {
+  const { fns, state } = stopEnv({ appearAfter: 3 });
+  if (!fns) return t.skip("stopGenerationOnCancel chua co trong bridge.js");
+  assert.equal(await fns.stopGenerationOnCancel({ cancelled: true, attached: true }), true);
+  assert.equal(state.clicks, 1);
+});
+
+test("stopGenerationOnCancel: Qwen da dung san (khong co nut Stop) -> khong bam, false", async (t) => {
+  const { fns, state } = stopEnv({ visible: false });
+  if (!fns) return t.skip("stopGenerationOnCancel chua co trong bridge.js");
+  assert.equal(await fns.stopGenerationOnCancel({ cancelled: true, attached: true }), false);
+  assert.equal(state.clicks, 0);
+});
+
+test("stopGenerationOnCancel: nut Stop khong tat -> toi da 3 lan bam", async (t) => {
+  const { fns, state } = stopEnv({ sticky: true });
+  if (!fns) return t.skip("stopGenerationOnCancel chua co trong bridge.js");
+  await fns.stopGenerationOnCancel({ cancelled: true, attached: true });
+  assert.equal(state.clicks, 3);
+});
