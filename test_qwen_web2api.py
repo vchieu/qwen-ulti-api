@@ -1922,7 +1922,7 @@ class TestServerLargePromptLog(_Sandbox):
                     pass
 
     def test_prepare_large_prompt_no_log_when_under_limit(self):
-        """prepare_large_prompt không log gì khi prompt ngắn."""
+        """Prompt ngan: dung 1 dong inline check -> inline, khong log attach/split."""
         logged = []
         with mock.patch("qwen_web2api.server.log",
                         side_effect=lambda m: logged.append(m)), \
@@ -1932,7 +1932,10 @@ class TestServerLargePromptLog(_Sandbox):
                 {"role": "user", "content": "short"}
             ])
         self.assertIsNone(fi)
-        self.assertEqual(logged, [])
+        self.assertEqual(len(logged), 1, logged)
+        self.assertIn("inline check: full_prompt=5 ", logged[0])
+        self.assertIn("-> inline", logged[0])
+        self.assertFalse(any("[attach]" in s for s in logged), logged)
 
 
 # ------------------------------------------- temporary chat reload (config) ----
@@ -3016,6 +3019,75 @@ class TestInlineLimitReporting(_Sandbox):
         self._post("/event", {"kind": "ping", "inline_limit": 0})
         self._post("/event", {"kind": "ping", "inline_limit": "abc"})
         self.assertEqual(bridge.learned_inline_limit(), 30000)
+
+
+class TestPageReadyMode(_Sandbox):
+    """page_ready_mode (che do doi hydrate) + event kind="probe" cua extension."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.srv = bridge._Server(("127.0.0.1", 0), bridge._Handler)
+        cls.port = cls.srv.server_address[1]
+        cls.thread = threading.Thread(target=cls.srv.serve_forever, daemon=True)
+        cls.thread.start()
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.srv.shutdown()
+        cls.srv.server_close()
+        cls.thread.join(2)
+
+    def _post(self, path, payload):
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            c.request("POST", path, json.dumps(payload),
+                      {"Content-Type": "application/json",
+                       "Origin": "chrome-extension://x"})
+            r = c.getresponse()
+            return r.status, json.loads(r.read() or b"{}")
+        finally:
+            c.close()
+
+    def test_default_is_full_and_exposed(self):
+        self.assertEqual(DEFAULT_CONFIG["page_ready_mode"], "full")
+        self.assertEqual(bridge.page_ready_mode(), "full")
+        self.assertEqual(bridge.status()["page_ready_mode"], "full")
+
+    def test_modes_normalised(self):
+        for raw, want in (("full", "full"), ("SLEEP_ONLY", "sleep_only"),
+                          (" off ", "off"), ("", "full"), (None, "full"),
+                          ("bogus", "full"), (5, "full"), ([], "full")):
+            CONFIG["page_ready_mode"] = raw
+            self.assertEqual(bridge.page_ready_mode(), want, repr(raw))
+            self.assertEqual(bridge.status()["page_ready_mode"], want, repr(raw))
+
+    def test_status_endpoint_carries_mode(self):
+        CONFIG["page_ready_mode"] = "sleep_only"
+        c = http.client.HTTPConnection("127.0.0.1", self.port, timeout=5)
+        try:
+            c.request("GET", "/status")
+            r = c.getresponse()
+            self.assertEqual(r.status, 200)
+            self.assertEqual(json.loads(r.read())["page_ready_mode"], "sleep_only")
+        finally:
+            c.close()
+
+    def test_probe_event_logged_with_probe_label(self):
+        logged = []
+        with mock.patch.object(bridge, "_log", side_effect=logged.append):
+            st, _d = self._post("/event", {"job_id": "none", "kind": "probe",
+                                           "message": "hydration probe: {}",
+                                           "probe": {"composer": 200}})
+        self.assertEqual(st, 200)
+        self.assertTrue(any(s.startswith("extension probe:") for s in logged), logged)
+
+    def test_warn_label_unchanged_and_ping_still_silent(self):
+        logged = []
+        with mock.patch.object(bridge, "_log", side_effect=logged.append):
+            self._post("/event", {"job_id": "none", "kind": "warn", "message": "w"})
+            self._post("/event", {"job_id": "none", "kind": "ping"})
+        self.assertEqual([s for s in logged if s.startswith("extension ")],
+                         ["extension warn: w"])
 
 
 if __name__ == "__main__":

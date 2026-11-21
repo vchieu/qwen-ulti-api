@@ -296,6 +296,11 @@ def prepare_large_prompt(messages, tools=None, tool_choice=None):
         raise QwenError(f"prompt too large: {len(full_prompt)} chars > "
                         f"prompt_hard_max_chars={hard}", status=413)
     thr = _inline_max_chars()
+    debug_log(f"inline check: full_prompt={len(full_prompt)} thr={thr} "
+              f"(config={CONFIG.get('inline_prompt_max_chars')}, "
+              f"learned={bridge.learned_inline_limit()}, "
+              f"use_learned={bool(CONFIG.get('inline_prompt_use_learned', True))}) "
+              f"-> {'file' if len(full_prompt) > thr else 'inline'}")
     if len(full_prompt) <= thr:
         return None, messages
     _cleanup_old_temp_files()

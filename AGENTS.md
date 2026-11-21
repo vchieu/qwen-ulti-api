@@ -349,3 +349,31 @@ Companion khi prompt nằm trong file, theo thứ tự ưu tiên:
 `_file_companion` ưu tiên nó hơn config. Extension `maybeInlineToFile(job)` dựng `file_info`
 có `bytes`/`sha256` (`fingerprintText`) để guard `size` của `bridge_attachment_block` hoạt động
 cả trên đường extension tự chuyển; debug in `companion=python|session|config`.
+
+## Đo hydrate & A/B `waitPageReady` (`page_ready_mode`)
+
+`page_ready_mode` (`full` mặc định | `sleep_only` | `off`, giá trị lạ → `full`) qua
+`/status.page_ready_mode`. `full` = hành vi cũ (đợi composer + temporary DOM, bounded
+`TEMP_DOM_WAIT_MS`=3s / `PAGE_READY_MAX_MS`=8s, rồi `sleep(1000)`); `sleep_only` = chỉ
+`sleep(1000)`; `off` = không đợi. Log `page ready: mode=… loop=Xms/N rounds sleep=Yms
+total=Zms` — **loop tách khỏi sleep**, đọc `loop` mới biết trang có trễ hydrate thật không.
+Sau `sleep(1000)` lấy mẫu lại DOM: `tempDom=…` là giá trị mới nhất (dùng cho warn), còn
+`(atLoop … tempDomAtLoop=…)` là giá trị lúc thoát vòng lặp — tránh warn nhầm khi hydrate
+xong đúng trong lúc sleep.
+
+Gate là `pageSent` (request completion đã đi — set trong hook fetch lẫn XHR), **không phải**
+`pageUsed`. Nhờ vậy attempt 2/3 sau khi job đầu fail vẫn được đợi. `pageDirty()` vẫn dùng
+`pageUsed`.
+
+`hydrationProbe()` chạy 1 lần mỗi load trang, read-only, không phụ thuộc job: lấy mẫu
+composer / picker / tempDom / React props mỗi `HYDRATION_PROBE_STEP_MS`=200ms trong
+`HYDRATION_PROBE_MS`=12s rồi gửi `/event` `{job_id:"none", kind:"probe", probe:{…}}` → log
+`extension probe: hydration probe …`. `-1` = không thấy trong cửa sổ đó. `reactProps` là tín
+hiệu hydrate thật hơn `tempDom`; **chưa xác nhận trên DOM thật** — đọc vài mẫu probe trước khi
+tin và trước khi thay điều kiện của `waitPageReady`.
+
+Cách A/B: `bridge_session_mode=false` + `temporary_chat=true` + `temporary_chat_reload=true`
+⇒ mỗi request là reload + job new = một ca hydrate. Bơm ~30 request prompt 40k–100k cho từng
+chế độ, đếm stall bằng `composerAfter=0` / `composerLens=[0:N,1000:0]` / thiếu dòng
+`completion request`. Chỉ dọn `waitPageReady` khi `off` không stall **và** probe cho thấy
+composer/tempDom/reactProps đều sẵn ở t≈0.

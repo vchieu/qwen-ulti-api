@@ -312,3 +312,30 @@ Ngưỡng mới có tác dụng từ **request kế tiếp**. Trong log này 2/3
 Test: `TestNewPlanAttachPrompt` + `TestNewPlanAttachPromptHttp` (test_session.py),
 `TestLearnedInlineLimit` + `TestInlineLimitReporting` (test_qwen_web2api.py),
 6 test Node (`adoptInlineLimit`, `learnInlineLimit`, `maybeInlineToFile` ×3, guard size).
+
+Đo được hydrate + A/B được `waitPageReady` (không đổi hành vi mặc định)
+
+Vấn đề: log `page ready: ... after Xms` gộp cả vòng đợi và `sleep(1000)` cố định nên không
+trả lời được "vòng đợi có thực sự phải chờ không". Log `server-20261120-231423-14420.log` có
+2 lần gọi: job `dc010a1f` (tab mở sẵn) `after 1015ms` ⇒ loop ~15ms; job `4233de7a` (ngay sau
+tab reload 23:19:20) `after 2916ms` ⇒ loop ~1916ms, thoát do điều kiện đúng chứ không phải
+timeout (`1916 < TEMP_DOM_WAIT_MS`). Tức hydrate trễ thật ~1.9s, nhưng chỉ 1 mẫu, và cả log
+chỉ có 2 lần gọi vì `waitPageReady` bị chặn bởi `pageUsed` + chỉ chạy ở nhánh new/legacy.
+
+Thêm (mặc định giữ nguyên hành vi):
+- `hydrationProbe()`: mỗi lần load trang lấy mẫu composer / model picker / temporary DOM /
+  React props (`__reactProps$…` trên node composer) mỗi 200ms trong 12s, gửi 1 event
+  `kind:"probe", job_id:"none"` kèm object `probe`. Read-only, không phụ thuộc job → đo được
+  phân bố hydrate kể cả khi không có request nào tới sớm.
+- `waitPageReady` log tách `loop=Xms/N rounds sleep=Yms total=Zms`.
+- `page_ready_mode` = `full` (mặc định) | `sleep_only` (hành vi cũ trước session_patch3) |
+  `off`; qua `/status`, giá trị lạ → `full`. Dùng để A/B: tắt `bridge_session_mode` +
+  `temporary_chat` + `temporary_chat_reload` ⇒ mỗi request = reload + job new = một ca hydrate.
+- Gate đổi từ `pageUsed` sang `pageSent` (set khi request completion thật sự đi, cả fetch lẫn
+  XHR). Trước đây job đầu fail vì chưa hydrate thì attempt 2/3 trên cùng trang không được đợi
+  nữa — đúng lúc cần nhất lại tắt. `pageDirty()`/`tryNewChat` vẫn dùng `pageUsed` như cũ.
+- `/event` orphan: `kind:"probe"` ghi nhãn `extension probe:` (trước mọi kind ≠ ping đều là
+  `extension warn:`); `ping` vẫn im lặng.
+
+Test: `TestPageReadyMode` (Python) + 4 test `waitPageReady` mới (3 chế độ, gate pageSent,
+log tách) + 3 test `hydrationProbe`; `pageReadyEnv` cập nhật theo ctx mới.

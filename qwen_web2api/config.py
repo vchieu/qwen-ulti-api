@@ -40,6 +40,12 @@ DEFAULT_CONFIG = {
     # Temporary chat khong co New Chat: reload /?temporary-chat=true truoc
     # job khi trang da co tin nhan de tranh lan context. false = chi canh bao.
     "temporary_chat_reload": True,
+    # Che do doi hydrate truoc job new/legacy (extension waitPageReady):
+    #   "full"       = doi composer + temporary DOM (bounded) + sleep 1s  [mac dinh]
+    #   "sleep_only" = chi sleep 1s (hanh vi cu truoc session_patch3)
+    #   "off"        = khong doi gi
+    # Dung de A/B do xem viec doi hydrate co that su can thiet; gia tri la -> "full".
+    "page_ready_mode": "full",
     # Khi tab dang hien captcha: cho nguoi dung giai (giay) thay vi reload/gui tiep.
     # 0 = tat.
     "captcha_wait_seconds": 300,

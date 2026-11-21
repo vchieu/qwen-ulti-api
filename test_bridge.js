@@ -646,7 +646,9 @@ function pageReadyEnv(opts = {}) {
   const ctx = {
     PAGE_READY_MAX_MS: 8000,
     TEMP_DOM_WAIT_MS: 3000,
-    pageUsed: !!opts.pageUsed,
+    // Gate moi: pageSent (request DA di). Giu opts.pageUsed lam alias cho test cu.
+    pageSent: !!(opts.pageSent || opts.pageUsed),
+    pageReadyMode: opts.mode || "full",
     selectModelEnabled: false,          // giong config that: bridge_select_model=false
     Date: { now: () => state.now },
     sleep: async (ms) => { state.now += ms; },
@@ -991,4 +993,112 @@ test("classifyRequestFiles: inline file co bytes -> guard size bat duoc lech", (
   const check = (size) => e.checkRequestFiles(job, e.collectRequestFiles(body([reqFile(size)])));
   assert.deepEqual(check(40000), []);
   assert.match(check(39000)[0], /THIEU/);
+});
+
+// ================= hydrate: che do A/B + gate pageSent + duong cong hydrate ========
+test("waitPageReady: mode=sleep_only -> chi sleep 1s, khong doi, khong warn", async (t) => {
+  const env = pageReadyEnv({ dom: false, mode: "sleep_only" });
+  if (!env.fns) return t.skip("waitPageReady chua co trong bridge.js");
+  await env.fns.waitPageReady({ id: "j" });
+  assert.equal(env.state.now - 1000, 1000);
+  assert.deepEqual(env.state.warns, []);
+  assert.match(env.state.sent[0].message, /mode=sleep_only/);
+  assert.match(env.state.sent[0].message, /loop=0ms\/1 rounds/);
+});
+
+test("waitPageReady: mode=off -> khong doi, khong sleep", async (t) => {
+  const env = pageReadyEnv({ dom: false, mode: "off" });
+  if (!env.fns) return t.skip("waitPageReady chua co trong bridge.js");
+  await env.fns.waitPageReady({ id: "j" });
+  assert.equal(env.state.now, 1000);
+  assert.deepEqual(env.state.warns, []);
+  assert.match(env.state.sent[0].message, /mode=off/);
+});
+
+test("waitPageReady: gate theo pageSent chu khong pageUsed (retry van duoc doi)", async (t) => {
+  const chua = pageReadyEnv({ dom: false, pageSent: false });
+  const roi = pageReadyEnv({ dom: false, pageSent: true });
+  if (!chua.fns || !roi.fns) return t.skip("waitPageReady chua co trong bridge.js");
+  await chua.fns.waitPageReady({ id: "j" });
+  await roi.fns.waitPageReady({ id: "j" });
+  assert.ok(chua.state.now - 1000 >= 3000, "chua gui request -> van phai doi");
+  assert.equal(roi.state.now, 1000, "da gui request -> bo qua");
+  assert.deepEqual(roi.state.sent, []);
+});
+
+test("waitPageReady: log tach loop/sleep/rounds", async (t) => {
+  const env = pageReadyEnv({ domAt: 2000 });
+  if (!env.fns) return t.skip("waitPageReady chua co trong bridge.js");
+  await env.fns.waitPageReady({ id: "j" });
+  const m = env.state.sent[0].message;
+  // domAt=2000, sleep(300): thay dom o lan kiem tra now=2200 -> loop=1200ms, 5 rounds.
+  assert.match(m, /loop=1200ms\/\d+ rounds/);
+  assert.match(m, /sleep=1000ms/);
+  assert.match(m, /total=2200ms/);
+});
+
+function hydrationProbeEnv(opts = {}) {
+  const state = { now: 5000, posted: [] };
+  const el = { "__reactProps$x": {} };
+  const ctx = {
+    HYDRATION_PROBE_MS: 1000,
+    HYDRATION_PROBE_STEP_MS: 200,
+    Date: { now: () => state.now },
+    sleep: async (ms) => { state.now += ms; },
+    location: { pathname: "/c/local" },
+    findComposers: () => {
+      if (opts.boom) throw new Error("DOM chet");
+      return (opts.composerAt != null && state.now >= opts.composerAt) ? [el] : [];
+    },
+    findModelTrigger: () => (opts.pickerAt != null && state.now >= opts.pickerAt ? {} : null),
+    temporaryEvidence: () => ({ dom: opts.domAt != null && state.now >= opts.domAt }),
+    post: (p, b) => { state.posted.push([p, b]); return Promise.resolve({}); },
+  };
+  return { fns: loadFns(["hydrationProbe"], ctx), state };
+}
+
+test("hydrationProbe: ghi moc thoi gian tung tin hieu, gui 1 event probe", async (t) => {
+  const env = hydrationProbeEnv({ composerAt: 5200, domAt: 5600 });
+  if (!env.fns) return t.skip("hydrationProbe chua co trong bridge.js");
+  await env.fns.hydrationProbe();
+  assert.equal(env.state.posted.length, 1);
+  const [path, body] = env.state.posted[0];
+  assert.equal(path, "/event");
+  assert.equal(body.kind, "probe");
+  assert.equal(body.job_id, "none");
+  assert.deepEqual(body.probe, { composer: 200, picker: -1, tempDom: 600, reactProps: 200 });
+});
+
+test("hydrationProbe: khong thay gi -> -1 van gui; DOM nem loi -> khong crash", async (t) => {
+  const empty = hydrationProbeEnv();
+  const boom = hydrationProbeEnv({ boom: true });
+  if (!empty.fns || !boom.fns) return t.skip("hydrationProbe chua co trong bridge.js");
+  await empty.fns.hydrationProbe();
+  await boom.fns.hydrationProbe();
+  assert.deepEqual(empty.state.posted[0][1].probe,
+    { composer: -1, picker: -1, tempDom: -1, reactProps: -1 });
+  assert.equal(boom.state.posted.length, 1);
+});
+
+test("hydrationProbe: tham so ms rut ngan cua so do", async (t) => {
+  const env = hydrationProbeEnv({ domAt: 5400 });
+  if (!env.fns) return t.skip("hydrationProbe chua co trong bridge.js");
+  await env.fns.hydrationProbe(400);
+  assert.deepEqual(env.state.posted[0][1].probe,
+    { composer: -1, picker: -1, tempDom: 400, reactProps: -1 });
+});
+
+test("waitPageReady: tempDom chi xong TRONG luc sleep -> lay mau lai, khong warn nham", async (t) => {
+  // domAt phai nam trong (4000, 5000]: vong loop break vi timeout o now=4000 (elapsed 3000),
+  // trong luc sleep(1000) dong ho chay tiep den 5000 -> tempDom bat dau true.
+  // (domAt=3500 se co dom=true ngay tu now=3700, break som 2700ms -> khong test duoc truong hop.)
+  const env = pageReadyEnv({ domAt: 4500 });
+  if (!env.fns) return t.skip("waitPageReady chua co trong bridge.js");
+  await env.fns.waitPageReady({ id: "j" });
+  const m = env.state.sent[0].message;
+  assert.match(m, /tempDom=true/);          // sau sleep: da hydrate
+  assert.match(m, /tempDomAtLoop=false/);   // truoc sleep: chua
+  assert.deepEqual(env.state.warns, []);    // khong warn nham nua
+  assert.match(m, /loop=3000ms\/\d+ rounds/);
+  assert.match(m, /total=4000ms/);
 });

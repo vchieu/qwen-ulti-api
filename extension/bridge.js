@@ -212,6 +212,8 @@
   const INLINE_STALL_GRACE_MS = 8000;    // composer rong / nut Send bien mat qua lau -> fallback file
   const TEMP_DOM_WAIT_MS = 3000;         // doi them temporary DOM (bounded) khi trang vua reload
   const PAGE_READY_MAX_MS = 8000;
+  const HYDRATION_PROBE_MS = 12000;      // cua so do hydrate moi lan load trang
+  const HYDRATION_PROBE_STEP_MS = 200;   // buoc lay mau cua hydrationProbe
   let inlineMaxChars = Infinity;    // hoc duoc: prompt inline >= nguong nay di duong attach file
   try {
     const savedLimit = Number(sessionStorage.getItem(INLINE_LIMIT_KEY));
@@ -333,38 +335,88 @@
 
   // Lan dau tren moi lan load trang (nhat la ngay sau reload): DOM chua hydrate nen
   // model picker/composer chua san sang -> doi truoc khi chon model va dien prompt.
+  // Che do doi hydrate = config page_ready_mode ("full" | "sleep_only" | "off").
+  // Gate theo pageSent (request completion DA di) thay vi pageUsed (chi moi tim thay
+  // composer): job dau fail VI chua hydrate thi attempt 2/3 tren cung trang van duoc doi.
+  // Log tach loop/sleep/rounds de do chi phi that cua viec doi (A/B voi sleep_only/off).
   async function waitPageReady(job) {
-    if (pageUsed) return;
+    if (pageSent) return;
+    if (pageReadyMode === "off") {
+      if (job) send(job.id, { kind: "debug", message: "page ready: mode=off (khong doi hydrate)" });
+      return;
+    }
     const t0 = Date.now();
     const targets = modelTargets(job && job.model);
     const wantTemp = isTemporaryPage(false);
-    let picker = false, composer = false, tempDom = false;
-    /* Cu: `selectModelEnabled === false || findModelTrigger(...)` -> khi bridge_select_model
-       = false vong lap break NGAY, khong kiem tra gi, chi sleep 1s. Log that: 2 job fail co
-       temporary evidence dom=false (trang chua hydrate) van duoc coi la "ready", composer
-       nhan text roi bi xoa ma khong co completion request. Gio doi composer + temporary DOM
-       (bounded boi TEMP_DOM_WAIT_MS) bat ke select_model, va warn neu van chua hydrate. */
-    while (Date.now() - t0 < PAGE_READY_MAX_MS) {
+    let picker = false, composer = false, tempDom = false, rounds = 0;
+    do {
+      rounds++;
       picker = !!findModelTrigger(targets);
       composer = findComposers().length > 0;
       tempDom = !wantTemp || !!temporaryEvidence().dom;
+      if (pageReadyMode !== "full") break;        // sleep_only: hanh vi cu, lay mau 1 lan
       if (composer && (picker || selectModelEnabled === false)
           && (tempDom || Date.now() - t0 >= TEMP_DOM_WAIT_MS)) break;
       await sleep(300);
-    }
+    } while (Date.now() - t0 < PAGE_READY_MAX_MS);
+    const loopMs = Date.now() - t0;
+    const atLoop = { picker: picker, composer: composer, tempDom: tempDom };
+    const tSleep = Date.now();
     await sleep(1000);   // de app gan xong handler cho composer/paste
+    const sleepMs = Date.now() - tSleep;
+    // Lay mau LAI sau sleep. Log cu in gia tri cua vong loop cuoi (truoc sleep 1s) nen
+    // warn "CHUA hydrate" co the la false positive: log 00:18:41 in tempDom=false nhung
+    // evidence.dom=true doc ngay sau do -> DOM da xong TRONG luc sleep.
+    picker = !!findModelTrigger(targets);
+    composer = findComposers().length > 0;
+    tempDom = !wantTemp || !!temporaryEvidence().dom;
     if (job) send(job.id, { kind: "debug",
-      message: "page ready: modelPicker=" + picker + " composer=" + composer
-        + " tempDom=" + tempDom + " after " + (Date.now() - t0) + "ms" });
-    if (job && (!composer || !tempDom)) {
+      message: "page ready: mode=" + pageReadyMode + " modelPicker=" + picker
+        + " composer=" + composer + " tempDom=" + tempDom
+        + " (atLoop picker=" + atLoop.picker + " composer=" + atLoop.composer
+        + " tempDomAtLoop=" + atLoop.tempDom + ")"
+        + " loop=" + loopMs + "ms/" + rounds + " rounds sleep=" + sleepMs
+        + "ms total=" + (Date.now() - t0) + "ms" });
+    if (job && pageReadyMode === "full" && (!composer || !tempDom)) {
       fwd(job, "warn", "trang co the CHUA hydrate xong khi dien prompt (composer=" + composer
         + " tempDom=" + tempDom + " wantTemp=" + wantTemp
         + " evidence=" + JSON.stringify(temporaryEvidence()) + ")");
     }
   }
 
+  // Do DUONG CONG hydrate that cua trang, KHONG phu thuoc job: chi doc DOM, khong sua gi.
+  // Chay 1 lan moi load trang, gui 1 event tong ket (kind="probe", job_id="none").
+  // -1 = khong thay trong cua so do. reactProps = React da gan props vao composer chua
+  // (tin hieu hydrate that, tot hon "co phan tu temporary trong DOM").
+  async function hydrationProbe(ms) {
+    const total = Number(ms) > 0 ? Number(ms) : HYDRATION_PROBE_MS;
+    const t0 = Date.now();
+    const at = { composer: -1, picker: -1, tempDom: -1, reactProps: -1 };
+    for (;;) {
+      const now = Date.now() - t0;
+      try {
+        const el = findComposers()[0];
+        if (at.composer < 0 && el) at.composer = now;
+        if (at.picker < 0 && findModelTrigger([])) at.picker = now;
+        if (at.tempDom < 0 && temporaryEvidence().dom) at.tempDom = now;
+        if (at.reactProps < 0 && el && Object.keys(el).some(
+          (k) => k.indexOf("__reactProps$") === 0)) at.reactProps = now;
+      } catch (e) { /* best-effort: probe khong duoc lam hong gi */ }
+      if (now >= total) break;
+      await sleep(HYDRATION_PROBE_STEP_MS);
+    }
+    try {
+      await post("/event", { job_id: "none", kind: "probe", probe: at,
+        message: "hydration probe (ms ke tu luc content script chay): " + JSON.stringify(at)
+          + " window=" + total + "ms path=" + location.pathname });
+    } catch (e) { /* best-effort */ }
+  }
+
   let temporaryReloadEnabled = true;  // config temporary_chat_reload (qua /status)
+  let pageReadyMode = "full";         // config page_ready_mode: full | sleep_only | off
   let pageUsed = false;               // trang nay da gui >= 1 prompt => co tin nhan cu
+  let pageSent = false;               // request completion DA di tren trang nay
+                                      // (gate waitPageReady; khac pageUsed = moi thay composer)
   let freshByBridge = false;          // trang vua duoc bridge chu dong reload => sach
   try {
     const rawTs = sessionStorage.getItem(FRESH_RELOAD_KEY);
@@ -635,6 +687,7 @@
     if (st && typeof st.debug === "boolean") {
       debugEnabled = st.debug;
     }
+    if (st && typeof st.page_ready_mode === "string") pageReadyMode = st.page_ready_mode;
     if (st) adoptInlineLimit(st.inline_limit);
     if (st && typeof st.temporary_reload === "boolean") {
       temporaryReloadEnabled = st.temporary_reload;
@@ -2086,6 +2139,7 @@
       if (jobRef && isCompletion && !jobRef.attached && !jobRef.settled
           && current === jobRef) {
         jobRef.attached = true;
+        pageSent = true;
         if (typeof jobRef._clearSendTimer === "function") jobRef._clearSendTimer();
         const clone = resp.clone();
         pumpFetch(jobRef, clone).catch((e) => settle(jobRef, e));
@@ -2136,6 +2190,7 @@
           + "): khong guard/doi chieu duoc attachment");
       }
       job.attached = true;
+      pageSent = true;
       if (typeof job._clearSendTimer === "function") job._clearSendTimer();
       /* send timer DA bi clear o tren, nen neu
          khong xu ly error/abort/timeout thi job treo vinh vien -> active
@@ -3259,5 +3314,6 @@
     console.log("last raw thinking deltas:", lastRawDeltas);
   };
 
+  hydrationProbe().catch(() => {});
   loop();
 })();

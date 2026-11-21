@@ -290,6 +290,17 @@ def _attachment_block():
     return [k for k in kinds if k in _ATTACH_BLOCK_KINDS]
 
 
+_PAGE_READY_MODES = ("full", "sleep_only", "off")
+
+
+def page_ready_mode():
+    """Che do doi hydrate cua extension (waitPageReady): "full" (doi composer + temporary
+    DOM + sleep), "sleep_only" (chi sleep 1s, hanh vi cu), "off" (khong doi gi).
+    Gia tri la -> "full": go sai config khong duoc vo tinh tat lop bao ve."""
+    v = str(CONFIG.get("page_ready_mode", "full") or "").strip().lower()
+    return v if v in _PAGE_READY_MODES else "full"
+
+
 def status():
     with _lock:
         n = len(_jobs)
@@ -311,6 +322,7 @@ def status():
             # tool built-in cua Qwen (config qwen_builtin_tools).
             "builtin_tools": builtin_tools(),
             "temporary_reload": bool(CONFIG.get("temporary_chat_reload", True)),
+            "page_ready_mode": page_ready_mode(),
             "captcha_wait": _captcha_wait(),
             "attachment_prompt": str(CONFIG.get("attachment_prompt", "Please read the text and action")),
             "debug": qwen.is_debug(),
@@ -776,6 +788,7 @@ class _Handler(BaseHTTPRequestHandler):
             safe_keys = ("debug", "log_requests", "temporary_chat", "temporary-chat",
                          "bridge_select_model", "temporary_chat_reload", "captcha_wait_seconds", "default_model",
                          "bridge_select_mode", "bridge_force_request_model", "prompt_max_bytes",
+                         "page_ready_mode",
                          "file_prompt_max_chars", "inline_prompt_max_chars",
                          "inline_prompt_use_learned",
                          "retry_attempts",
@@ -915,7 +928,8 @@ class _Handler(BaseHTTPRequestHandler):
             if kind not in ("ping",):
                 msg = data.get("message") or ""
                 if jid in (None, "", "none"):
-                    _log(f"extension warn: {msg}")
+                    label = "probe" if kind == "probe" else "warn"
+                    _log(f"extension {label}: {msg}")
                 elif data.get("tab_reloaded") or data.get("tab_reloading"):
                     _log(f"extension warn: {msg}")
                 elif kind == "warn":

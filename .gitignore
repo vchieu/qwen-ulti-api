@@ -15,3 +15,4 @@ qwen-raw.log
 *.mhtml
 logs/
 *.xml
+*fix*
