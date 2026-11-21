@@ -1413,5 +1413,39 @@ class TestRequestShape(unittest.TestCase):
         self.assertIn("seq=? s", server._request_shape(["junk", {"role": "developer", "content": [{"text": "x"}]}], None, None))
 
 
+class TestReplayAdaptiveBudget(_Sandbox):
+    def _history(self):
+        msgs = [{"role": "system", "content": "S" * 5000}, {"role": "user", "content": "task"}]
+        for i in range(40):
+            msgs.append(asst_calls("c%d" % i))
+            msgs.append(tool("c%d" % i, "Read file f%d.py\n" % i + "x" * 9000))
+        msgs.append({"role": "user", "content": "next"})
+        return msgs
+
+    def test_adaptive_keeps_more_than_fixed_budget_but_fits_target(self):
+        from qwen_web2api import replay
+        from qwen_web2api.tools import messages_to_prompt
+        msgs = self._history()
+        CONFIG["session_max_chars"] = 400000          # target 200k
+        out_a, st_a = replay.compact_messages(msgs, TOOLS, "auto")
+        CONFIG["session_replay_adaptive"] = False
+        out_f, st_f = replay.compact_messages(msgs, TOOLS, "auto")
+        self.assertIsNotNone(st_a)
+        self.assertIsNotNone(st_f)
+        self.assertLessEqual(st_a["after"], st_a["target"])
+        self.assertGreater(st_a["after"], st_f["after"])     # giu nhieu hon muc co dinh
+        self.assertLess(st_a["tool_stubbed"], st_f["tool_stubbed"])
+        self.assertEqual(messages_to_prompt(msgs, TOOLS, "auto").count("x" * 9000), 40)
+
+    def test_target_ratio_config(self):
+        from qwen_web2api import replay
+        CONFIG["session_max_chars"] = 400000
+        CONFIG["session_replay_target_chars"] = 0
+        CONFIG["session_replay_target_ratio"] = 0.75
+        self.assertEqual(replay.target_chars(), 300000)
+        CONFIG["session_replay_target_ratio"] = 9          # ngoai khoang -> 0.5
+        self.assertEqual(replay.target_chars(), 200000)
+
+
 if __name__ == "__main__":
     unittest.main()

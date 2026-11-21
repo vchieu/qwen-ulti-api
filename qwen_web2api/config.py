@@ -154,6 +154,10 @@ DEFAULT_CONFIG = {
     # tao da het han -> vong lap new/reset). 0 = tu dong = 50% session_max_chars.
     "session_replay_compact": True,
     "session_replay_target_chars": 0,
+    # Ty le session_max_chars dung lam target khi session_replay_target_chars = 0.
+    "session_replay_target_ratio": 0.5,
+    # true: ngan sach tool/args tu co theo target (cat vua du); false: chi ngan sach co dinh.
+    "session_replay_adaptive": True,
     # Ngan sach (ky tu) cho tool result CU / arguments tool_call assistant CU sau khi thu gon;
     # vuot -> tool result thay bang stub (giu dong dau), arguments chi elide chuoi lon.
     "session_replay_tool_budget": 40000,

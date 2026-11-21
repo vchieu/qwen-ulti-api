@@ -50,7 +50,19 @@ def target_chars():
     if t > 0:
         return t
     mc = _num("session_max_chars", 400000)
-    return mc // 2 if mc > 0 else 0
+    try:
+        ratio = float(CONFIG.get("session_replay_target_ratio", 0.5))
+    except (TypeError, ValueError):
+        ratio = 0.5
+    if not 0.05 <= ratio <= 1.0:
+        ratio = 0.5
+    return int(mc * ratio) if mc > 0 else 0
+
+
+def adaptive():
+    """true: ngan sach tool/args tu co theo target (chi cat den khi vua du), false: chi dung ngan
+    sach co dinh `session_replay_tool_budget`/`session_replay_args_budget`."""
+    return bool(CONFIG.get("session_replay_adaptive", True))
 
 
 # ------------------------------------------------------------------ helpers ----
@@ -252,12 +264,22 @@ def compact_messages(messages, tools=None, tool_choice=None):
     try:
         before = len(messages_to_prompt(messages, tools, tool_choice, max_bytes=_NO_LIMIT))
         if before <= target:
-            debug_log(f"[replay] compact bo qua: replay {before} chars <= target {target}")
+            debug_log(f"[replay] compact bo qua: replay {before} chars <= target {target} "
+                      f"(headroom={_num('session_max_chars', 400000) - before:.0f} chars toi "
+                      "session_max_chars)")
             return messages, None
         recent = max(0, _num("session_replay_recent_turns", 3))
         tb = max(0, _num("session_replay_tool_budget", 40000))
         ab = max(0, _num("session_replay_args_budget", 40000))
-        schedule = [(recent, tb, ab)]
+        # Thu tu tu LONG -> CHAT: muc adaptive (ngan sach theo target) truoc, roi ngan sach co
+        # dinh cu. Dung ngay o muc long nhat dat <= target nen khong cat qua tay.
+        schedule = []
+        if adaptive():
+            for frac in (0.6, 0.4, 0.25):
+                lt, la = int(target * frac * 0.7), int(target * frac * 0.3)
+                if lt > tb:
+                    schedule.append((recent, lt, max(la, ab)))
+        schedule.append((recent, tb, ab))
         for p in ((1, tb, ab), (0, tb, ab), (0, tb // 2, ab // 2), (0, 0, 0)):
             if p[0] <= recent and p not in schedule:
                 schedule.append(p)
@@ -281,7 +303,9 @@ def compact_messages(messages, tools=None, tool_choice=None):
             f"tool_stubbed={st['tool_stubbed']}/{st['tool_old']} (-{st['tool_saved']}) "
             f"args_elided={st['args_elided']} (-{st['args_saved']}) "
             f"recent_capped={st['recent_capped']} (-{st['recent_saved']}) "
-            f"params=recent={st['recent_turns']}/tool={st['tool_budget']}/args={st['args_budget']}"
+            f"params=recent={st['recent_turns']}/tool={st['tool_budget']}/args={st['args_budget']} "
+            f"level={len(tried)}/{len(schedule)} adaptive={adaptive()} "
+            f"headroom={_num('session_max_chars', 400000) - st['after']:.0f}"
             + ("" if st["after"] <= target else
                f" CANH BAO: van > target, da thu {len(tried)} muc: {'; '.join(tried)}"))
         for it in st["items"][:_MAX_DEBUG_ITEMS]:       # /debug chi giu 100 dong gan nhat

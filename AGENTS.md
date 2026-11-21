@@ -327,6 +327,10 @@ arguments sai kiểu thay vì biến thành `{}`. Chi tiết lịch sử ở `CH
   (`tail_turns`/`preserve_recent_tokens` của opencode) có thể là gần như TOÀN BỘ hội thoại nếu
   hội thoại ngắn, nên "gửi lên vẫn đủ history" có thể là hành vi của client, không phải proxy. Log
   `[session] request msgs=.. tools=.. sys=.. seq=..` cho biết đúng hình dạng từng request.
+- Replay thu gọn (`replay.py`): mặc định `session_replay_adaptive=true` thử ngân sách tool/args
+  theo `target` từ lỏng đến chặt (0.6/0.4/0.25 × target) rồi mới đến ngân sách cố định; dừng ở
+  mức lỏng nhất đạt ≤ target. `session_replay_target_ratio` (0.5) × `session_max_chars` = target.
+  Log `[replay] compact A -> B ... level=i/n headroom=H` (H = chỗ còn lại tới `session_max_chars`).
 - `extension/bridge.js` hardcode bridge port 8083.
 - DOM heuristics chưa có test UI thật: model picker, mode dropdown, captcha selector, nút Send.
   Qwen đổi layout → sửa `findModelTrigger` / `selectModel` / `findModeTrigger` / `captchaSignal`.

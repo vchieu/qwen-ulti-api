@@ -2557,6 +2557,23 @@
           + " ky tu) thanh document; se dung duong attach file o lan retry");
       }
     }
+    // Chuyen thanh document co the xay ra TRE (sau lan kiem tra 350ms o tren): Send bi khoa, composer
+    // rong, khong co completion request -> truoc day cho het 60s send-timeout (+ timeout Python)
+    // moi retry (log 16:44: 47k ky tu, composerAfter=47055 roi composer=0 sendBtn=false). Voi prompt
+    // dai thi doi them 1.5s kiem tra lai; rong -> hoc nguong + nem loi de retry ngay.
+    if (!(job && job.file_info) && String(prompt).length >= 20000) {
+      await sleep(1500);
+      const lateLen = composerText(composer).trim().length;
+      const lateNodes = findActiveAttachmentElements(composer).length;
+      if (job) send(job.id, { kind: "debug",
+        message: "inline late-check: len=" + String(prompt).length + " composer=" + lateLen
+          + " attachmentNodes=" + lateNodes + " sendBtn=" + !!findSendButton(composer) });
+      if (lateLen === 0 && !(job && (job.attached || job.settled))) {
+        learnInlineLimit(String(prompt).length);
+        throw new Error("Qwen UI doi prompt inline (" + String(prompt).length
+          + " ky tu) thanh document sau khi dien (late-check); retry ngay");
+      }
+    }
     // UI tu doi text dai vua nhap thanh attachment card va lam rong composer:
     if (!composerText(composer).trim()) {
       /* chi duoc dien companion khi CO file

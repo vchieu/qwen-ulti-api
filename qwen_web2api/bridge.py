@@ -823,7 +823,8 @@ class _Handler(BaseHTTPRequestHandler):
                          "session_task_anchor", "session_task_anchor_chars",
                          "session_replay_compact", "session_replay_target_chars",
                          "session_replay_tool_budget", "session_replay_args_budget",
-                         "session_replay_recent_turns", "session_replay_recent_cap")
+                         "session_replay_recent_turns", "session_replay_recent_cap",
+                         "session_replay_target_ratio", "session_replay_adaptive")
             cfg_snapshot = {k: CONFIG[k] for k in safe_keys if k in CONFIG}
             return self._json({
                 "config": cfg_snapshot,
