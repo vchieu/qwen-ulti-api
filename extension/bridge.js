@@ -17,7 +17,7 @@
   const SEND_TIMEOUT_MS = 90000;    // Timeout de dien UI va cho completion response bat dau
   const STREAM_IDLE_TIMEOUT_MS = 180000; // 3 phut khong co bat ky chunk nao moi coi la stream treo
   const COMPOSER_WAIT_MS = 15000;
-  const COMPOSER_WAIT_CHAT_MS = 150000;  // F3-D: continue/fork khong the reload -> cho lau hon
+  const COMPOSER_WAIT_CHAT_MS = 30000;   // F5-A: >30s ma khong co composer -> tab ket, can luot new  // F3-D: continue/fork khong the reload -> cho lau hon
   const NO_REQUEST_AFTER_CLICK_MS = 45000;  // F3-B: Send xong ma khong co completion request
   const MODEL_REFRESH_MS = 10 * 60 * 1000;
   const MODE_CHECK_MS = 5000;
@@ -3365,7 +3365,13 @@
       saveJobState(job, "model_selected", "Model " + job.model);
       send(job.id, { kind: "debug",
         message: "temporary evidence: " + JSON.stringify(temporaryEvidence()) });
-      const composer = await waitComposer(job, inChat ? COMPOSER_WAIT_CHAT_MS : COMPOSER_WAIT_MS);
+      let composer;
+      try {
+        composer = await waitComposer(job, inChat ? COMPOSER_WAIT_CHAT_MS : COMPOSER_WAIT_MS);
+      } catch (ce) {   // F5-A: khong retry cung chat ket; Python reset session -> luot sau la new
+        if (inChat && ce && !job.attached && !job.cancelled) ce.sessionLost = true;
+        throw ce;
+      }
       job._composerEl = composer;   // sendDiag dung khi send-timeout khong co composer trong scope
       saveJobState(job, "composer_ready", "Composer found");
       pageUsed = true;  // tu day trang nay co tin nhan
@@ -3416,8 +3422,12 @@
         let diag = "";
         try { diag = sendDiag(j, null) + " | " + pageDiagFull(j._composerEl || null); }
         catch (e) { /* diag */ }
-        settle(j, new Error("da bam Send nhung khong co completion request sau "
-          + Math.round(NO_REQUEST_AFTER_CLICK_MS / 1000) + "s | " + diag));
+        const nrErr = new Error("da bam Send nhung khong co completion request sau "
+          + Math.round(NO_REQUEST_AFTER_CLICK_MS / 1000) + "s | " + diag);
+        if (j.session && (j.session.mode === "continue" || j.session.mode === "fork")) {
+          nrErr.sessionLost = true;   // F5-B: chat ket, retry cung chat vo ich
+        }
+        settle(j, nrErr);
       }
     }
   }, 5000);
