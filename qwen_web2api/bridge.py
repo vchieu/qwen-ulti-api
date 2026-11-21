@@ -820,7 +820,10 @@ class _Handler(BaseHTTPRequestHandler):
                          "log_save_prompt_files", "attachment_usage_warn_ratio",
                          "bridge_session_mode", "session_max_chars", "session_max_turns",
                          "session_idle_ttl", "session_file_threshold", "session_fork",
-                         "session_task_anchor", "session_task_anchor_chars")
+                         "session_task_anchor", "session_task_anchor_chars",
+                         "session_replay_compact", "session_replay_target_chars",
+                         "session_replay_tool_budget", "session_replay_args_budget",
+                         "session_replay_recent_turns", "session_replay_recent_cap")
             cfg_snapshot = {k: CONFIG[k] for k in safe_keys if k in CONFIG}
             return self._json({
                 "config": cfg_snapshot,

@@ -22,7 +22,7 @@ import time
 import unittest
 from unittest import mock
 
-from qwen_web2api import bridge, models, qwen, server, tools
+from qwen_web2api import bridge, models, qwen, replay, server, tools
 from qwen_web2api.config import CONFIG, DEFAULT_CONFIG, find_config, load_config
 
 
@@ -2687,6 +2687,350 @@ class TestAttachDiagnostics(_Sandbox):
             _line, warns = bridge.attach_report(
                 self._fi(), {"input_tokens": 40000}, text, 0.05)
             self.assertEqual(warns, [], text)
+
+
+# ------------------------------- session: thu gon replay luot new (replay.py) ----
+_RP_TOOLS = [{"type": "function", "function": {
+    "name": "read", "description": "read",
+    "parameters": {"type": "object", "properties": {"filePath": {"type": "string"}}}}}]
+
+
+def _rp_call(cid, name, args):
+    return {"id": cid, "type": "function",
+            "function": {"name": name, "arguments": json.dumps(args)}}
+
+
+def _rp_history(rounds, write_len=20000, edit_len=1500, result_len=1500, read_len=3000,
+                edits=2, tail_user=True):
+    """system + user, roi `rounds` luot assistant (1 write lon + `edits` edit + 1 read) kem tool
+    result; tail_user=True ket thuc bang tin user (split duoc), False = ket thuc bang tool result."""
+    msgs = [{"role": "system", "content": "SYS"}, {"role": "user", "content": "do the task"}]
+    k = 0
+    for r in range(rounds):
+        calls, results = [], []
+        k += 1
+        calls.append(_rp_call(f"c{k}", "write", {"filePath": f"D:\\w{r}.js",
+                                                  "content": "W" * write_len}))
+        results.append((f"c{k}", "Wrote file successfully."))
+        for _ in range(edits):
+            k += 1
+            calls.append(_rp_call(f"c{k}", "edit", {"filePath": "D:\\e.js",
+                                                    "oldString": "O" * edit_len,
+                                                    "newString": "N" * edit_len}))
+            results.append((f"c{k}", "Could not find oldString in the file. " * (result_len // 37)))
+        k += 1
+        calls.append(_rp_call(f"c{k}", "read", {"filePath": "D:\\r.js"}))
+        results.append((f"c{k}", f"Read file D:\\r.js, lines {r}-{r + 99}\n" + "code\n" * (read_len // 5)))
+        msgs.append({"role": "assistant", "content": None, "tool_calls": calls})
+        for cid, text in results:
+            msgs.append({"role": "tool", "tool_call_id": cid, "content": text})
+    if tail_user:
+        msgs.append({"role": "user", "content": "now continue please"})
+    return msgs
+
+
+class TestReplayCompact(_Sandbox):
+    def setUp(self):
+        super().setUp()
+        CONFIG["session_max_chars"] = 400000
+        CONFIG["session_replay_compact"] = True
+        CONFIG["session_replay_target_chars"] = 0
+
+    def _render(self, msgs):
+        return len(tools.messages_to_prompt(msgs, _RP_TOOLS, "auto", max_bytes=1 << 40))
+
+    # -- cau hinh
+    def test_defaults_present(self):
+        for k in ("session_replay_compact", "session_replay_target_chars",
+                  "session_replay_tool_budget", "session_replay_args_budget",
+                  "session_replay_recent_turns", "session_replay_recent_cap",
+                  "session_replay_short_result", "session_replay_elide_min"):
+            self.assertIn(k, DEFAULT_CONFIG)
+
+    def test_target_is_half_of_session_max_chars_unless_overridden(self):
+        self.assertEqual(replay.target_chars(), 200000)
+        CONFIG["session_max_chars"] = 600000
+        self.assertEqual(replay.target_chars(), 300000)
+        CONFIG["session_replay_target_chars"] = 123456
+        self.assertEqual(replay.target_chars(), 123456)
+        CONFIG["session_replay_target_chars"] = 0
+        CONFIG["session_max_chars"] = 0          # khong gioi han session -> khong can thu gon
+        self.assertEqual(replay.target_chars(), 0)
+
+    def test_disabled_or_under_target_returns_same_list(self):
+        small = _rp_history(2)
+        out, st = replay.compact_messages(small, _RP_TOOLS, "auto")
+        self.assertIs(out, small)
+        self.assertIsNone(st)
+        big = _rp_history(30)
+        CONFIG["session_replay_compact"] = False
+        out, st = replay.compact_messages(big, _RP_TOOLS, "auto")
+        self.assertIs(out, big)
+        self.assertIsNone(st)
+
+    # -- hoi tu
+    def test_tool_result_only_does_not_converge_but_two_layers_do(self):
+        """Phan phinh nam o arguments cua assistant: chi thu gon tool result thi van vuot dich."""
+        msgs = _rp_history(30, write_len=20000, result_len=1500, read_len=3000)
+        self.assertGreater(self._render(msgs), 600000)
+        only_tools, _st = replay._compact_once(msgs, 3, 40000, 10 ** 9)   # args khong bi dong
+        self.assertGreater(self._render(only_tools), 200000)
+        out, st = replay.compact_messages(msgs, _RP_TOOLS, "auto")
+        self.assertIsNotNone(st)
+        self.assertLessEqual(self._render(out), 200000)
+        self.assertEqual(st["after"], self._render(out))
+        self.assertGreater(st["args_elided"], 0)
+        self.assertGreater(st["tool_stubbed"], 0)
+
+    def test_schedule_degrades_when_recent_zone_too_big(self):
+        msgs = _rp_history(12, write_len=60000, edit_len=3000, result_len=3000, read_len=40000)
+        first, _st = replay._compact_once(msgs, 3, 40000, 40000)
+        self.assertGreater(self._render(first), 200000)       # muc dau khong du
+        out, st = replay.compact_messages(msgs, _RP_TOOLS, "auto")
+        self.assertGreater(len(st["tried"]), 1)
+        self.assertLessEqual(st["after"], 200000)
+        self.assertLess(st["recent_turns"], 3)
+
+    def test_still_over_target_keeps_smallest_attempt(self):
+        msgs = _rp_history(10)
+        CONFIG["session_replay_target_chars"] = 5000       # khong the dat duoc
+        out, st = replay.compact_messages(msgs, _RP_TOOLS, "auto")
+        self.assertIsNotNone(st)
+        self.assertGreater(st["after"], 5000)
+        self.assertEqual(st["after"], min(int(t.rsplit("->", 1)[1]) for t in st["tried"]))
+
+    # -- bat bien: khong mutate, hash, id
+    def test_original_messages_not_mutated(self):
+        msgs = _rp_history(30)
+        snap = copy.deepcopy(msgs)
+        out, st = replay.compact_messages(msgs, _RP_TOOLS, "auto")
+        self.assertIsNotNone(st)
+        self.assertEqual(msgs, snap)
+        self.assertIsNot(out, msgs)
+        self.assertEqual(len(out), len(msgs))
+
+    def test_unchanged_messages_share_identity_and_ids_survive(self):
+        msgs = _rp_history(30)
+        out, _st = replay.compact_messages(msgs, _RP_TOOLS, "auto")
+        self.assertIs(out[0], msgs[0])
+        self.assertIs(out[1], msgs[1])
+        self.assertIs(out[-1], msgs[-1])
+        for a, b in zip(msgs, out):
+            self.assertEqual(a["role"], b["role"])
+            self.assertEqual(a.get("tool_call_id"), b.get("tool_call_id"))
+            self.assertEqual([(c["id"], c["function"]["name"]) for c in a.get("tool_calls") or []],
+                             [(c["id"], c["function"]["name"]) for c in b.get("tool_calls") or []])
+
+    # -- lop 1: tool result
+    def test_old_tool_result_stub_keeps_first_line(self):
+        msgs = _rp_history(30, read_len=30000)
+        out, _st = replay.compact_messages(msgs, _RP_TOOLS, "auto")
+        stubs = [m for m in out if m.get("role") == "tool" and "elided to save context" in m["content"]]
+        self.assertTrue(stubs)
+        reads = [m for m in stubs if m["content"].startswith("Read file D:\\r.js, lines ")]
+        self.assertTrue(reads, "stub phai giu dong dau 'Read file X, lines A-B'")
+        self.assertIn("chars of old tool output elided", reads[0]["content"])
+
+    def test_old_tool_budget_counts_short_results_too(self):
+        msgs = [{"role": "user", "content": "go"}]
+        for i in range(100):                          # 100 loi edit ~1.5K, nhu log that
+            msgs.append({"role": "assistant", "content": None,
+                         "tool_calls": [_rp_call(f"e{i}", "edit", {"filePath": "x"})]})
+            msgs.append({"role": "tool", "tool_call_id": f"e{i}",
+                         "content": f"{i} " + "Could not find oldString. " * 57})
+        out, st = replay._compact_once(msgs, 0, 40000, 40000)
+        kept = [m for m in out if m.get("role") == "tool"
+                and "elided to save context" not in m["content"]]
+        self.assertLessEqual(sum(len(m["content"]) for m in kept[:-1]), 40000)  # tru batch cuoi
+        self.assertGreater(st["tool_stubbed"], 50)
+        # uu tien moi nhat: tool result cuoi cung (batch cuoi) luon con nguyen
+        self.assertEqual(out[-1]["content"], msgs[-1]["content"])
+
+    def test_short_results_cannot_starve_large_read(self):
+        msgs = [{"role": "user", "content": "go"}]
+        # read lon (30K) o phia cu, sau do nhieu loi ngan moi hon
+        msgs.append({"role": "assistant", "content": None,
+                     "tool_calls": [_rp_call("rd", "read", {"filePath": "x"})]})
+        msgs.append({"role": "tool", "tool_call_id": "rd", "content": "Read file x\n" + "r" * 15000})
+        for i in range(60):
+            msgs.append({"role": "assistant", "content": None,
+                         "tool_calls": [_rp_call(f"e{i}", "edit", {"filePath": "x"})]})
+            msgs.append({"role": "tool", "tool_call_id": f"e{i}", "content": "E" * 1000})
+        out, _st = replay._compact_once(msgs, 0, 40000, 40000)
+        self.assertEqual(out[2]["content"], msgs[2]["content"])   # read 15K con nguyen
+
+    def test_recent_zone_kept_but_capped(self):
+        msgs = _rp_history(30, tail_user=False)
+        big = "R" * 52000
+        msgs.append({"role": "assistant", "content": None,
+                     "tool_calls": [_rp_call("z1", "read", {"filePath": "a"}),
+                                    _rp_call("z2", "read", {"filePath": "b"})]})
+        msgs.append({"role": "tool", "tool_call_id": "z1", "content": big})
+        msgs.append({"role": "tool", "tool_call_id": "z2", "content": "small result"})
+        out, _st = replay.compact_messages(msgs, _RP_TOOLS, "auto")
+        self.assertEqual(out[-1]["content"], "small result")
+        capped = out[-2]["content"]
+        self.assertLess(len(capped), 25000)
+        self.assertTrue(capped.startswith("R" * 100) and capped.endswith("R" * 100))
+        self.assertIn("chars elided in the middle", capped)
+
+    # -- lop 2: arguments assistant
+    def test_args_elide_big_strings_keep_path_and_valid_json(self):
+        msgs = _rp_history(30)
+        out, st = replay.compact_messages(msgs, _RP_TOOLS, "auto")
+        elided = []
+        for m in out:
+            for c in m.get("tool_calls") or []:
+                args = json.loads(c["function"]["arguments"])   # luon la JSON hop le
+                if any("[elided" in str(v) for v in args.values()):
+                    elided.append((c["function"]["name"], args))
+        self.assertTrue(elided)
+        for name, args in elided:
+            if name == "write":
+                self.assertTrue(args["filePath"].startswith("D:\\w"))   # giu path
+                self.assertRegex(args["content"], r"^\[elided \d+ chars\]$")
+            if name == "edit":
+                self.assertEqual(args["filePath"], "D:\\e.js")
+        self.assertGreater(st["args_saved"], 100000)
+
+    def test_args_recent_turns_untouched(self):
+        msgs = _rp_history(30)
+        out, st = replay.compact_messages(msgs, _RP_TOOLS, "auto")
+        r = st["recent_turns"]
+        tc_idx = [i for i, m in enumerate(msgs) if m.get("tool_calls")]
+        for i in tc_idx[-r:] if r else []:
+            self.assertEqual(out[i]["tool_calls"], msgs[i]["tool_calls"])
+
+    def test_args_dict_and_bad_json_left_alone(self):
+        msgs = [{"role": "user", "content": "go"},
+                {"role": "assistant", "content": None, "tool_calls": [
+                    {"id": "d", "type": "function", "function": {
+                        "name": "write", "arguments": {"filePath": "p", "content": "D" * 5000}}},
+                    {"id": "b", "type": "function", "function": {
+                        "name": "write", "arguments": '{"content": "' + "B" * 5000}}]},
+                {"role": "tool", "tool_call_id": "d", "content": "ok"},
+                {"role": "tool", "tool_call_id": "b", "content": "ok"},
+                {"role": "assistant", "content": None,
+                 "tool_calls": [_rp_call("n", "read", {"filePath": "q"})]},
+                {"role": "tool", "tool_call_id": "n", "content": "ok"}]
+        out, st = replay._compact_once(msgs, 0, 0, 0)
+        d = json.loads(out[1]["tool_calls"][0]["function"]["arguments"])
+        self.assertEqual(d, {"filePath": "p", "content": "[elided 5000 chars]"})
+        self.assertEqual(out[1]["tool_calls"][1], msgs[1]["tool_calls"][1])   # JSON hong: de nguyen
+
+    def test_rendered_prompt_has_valid_tool_call_blocks(self):
+        msgs = _rp_history(30)
+        out, _st = replay.compact_messages(msgs, _RP_TOOLS, "auto")
+        prompt = tools.messages_to_prompt(out, _RP_TOOLS, "auto", max_bytes=1 << 40)
+        self.assertNotIn('"arguments": {}', prompt)        # khong cai nao bi doi thanh {}
+        self.assertIn('"content": "[elided 20000 chars]"', prompt)
+
+    # -- an toan
+    def test_nothing_to_compact_returns_original(self):
+        msgs = [{"role": "user", "content": "U" * 300000}]
+        out, st = replay.compact_messages(msgs, None, "auto")
+        self.assertIs(out, msgs)
+        self.assertIsNone(st)
+
+    def test_internal_error_falls_back_to_original(self):
+        msgs = _rp_history(30)
+        with mock.patch.object(replay, "_compact_once", side_effect=RuntimeError("boom")):
+            out, st = replay.compact_messages(msgs, _RP_TOOLS, "auto")
+        self.assertIs(out, msgs)
+        self.assertIsNone(st)
+
+    def test_logs_summary_and_debug_details(self):
+        CONFIG["log_requests"] = True
+        msgs = _rp_history(30)
+        qwen._recent_log.clear()
+        replay.compact_messages(msgs, _RP_TOOLS, "auto")          # debug tat: chi dong tong ket
+        text = "\n".join(qwen.get_recent_log())
+        self.assertIn("[replay] compact", text)
+        self.assertIn("tool_stubbed=", text)
+        self.assertIn("args_elided=", text)
+        self.assertNotIn("[replay]   msg[", text)
+        CONFIG["debug"] = True
+        qwen._recent_log.clear()
+        replay.compact_messages(msgs, _RP_TOOLS, "auto")          # debug bat: them chi tiet tung muc
+        text = "\n".join(qwen.get_recent_log())
+        self.assertIn("[replay]   msg[", text)
+        self.assertIn("muc nua", text)                            # cat gon, khong tran /debug
+        self.assertIn("[replay] compact", text)
+
+
+class TestComposePromptReplayCompact(_Sandbox):
+    """_compose_prompt: luot new cua session duoc thu gon TRUOC prepare_large_prompt."""
+
+    def setUp(self):
+        super().setUp()
+        CONFIG["session_max_chars"] = 400000
+        CONFIG["session_replay_compact"] = True
+        CONFIG["session_replay_target_chars"] = 0
+        CONFIG["inline_prompt_max_chars"] = 30000
+        CONFIG["inline_prompt_use_learned"] = False
+
+    def _plan_ref(self):
+        from qwen_web2api import session as sess
+        self._last_plan = sess.Plan(sess.KIND_NEW, "test", [], "ctx", "chat", True)
+        return self._last_plan
+
+    def test_split_layout_compacted_and_counted(self):
+        msgs = _rp_history(30)
+        fi, prompt, short = server._compose_prompt(self._plan_ref(), msgs, _RP_TOOLS, "auto", "")
+        try:
+            self.assertIsNotNone(fi)
+            self.assertLessEqual(fi["size"], 200000)
+            with open(fi["path"], encoding="utf-8") as f:
+                body = f.read()
+            self.assertIn("[elided 20000 chars]", body)
+            self.assertIn("now continue please", prompt)
+            self.assertIn("display shortcuts only", prompt)           # chu thich elision
+            self.assertEqual(fi["attachment_prompt"], prompt)
+            self.assertEqual(self._last_plan.delta_chars, fi["size"] + len(prompt))
+            self.assertEqual(short, [msgs[-1]])
+        finally:
+            server._remove_prompt_file(fi)
+
+    def test_whole_file_layout_note_goes_to_extra_instructions(self):
+        msgs = _rp_history(30, tail_user=False)        # ket thuc bang tool result -> khong split
+        fi, _prompt, _m = server._compose_prompt(self._plan_ref(), msgs, _RP_TOOLS, "auto", "")
+        try:
+            self.assertIsNotNone(fi)
+            self.assertIsNone(fi.get("attachment_prompt"))
+            self.assertLessEqual(fi["size"], 200000)
+            self.assertIn("display shortcuts only", fi["extra_instructions"])
+            self.assertIn("FULL conversation", fi["companion_prompt"])
+        finally:
+            server._remove_prompt_file(fi)
+
+    def test_small_history_has_no_note(self):
+        msgs = _rp_history(1)
+        fi, prompt, _m = server._compose_prompt(self._plan_ref(), msgs, _RP_TOOLS, "auto", "")
+        try:
+            self.assertNotIn("display shortcuts only", prompt)
+        finally:
+            server._remove_prompt_file(fi)
+
+    def test_no_session_plan_keeps_old_behaviour(self):
+        msgs = _rp_history(30)
+        fi, prompt, _m = server._compose_prompt(None, msgs, _RP_TOOLS, "auto", "")
+        try:
+            self.assertGreater(fi["size"], 600000)
+            self.assertNotIn("display shortcuts only", prompt)
+            with open(fi["path"], encoding="utf-8") as f:
+                self.assertNotIn("[elided", f.read())
+        finally:
+            server._remove_prompt_file(fi)
+
+    def test_disabled_by_config(self):
+        CONFIG["session_replay_compact"] = False
+        msgs = _rp_history(30)
+        fi, prompt, _m = server._compose_prompt(self._plan_ref(), msgs, _RP_TOOLS, "auto", "")
+        try:
+            self.assertGreater(fi["size"], 600000)
+            self.assertNotIn("display shortcuts only", prompt)
+        finally:
+            server._remove_prompt_file(fi)
 
 
 # ------------------------------- findings: attach liveness / empty-string arguments ----

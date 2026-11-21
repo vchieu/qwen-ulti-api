@@ -18,6 +18,7 @@ from .models import MODELS, resolve_model, ui_mode_for_effort
 from .qwen import QwenError, log, debug_log, save_prompt_copy
 from . import bridge
 from . import session as sess
+from . import replay
 from .tools import (_TRUNCATION_MARKER, build_response_format_instruction,
                     is_required_tool_choice,
                     looks_like_missed_tool_call, messages_to_prompt,
@@ -403,6 +404,11 @@ def _compose_prompt(plan, messages, tools, tool_choice, rf):
     preamble giao thuc session vao CUOI prompt dau tien (file_info co attachment_prompt thi vao
     composer cung prompt; file chua toan bo thi vao extra_instructions). continue/fork: chi
     delta (plan.prompt, hoac file khi qua dai).
+
+    Plan new con thu gon BAN COPY messages (replay.compact_messages) TRUOC prepare_large_prompt:
+    nguong inline/file, file_info["size"], fingerprint va plan.delta_chars deu tinh tren ban da
+    thu gon, nen luot new khong tu vuot session_max_chars. Hash session lay tu messages goc
+    (plan.hashes) nen khong bi anh huong; plan None (tat session) giu nguyen duong cu.
     """
     if plan is not None and plan.kind != sess.KIND_NEW:
         prompt = plan.prompt + (rf or "")
@@ -410,12 +416,19 @@ def _compose_prompt(plan, messages, tools, tool_choice, rf):
         if plan.file_text is not None:
             file_info = _session_prompt_file(plan.file_text, prompt)
         return file_info, prompt, messages
+    replay_note = ""
+    if plan is not None:
+        messages, rstats = replay.compact_messages(messages, tools, tool_choice)
+        if rstats:
+            replay_note = sess.prompts()["replay_elided"]
     file_info, messages = prepare_large_prompt(messages, tools, tool_choice)
     if file_info:
         log(f"[bridge] large prompt detected ({file_info['size']} chars), "
             f"created file: {file_info['filename']}")
     prompt = messages_to_prompt(messages, tools, tool_choice)
     pre = ("\n\n" + sess.STORE.preamble(plan.tools_active)) if plan is not None else ""
+    if replay_note:
+        pre += "\n\n" + replay_note
     if rf:
         prompt += rf
     prompt += pre

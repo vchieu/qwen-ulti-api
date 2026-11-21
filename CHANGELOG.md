@@ -382,6 +382,30 @@ crash).
 Test: `TestSocketExclusiveAddr` (bind trùng port ở cả hai server + restart sau `server_close`).
 
 
+## Session: vòng lặp reset `max_chars` ở lượt `new` (thu gọn replay)
+Triệu chứng (log server-20261121-145314-14876.log): sau lần `reset ... reason=max_chars` đầu tiên
+(chars=400181), mọi lượt đều lặp `plan new` → upload cả file lịch sử (409K → 614K ký tự) →
+`session new ... chars=428525` → request kế `reset reason=max_chars`. 12 lượt cuối mất ~21 phút
+(12 lượt đầu ~5 phút), mỗi lượt 226K–280K input token, một lượt timeout.
+Nguyên nhân: lượt `new` tính `plan.delta_chars = file size + len(prompt)` (đúng thiết kế, xem
+mục "lượt new giờ tính độ dài prompt đã gửi") và `commit` đặt `chars_sent = plan.delta_chars`.
+Replay đầy đủ đã > `session_max_chars` thì session vừa tạo hết hạn ngay lượt sau, lịch sử không
+bao giờ được rút gọn nên chỉ phình thêm. Không đổi ngữ nghĩa ngưỡng (không trừ `base_chars`).
+Đo trên 3 bản copy prompt: chỉ compact tool result không hội tụ — snapshot 313K có
+`Assistant` = 239K (76%), tool+user chỉ 63K; snapshot 745K có `Assistant` = 379K, xoá sạch 247 tool
+result vẫn còn ~393K (98% ngưỡng). Phần phình là `tool_call.arguments` của assistant (batch
+`write` 28K/67K, `edit` oldString/newString).
+Sửa: `replay.compact_messages` (gọi trong `_compose_prompt` trước `prepare_large_prompt`, chỉ khi
+có plan session) thu gọn bản copy xuống `session_replay_target_chars` (0 = 50% `session_max_chars`)
+bằng hai lớp: tool result cũ (ngân sách 40K, stub giữ dòng đầu) và arguments assistant cũ
+(ngân sách 40K, chỉ elide chuỗi lớn, JSON hợp lệ); vùng gần nhất giữ nguyên, cap 24K mỗi tool
+result. Hash không đổi vì `plan.hashes` tính từ messages gốc. Prompt `replay_elided` dặn model
+không chép marker vào tool_call mới. Chưa làm (cố ý): guard mojibake — `Cyrillic OK: 6 | mojibake: 9`
+trên bản copy cho thấy lỗi nằm ở dữ liệu nguồn, không phải bridge.
+Test: `TestReplayCompact`, `TestComposePromptReplayCompact` (test_qwen_web2api.py),
+`TestReplayCompactBreaksResetLoop` (test_session.py).
+
+
 ## Session: lượt continue trả lời chủ đề cũ (neo yêu cầu hiện tại)
 Triệu chứng: ở `bridge_session_mode`, sau lượt `new` bị tách (history vào file đính kèm, câu hỏi
 hiện tại ở composer), lượt `continue` chỉ mang tool result trả lời theo chủ đề cũ trong file.

@@ -30,6 +30,7 @@ Không có tab/worker → request trả 503.
 | `qwen_web2api/server.py` | HTTP OpenAI-compatible: `/v1/chat/completions`, `/v1/responses`, `/v1/models`, auth, CORS, SSE, `_run_turn` (tool retry/nudge), `prepare_large_prompt` | route, SSE response, auth, tool retry, file prompt |
 | `qwen_web2api/bridge.py` | Server 8083 cho extension: `/poll`, `/event`, `/status`, `/debug`, `/requeue`, `/file/*`, `/alive`, `/cancel`; queue job, stream event, `known_models()`, `temporary_chat_enabled()`, `job_cancelled()`, `job_alive()`, `cancel_job()` | job queue/timeout/requeue, liveness, file serving, models feed |
 | `qwen_web2api/session.py` | Chế độ session (`bridge_session_mode`): `SessionStore.plan/commit/fail`, hash chuỗi history, render delta, prompt (`DEFAULT_PROMPTS`). Thuần, không I/O | gửi tiếp vào chat Qwen thay vì replay |
+| `qwen_web2api/replay.py` | Thu gọn **bản copy** messages của lượt `new` (session mode): tool result cũ → stub, arguments tool_call cũ → elide chuỗi lớn, cap vùng gần nhất. Thuần (chỉ log) | lượt `new` vượt `session_max_chars`, vòng lặp `reset reason=max_chars` |
 | `qwen_web2api/tools.py` | Flatten messages → prompt, chèn `# Tool Use`, parse tool_call, truncate theo byte | prompt render, tool_call parser |
 | `qwen_web2api/models.py` | `DEFAULT_MODELS`; `MODELS` đọc live từ config `models`; `@think=0/1` | tên model |
 | `qwen_web2api/config.py` | `DEFAULT_CONFIG` + `CONFIG` (global mutable), load/find config | giá trị mặc định, alias config key |
@@ -72,6 +73,11 @@ Giá trị mặc định và alias nằm trong `qwen_web2api/config.py`. Các ke
   (ghi đè từng prompt trong `session.DEFAULT_PROMPTS`), `session_fork` (**false**, thử nghiệm),
   `session_fork_user_action` (`"edit"`), `session_nudge_mode` (`append`|`fork`),
   `session_task_anchor` (**true**), `session_task_anchor_chars` (500).
+- Thu gọn replay lượt `new` (`replay.py`): `session_replay_compact` (**true**),
+  `session_replay_target_chars` (0 = 50% `session_max_chars`), `session_replay_tool_budget` (40000),
+  `session_replay_args_budget` (40000), `session_replay_recent_turns` (3),
+  `session_replay_recent_cap` (24000), `session_replay_short_result` (2000),
+  `session_replay_elide_min` (200). Có trong `/debug`.
 - Liveness/retry: `bridge_cancel_on_disconnect` (true), `bridge_max_requeues` (8),
   `retry_attempts`, `retry_delay_sec`, `tool_retry_on_miss`, `tool_retry_attempts`,
   `tool_reject_bad_arguments` (true).
@@ -265,6 +271,22 @@ chỉ mang **1** message mới.
   file chủ đề cũ + câu hỏi ngắn; "continue from where you left off" dễ bị hiểu là chủ đề cũ.
   Tắt: `session_task_anchor=false`. `session_prompts` ghi đè không có `{task}` → không có neo.
   Neo lặp lại mỗi lượt continue và tính vào `chars_sent`.
+- Thu gọn replay (`replay.compact_messages`, gọi trong `_compose_prompt` **trước**
+  `prepare_large_prompt`, chỉ khi có plan session): nếu replay đầy đủ > `target`
+  (mặc định 50% `session_max_chars`) thì thu gọn **bản copy** `messages` (không mutate list của
+  client; hash session lấy từ messages gốc qua `plan.hashes`, assistant có tool_calls chỉ hash
+  `(id, name)`). Hai lớp, vì chỉ compact tool result không hội tụ (phần phình nằm ở arguments
+  của assistant: `write.content`, `edit.oldString/newString`): (1) tool result cũ → ngân sách
+  `session_replay_tool_budget`, phần vượt thay bằng stub giữ dòng đầu (`Read file X, lines A-B`);
+  kết quả ngắn (< `session_replay_short_result`) ưu tiên nhưng vẫn tính vào ngân sách (tối đa nửa
+  ngân sách) — (2) arguments tool_call assistant cũ → ngân sách `session_replay_args_budget`, vượt
+  thì chỉ thay chuỗi ≥ `session_replay_elide_min` bằng `"[elided N chars]"` (JSON vẫn hợp lệ,
+  giữ `path`). Vùng gần nhất (`session_replay_recent_turns` luot tool-call + batch tool result
+  cuối) giữ nguyên, chỉ cap mỗi tool result ở `session_replay_recent_cap`. Vẫn > target thì thử
+  mức chặt hơn (giảm số lượt giữ nguyên, rồi giảm ngân sách). Có thu gọn → thêm prompt
+  `replay_elided` vào cuối composer/`extra_instructions`. Log: dòng `[replay] compact A -> B chars`
+  (+ chi tiết từng mục khi `debug`); `CANH BAO` khi không đạt target. Lỗi bất ngờ → dùng
+  messages gốc. Tắt: `session_replay_compact=false`.
 - Nudge trong session (`_run_turn` lần 2+): `append` chỉ gửi `[Format error] …` vào chat (không
   kèm file); `fork` (cần `session_fork`) gửi lại delta ở nhánh anh em. Chat Qwen chứa cả reply hỏng
   + nudge nhưng hash client chỉ có reply cuối → vẫn khớp.
@@ -287,7 +309,8 @@ arguments sai kiểu thay vì biến thành `{}`. Chi tiết lịch sử ở `CH
 
 - Session: `parent_id` của lượt sau một fork do **app** tự tính (từ id assistant trong SSE) — chưa
   chứng minh trên máy thật; `user_action:"edit"` có thật sự cần không cũng chưa rõ. Context
-  của một chat dài có giới hạn thật chưa đo (`session_max_chars` là số đoán). Tin
+  của một chat dài có giới hạn thật chưa đo (`session_max_chars` là số đoán; target thu gọn
+  replay = 50% của nó nên cũng là số đoán, chỉnh `session_replay_target_chars` nếu cần). Tin
   `Tool X does not exist` / reply sai format nằm lại trong chat (không tránh được). Harness đổi
   system/env mỗi lượt → `history_diverged@0` liên tục (xem log `[session] reset`; thêm regex vào
   `session_hash_ignore`). Selector/URL `/c/<id>` của app là capture, đổi → `session_lost`.

@@ -1334,5 +1334,65 @@ class TestTaskAnchor(_Sandbox):
         self.assertIn('"now fix the parser bug"', p2.prompt)
 
 
+class TestReplayCompactBreaksResetLoop(_Sandbox):
+    """Vong lap new -> max_chars -> new: replay day du >= session_max_chars lam session vua tao het
+    han ngay luot sau. Thu gon replay dua chars_sent ve duoi tran; hash chuoi khong doi."""
+
+    def setUp(self):
+        super().setUp()
+        CONFIG["session_max_chars"] = 100000
+        CONFIG["session_replay_compact"] = True
+        CONFIG["session_replay_target_chars"] = 0
+        CONFIG["inline_prompt_max_chars"] = 30000
+        CONFIG["inline_prompt_use_learned"] = False
+
+    def _history(self):
+        msgs = [{"role": "system", "content": "SYS"}, {"role": "user", "content": "task"}]
+        for i in range(12):
+            cid = f"c{i}"
+            msgs.append({"role": "assistant", "content": None, "tool_calls": [
+                call(cid, "read_file", json.dumps({"path": f"f{i}.py", "pad": "P" * 20000}))]})
+            msgs.append(tool(cid, f"Read file f{i}.py, lines 1-99\n" + "code\n" * 3000))
+        msgs.append({"role": "user", "content": "now continue"})
+        return msgs
+
+    def _new_turn(self, msgs):
+        plan = sess.STORE.plan(msgs, TOOLS, "auto", tab=TAB)
+        fi, prompt, _m = server._compose_prompt(plan, msgs, TOOLS, "auto", "")
+        server._remove_prompt_file(fi)
+        plan.out.update({"nonce": "N1", "chat_id": "C1", "parent_id": "", "sent": True})
+        s = sess.STORE.commit(plan, "reply", None)
+        return plan, s
+
+    def _next(self, msgs):
+        nxt = msgs + [{"role": "assistant", "content": "reply"},
+                      {"role": "user", "content": "next step"}]
+        return sess.STORE.plan(nxt, TOOLS, "auto", tab=TAB)
+
+    def test_without_compaction_session_dies_next_turn(self):
+        CONFIG["session_replay_compact"] = False
+        msgs = self._history()
+        plan, s = self._new_turn(msgs)
+        self.assertGreaterEqual(s.chars_sent, 100000)
+        p2 = self._next(msgs)
+        self.assertEqual(p2.kind, "new")
+        self.assertEqual(p2.reason, "max_chars")
+
+    def test_with_compaction_next_turns_continue_and_hashes_unchanged(self):
+        msgs = self._history()
+        plan, s = self._new_turn(msgs)
+        self.assertLess(s.chars_sent, 100000)
+        # hash session = hash cua messages GOC, khong phai ban da thu gon
+        self.assertEqual(plan.hashes, sess.hash_messages(msgs))
+        from qwen_web2api import replay
+        compacted, st = replay.compact_messages(msgs, TOOLS, "auto")
+        self.assertIsNotNone(st)
+        self.assertNotEqual(sess.hash_messages(compacted), sess.hash_messages(msgs))
+        p2 = self._next(msgs)
+        self.assertEqual(p2.kind, "continue")
+        self.assertEqual(p2.reason, "history_match")
+        self.assertEqual(p2.base_n, len(msgs) + 1)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -149,6 +149,23 @@ DEFAULT_CONFIG = {
     "bridge_session_mode": False,
     # Gioi han 1 session (vuot -> mo chat moi): tong ky tu da gui, so luot, giay khong dung.
     "session_max_chars": 400000,
+    # Luot new (replay day du) duoc thu gon ban COPY messages (replay.py) xuong dich nay roi moi
+    # dung file/prompt, de chars_sent khoi dau thap hon session_max_chars (khong thi session vua
+    # tao da het han -> vong lap new/reset). 0 = tu dong = 50% session_max_chars.
+    "session_replay_compact": True,
+    "session_replay_target_chars": 0,
+    # Ngan sach (ky tu) cho tool result CU / arguments tool_call assistant CU sau khi thu gon;
+    # vuot -> tool result thay bang stub (giu dong dau), arguments chi elide chuoi lon.
+    "session_replay_tool_budget": 40000,
+    "session_replay_args_budget": 40000,
+    # So luot tool-call gan nhat giu nguyen (+ batch tool result cuoi); moi tool result trong
+    # vung nay bi cat o recent_cap ky tu (2/3 dau + 1/3 cuoi).
+    "session_replay_recent_turns": 3,
+    "session_replay_recent_cap": 24000,
+    # Tool result < short_result duoc uu tien giu (toi da nua ngan sach); chuoi trong arguments
+    # < elide_min khong bao gio bi elide.
+    "session_replay_short_result": 2000,
+    "session_replay_elide_min": 200,
     "session_max_turns": 60,
     "session_idle_ttl": 1800,
     # Delta (inline) dai hon nguong nay -> gui bang file dinh kem. 0 = luon inline.

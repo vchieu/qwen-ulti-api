@@ -125,6 +125,13 @@ DEFAULT_PROMPTS = {
     "reminder_plain": ("\n\n[Reminder] Keep following the output format required in the "
                        "first message of this chat."),
     "nudge": "[Format error]\n{nudge}",
+    # Luot NEW da thu gon replay (replay.compact_messages): bao model de khong bat chuoc marker.
+    "replay_elided": (
+        "[Note] To keep this chat within the context limit, some OLD tool outputs and some large "
+        "values inside OLD tool_call arguments (file contents, edit strings) in the history were "
+        "replaced by \"[... elided ...]\" / \"[elided N chars]\" markers. They are display "
+        "shortcuts only: never copy a marker into a new tool_call, and re-read a file with a "
+        "tool if you need its current content."),
 }
 
 
