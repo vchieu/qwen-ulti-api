@@ -17,6 +17,8 @@
   const SEND_TIMEOUT_MS = 90000;    // Timeout de dien UI va cho completion response bat dau
   const STREAM_IDLE_TIMEOUT_MS = 180000; // 3 phut khong co bat ky chunk nao moi coi la stream treo
   const COMPOSER_WAIT_MS = 15000;
+  const COMPOSER_WAIT_CHAT_MS = 150000;  // F3-D: continue/fork khong the reload -> cho lau hon
+  const NO_REQUEST_AFTER_CLICK_MS = 45000;  // F3-B: Send xong ma khong co completion request
   const MODEL_REFRESH_MS = 10 * 60 * 1000;
   const MODE_CHECK_MS = 5000;
   const MODE_NAV_KEY = "qwenUIBridgeModeNav";
@@ -153,6 +155,49 @@
     }
   }
 
+  // F3-E: diag DOM day du khi composer/Send/hydrate co van de. Khong bao gio throw.
+  function pageDiagFull(composer) {
+    try {
+      const bits = [pageDiag(composer || null)];
+      bits.push("url=" + location.pathname + String(location.search || "").slice(0, 40));
+      bits.push("ready=" + document.readyState + " hidden=" + !!document.hidden
+        + " focus=" + (typeof document.hasFocus === "function" ? document.hasFocus() : "?"));
+      const raw = Array.from(document.querySelectorAll(
+        'textarea, [contenteditable], [role="textbox"]')).slice(0, 6);
+      bits.push("inputs=[" + raw.map((el) => {
+        let wh = "0x0";
+        try {
+          const r = el.getBoundingClientRect();
+          wh = Math.round(r.width) + "x" + Math.round(r.height);
+        } catch (e) { /* diag */ }
+        return el.tagName.toLowerCase()
+          + (visible(el) ? ":vis" : ":hid")
+          + (el.disabled ? ":disabled" : "")
+          + (el.readOnly ? ":ro" : "")
+          + (el.getAttribute("aria-disabled") === "true" ? ":aria-dis" : "")
+          + (el.getAttribute("contenteditable") ? ":ce=" + el.getAttribute("contenteditable") : "")
+          + ":" + wh;
+      }).join(", ") + "]");
+      const toasts = Array.from(document.querySelectorAll(
+        '[role="alert"], [class*="toast" i], [class*="notification" i], [class*="message-box" i]'))
+        .filter(visible).slice(0, 3)
+        .map((e) => String(e.innerText || "").replace(/\s+/g, " ").slice(0, 80));
+      if (toasts.length) bits.push("toasts=[" + toasts.join(" ; ") + "]");
+      const busy = Array.from(document.querySelectorAll(
+        '[aria-busy="true"], [class*="loading" i], [class*="spin" i], [class*="generat" i], [class*="thinking" i]'))
+        .filter(visible).slice(0, 4)
+        .map((e) => String(e.className || e.tagName).slice(0, 40));
+      if (busy.length) bits.push("busy=[" + busy.join(", ") + "]");
+      const ms = chatMessageStats();
+      bits.push("chatMsgs=" + ms.n + (ms.last ? " last=" + JSON.stringify(ms.last.slice(0, 40)) : ""));
+      bits.push("body=" + JSON.stringify(String((document.body && document.body.innerText) || "")
+        .replace(/\s+/g, " ").slice(0, 120)));
+      return bits.join(" ");
+    } catch (e) {
+      return "diagFull-error:" + ((e && e.message) || e);
+    }
+  }
+
   function hoverEl(el) {
     for (const t of ["pointerover", "mouseover", "pointerenter", "mouseenter", "mousemove"]) {
       el.dispatchEvent(new MouseEvent(t, { bubbles: true, cancelable: true, view: window }));
@@ -211,7 +256,7 @@
   const INLINE_LIMIT_KEY = "qwenUIBridgeInlineLimit";
   const INLINE_LIMIT_CAP = 32000;   // 32775 ky tu tung chay inline OK -> nguong an toan ban dau sau loi
   const INLINE_STALL_MIN_CHARS = 20000;  // prompt inline >= nguong nay moi xet stall sau Send
-  const INLINE_STALL_GRACE_MS = 8000;    // composer rong / nut Send bien mat qua lau -> fallback file
+  const INLINE_STALL_GRACE_MS = 25000;   // F3-C: 8000 bao stall nham (request that di luc +9s)    // composer rong / nut Send bien mat qua lau -> fallback file
   const TEMP_DOM_WAIT_MS = 3000;         // doi them temporary DOM (bounded) khi trang vua reload
   const PAGE_READY_MAX_MS = 8000;
   const HYDRATION_PROBE_MS = 12000;      // cua so do hydrate moi lan load trang
@@ -382,7 +427,7 @@
     if (job && pageReadyMode === "full" && (!composer || !tempDom)) {
       fwd(job, "warn", "trang co the CHUA hydrate xong khi dien prompt (composer=" + composer
         + " tempDom=" + tempDom + " wantTemp=" + wantTemp
-        + " evidence=" + JSON.stringify(temporaryEvidence()) + ")");
+        + " evidence=" + JSON.stringify(temporaryEvidence()) + ") | " + (typeof pageDiagFull === "function" ? pageDiagFull(null) : ""));
     }
   }
 
@@ -2349,8 +2394,11 @@
     });
   }
 
-  async function waitComposer() {
-    const deadline = Date.now() + COMPOSER_WAIT_MS;
+  async function waitComposer(job, waitMs) {
+    const t0 = Date.now();
+    const limitMs = Number(waitMs) > 0 ? Number(waitMs) : COMPOSER_WAIT_MS;
+    const deadline = t0 + limitMs;
+    let lastAliveAt = 0, diagSent = false;
     while (Date.now() < deadline) {
       const list = findComposers();
       if (list.length) {
@@ -2363,9 +2411,24 @@
         scored.sort((a, b) => b.score - a.score);
         return scored[0].el;
       }
+      if (job) {
+        const nowTs = Date.now();
+        if (nowTs - lastAliveAt >= 2000) {
+          lastAliveAt = nowTs;
+          touchJob(job);
+          if (typeof job._armSendTimer === "function") job._armSendTimer();   // cho composer khong tinh vao send-timeout
+          if (!(await jobAlive(job, true))) throw new Error("job cancelled (cho composer)");
+        }
+        if (!diagSent && nowTs - t0 >= 10000) {
+          diagSent = true;
+          send(job.id, { kind: "debug", message: "composer chua thay sau "
+            + Math.round((nowTs - t0) / 1000) + "s | " + (typeof pageDiagFull === "function" ? pageDiagFull(null) : "") });
+        }
+      }
       await sleep(200);
     }
-    throw new Error("khong tim thay o nhap chat (composer)");
+    throw new Error("khong tim thay o nhap chat (composer) sau "
+      + Math.round((Date.now() - t0) / 1000) + "s | " + (typeof pageDiagFull === "function" ? pageDiagFull(null) : ""));
   }
 
   function setComposer(el, text) {
@@ -2782,7 +2845,8 @@
     const t = attachmentTexts(composer);
     if (job) job._cardTexts = t;   // inspectCompletionRequest doi chieu ten file voi card
     fwd(job, "debug", "attachment cards sau '" + used + "': n=" + t.length
-      + " [" + t.join("; ") + "] expect=" + fname);
+      + " [" + t.join("; ") + "] expect=" + fname
+      + (t.length || typeof pageDiagFull !== "function" ? "" : " | " + pageDiagFull(composer)));
   }
 
   async function fetchPromptText(fileInfo) {
@@ -3066,6 +3130,7 @@
         if (trace.firstClickAt < 0) trace.firstClickAt = Date.now() - trace.t0;
         if (trace.atClick.length < 20) trace.atClick.push(composerText(composer).trim().length);
       }
+      if (job) job._lastClickAt = Date.now();   // F3-B
       btn.click();
       clicks++;
       log("send click", clicks);
@@ -3294,7 +3359,7 @@
       saveJobState(job, "model_selected", "Model " + job.model);
       send(job.id, { kind: "debug",
         message: "temporary evidence: " + JSON.stringify(temporaryEvidence()) });
-      const composer = await waitComposer();
+      const composer = await waitComposer(job, inChat ? COMPOSER_WAIT_CHAT_MS : COMPOSER_WAIT_MS);
       job._composerEl = composer;   // sendDiag dung khi send-timeout khong co composer trong scope
       saveJobState(job, "composer_ready", "Composer found");
       pageUsed = true;  // tu day trang nay co tin nhan
@@ -3330,10 +3395,24 @@
     /* Job dang generate ma caller da ngat: khong cho event/delta ke tiep (Qwen "nghi" lau thi
        khong co delta nao) -> hoi /alive, settle de runJobInner bam Stop. */
     const j = current;
-    if (j && j.attached && !j.settled && !j.cancelled) {
+    if (j && !j.settled && !j.cancelled) {
+      /* F3-A: kiem tra song cho MOI job (truoc day chi job da attached). Job huy luc chua
+         attached (vd. Send khong sinh request) truoc day cho het send-timer 240s, chiem worker. */
       jobAlive(j, true).then((ok) => {
         if (!ok && !j.settled) settle(j, new Error("job het hieu luc (caller da ngat/huy)"));
       }).catch(() => {});
+      /* F3-B: da bam Send > N giay ma khong co completion request -> fail som de Python retry. */
+      let capt = "";
+      try { capt = captchaSignal(); } catch (e) { /* best-effort */ }
+      if (!j.attached && j._lastClickAt && !capt
+          && Date.now() - j._lastClickAt > NO_REQUEST_AFTER_CLICK_MS) {
+        j._lastClickAt = 0;
+        let diag = "";
+        try { diag = sendDiag(j, null) + " | " + pageDiagFull(j._composerEl || null); }
+        catch (e) { /* diag */ }
+        settle(j, new Error("da bam Send nhung khong co completion request sau "
+          + Math.round(NO_REQUEST_AFTER_CLICK_MS / 1000) + "s | " + diag));
+      }
     }
   }, 5000);
 
