@@ -160,6 +160,11 @@ DEFAULT_CONFIG = {
     # Regex (re.DOTALL) bo khoi noi dung truoc khi hash, de phan dong (vd <environment_details>
     # cua Cline doi moi luot) khong lam lech chuoi history. Sai regex bi bo qua.
     "session_hash_ignore": ["<environment_details>.*?</environment_details>"],
+    # Luot continue chi co tool result: them dong "[Current task] ..." (tin user that cuoi cung,
+    # da bo session_hash_ignore) de Qwen khong tra loi chu de cu trong file lich su dinh kem
+    # o luot new. Chi ap dung khi prompt co {task}. chars <= 0 = tat.
+    "session_task_anchor": True,
+    "session_task_anchor_chars": 500,
     # Ghi de tung prompt trong session.DEFAULT_PROMPTS (dict ten -> text).
     "session_prompts": {},
     # THU NGHIEM: nhanh (fork) bang cach ghi de parent_id trong body completion: retry cung

@@ -70,7 +70,8 @@ Giá trị mặc định và alias nằm trong `qwen_web2api/config.py`. Các ke
   `session_reminder_every` (8), `session_strict_assistant` (false), `session_hash_ignore`
   (regex bỏ khỏi nội dung trước khi hash; mặc định `<environment_details>…`), `session_prompts`
   (ghi đè từng prompt trong `session.DEFAULT_PROMPTS`), `session_fork` (**false**, thử nghiệm),
-  `session_fork_user_action` (`"edit"`), `session_nudge_mode` (`append`|`fork`).
+  `session_fork_user_action` (`"edit"`), `session_nudge_mode` (`append`|`fork`),
+  `session_task_anchor` (**true**), `session_task_anchor_chars` (500).
 - Liveness/retry: `bridge_cancel_on_disconnect` (true), `bridge_max_requeues` (8),
   `retry_attempts`, `retry_delay_sec`, `tool_retry_on_miss`, `tool_retry_attempts`,
   `tool_reject_bad_arguments` (true).
@@ -257,6 +258,13 @@ chỉ mang **1** message mới.
   → file đính kèm với prompt riêng (`tool_results_file`/`message_file`); nếu extension tự chuyển
   inline → file thì dùng `attach_prompt` (`attach_results`/`attach_fallback`), **không** dùng
   `attachment_prompt` ("compressed conversation history" sai ngữ cảnh).
+- Neo yêu cầu hiện tại: delta chỉ có tool result (không có tin user) thêm cuối prompt
+  `[Current task] …` = tin user thật gần nhất trước delta (đã bỏ `session_hash_ignore`, cắt
+  `session_task_anchor_chars`), qua placeholder `{task}` của `tool_results`, `tool_results_file`,
+  `attach_results`. Lý do: lượt `new` tách (history → file, câu hỏi ở composer) để chat chỉ còn
+  file chủ đề cũ + câu hỏi ngắn; "continue from where you left off" dễ bị hiểu là chủ đề cũ.
+  Tắt: `session_task_anchor=false`. `session_prompts` ghi đè không có `{task}` → không có neo.
+  Neo lặp lại mỗi lượt continue và tính vào `chars_sent`.
 - Nudge trong session (`_run_turn` lần 2+): `append` chỉ gửi `[Format error] …` vào chat (không
   kèm file); `fork` (cần `session_fork`) gửi lại delta ở nhánh anh em. Chat Qwen chứa cả reply hỏng
   + nudge nhưng hash client chỉ có reply cuối → vẫn khớp.

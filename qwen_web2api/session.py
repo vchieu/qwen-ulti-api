@@ -71,14 +71,24 @@ DEFAULT_PROMPTS = {
         "{results}\n\n{user_part}"
         "Continue the task from where you left off. Call more tools with a ```tool_call block "
         "if needed; otherwise give the final answer as plain text. Do not repeat calls you "
-        "already have results for, and do not echo the results back."),
+        "already have results for, and do not echo the results back.{task}"),
     "user_part": "[User message]\n{text}\n\n",
+    # Neo yeu cau hien tai cho luot continue chi co tool result: chat Qwen co the chua file
+    # lich su (luot new tach history) nen "continue from where you left off" de bi hieu la
+    # chu de CU trong file. Chen vao cho {task} cua tool_results / tool_results_file /
+    # attach_results (override khong co {task} thi khong co neo). Chi them khi delta khong
+    # co tin user (tin user da la neo).
+    "task_anchor": (
+        "[Current task] The human's latest request, which you are still working on: "
+        "\"{text}\". Keep answering THIS request; ignore unrelated earlier topics in any "
+        "attached history."),
     "tool_results_file": (
         "[Tool results] The attached file holds the output of your previous tool_call(s): "
         "{inventory}. Each result sits between \"=== RESULT ... ===\" and \"=== END RESULT "
         "... ===\" markers.{user_note} Read the ENTIRE file, then continue the task from where "
         "you left off: call more tools with a ```tool_call block or give the final answer. Do "
-        "NOT repeat calls you already have results for and do not summarize the file back to me."),
+        "NOT repeat calls you already have results for and do not summarize the file back to me."
+        "{task}"),
     "user_note": " The file ends with my message (after \"=== USER MESSAGE ===\").",
     "message_file": (
         "[Message] The attached file contains my next message (too long to type). Read the "
@@ -109,7 +119,7 @@ DEFAULT_PROMPTS = {
         "\"=== END RESULT ... ===\" markers. Read the ENTIRE file, then continue the task from "
         "where you left off: call more tools with a ```tool_call block or give the final "
         "answer. Do NOT repeat calls you already have results for and do not summarize the "
-        "file back to me."),
+        "file back to me.{task}"),
     "reminder_tools": ("\n\n[Reminder] Keep the exact ```tool_call format. Each turn: "
                        "tool_call block(s) only, or a plain-text final answer."),
     "reminder_plain": ("\n\n[Reminder] Keep following the output format required in the "
@@ -333,6 +343,29 @@ def render_delta(messages, base_n, tools_active, tool_choice=None, turn_no=1):
             "n_tool": len(blocks), "n_user": len(user_parts)}
 
 
+def _task_anchor(messages, base_n, parts):
+    """Neo yeu cau hien tai (tin user thuc cuoi cung truoc delta) cho luot continue chi co
+    tool result, da kem dau ngat "\\n\\n" de gan vao {task}. Rong khi tat
+    (session_task_anchor=false), khi delta da co tin user, hoac khong co tin user nao.
+    Noi dung da bo phan dong (session_hash_ignore) nhu luc hash, de <environment_details>... khong chiem het gioi han."""
+    if not parts.get("results") or parts.get("user_text"):
+        return ""
+    if not bool(CONFIG.get("session_task_anchor", True)):
+        return ""
+    limit = int(_num("session_task_anchor_chars", 500))
+    if limit <= 0:
+        return ""
+    for m in reversed(list(messages[:base_n])):
+        if isinstance(m, dict) and _role(m) == "user":
+            text = " ".join(_hash_text(_stringify_content(m.get("content"))).split())
+            if not text:
+                continue
+            if len(text) > limit:
+                text = text[:limit].rstrip() + " ..."
+            return "\n\n" + _fmt(prompts()["task_anchor"], text=text)
+    return ""
+
+
 def _delta_text(parts, tools_active, tool_choice, turn_no):
     """Dung prompt inline (hoac noi dung file khi file_mode) cho delta da render."""
     P = prompts()
@@ -340,7 +373,8 @@ def _delta_text(parts, tools_active, tool_choice, turn_no):
     results, user_text = parts["results"], parts["user_text"]
     if results:
         user_part = _fmt(P["user_part"], text=user_text) if user_text else ""
-        text = _fmt(P["tool_results"], results=results, user_part=user_part)
+        text = _fmt(P["tool_results"], results=results, user_part=user_part,
+                    task=parts.get("anchor", ""))
     else:
         text = user_text
         if every > 0 and turn_no % every == 0:
@@ -577,11 +611,13 @@ class SessionStore:
         p = Plan(kind, reason, hashes, ch, api, tools_active)
         p.session, p.sid, p.base_n, p.parent_id = cur, cur.sid, base_n, parent
         parts = render_delta(messages, base_n, tools_active, tool_choice)
+        parts["anchor"] = _task_anchor(messages, base_n, parts)
         turn_no = cur.turns + 1
         inline = _delta_text(parts, tools_active, tool_choice, turn_no)
         thr = int(_num("session_file_threshold", 30000))
         P = prompts()
-        p.attach_prompt = P["attach_results"] if parts["n_tool"] else P["attach_fallback"]
+        p.attach_prompt = (_fmt(P["attach_results"], task=parts["anchor"])
+                           if parts["n_tool"] else P["attach_fallback"])
         if tools_active and tool_choice is not None:
             p.attach_prompt += _choice_instruction(tool_choice)
         if thr > 0 and len(inline) > thr:
@@ -593,7 +629,7 @@ class SessionStore:
                 note = _fmt(P["user_note"]) if parts["user_text"] else ""
                 p.prompt = _fmt(P["tool_results_file"],
                                 inventory=", ".join(parts["inventory"]) or "(none)",
-                                user_note=note)
+                                user_note=note, task=parts["anchor"])
             else:
                 p.prompt = P["message_file"]
             if tools_active and tool_choice is not None:

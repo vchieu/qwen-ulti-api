@@ -1239,5 +1239,100 @@ class TestNewPlanAttachPromptHttp(_HttpSandbox):
         self.assertIn("FULL conversation", sj["attach_prompt"])
 
 
+class TestTaskAnchor(_Sandbox):
+    """Luot continue chi co tool result mang [Current task] (tin user that cuoi cung) de Qwen
+    khong tra loi chu de cu trong file lich su dinh kem o luot new."""
+
+    M = [{"role": "system", "content": "sys"},
+         {"role": "user", "content": "old topic about cats"},
+         {"role": "assistant", "content": "meow"},
+         {"role": "user", "content": "now fix   the\nparser bug"}]
+
+    def _plan(self, result="FILE BODY", msgs=None):
+        base = msgs or self.M
+        _commit_new(sess.STORE, base, "", [call("c1")])
+        return sess.STORE.plan(base + [asst_calls("c1"), tool("c1", result)],
+                               TOOLS, "auto", tab=TAB)
+
+    def test_inline_has_anchor_with_latest_user_request(self):
+        p = self._plan()
+        self.assertEqual(p.kind, "continue")
+        self.assertIn('[Current task]', p.prompt)
+        self.assertIn('"now fix the parser bug"', p.prompt)
+        self.assertNotIn("old topic about cats", p.prompt)
+        self.assertTrue(p.prompt.rstrip().endswith("earlier topics in any attached history."))
+
+    def test_file_mode_anchor_in_composer_not_in_file(self):
+        CONFIG["session_file_threshold"] = 50
+        p = self._plan("X" * 200)
+        self.assertIsNotNone(p.file_text)
+        self.assertIn('"now fix the parser bug"', p.prompt)
+        self.assertNotIn("[Current task]", p.file_text)
+
+    def test_attach_prompt_has_anchor(self):
+        p = self._plan()
+        self.assertIn('"now fix the parser bug"', p.attach_prompt)
+
+    def test_no_anchor_when_delta_has_user_message(self):
+        _commit_new(sess.STORE, self.M, "", [call("c1")])
+        msgs = self.M + [asst_calls("c1"), tool("c1", "R"),
+                         {"role": "user", "content": "also this"}]
+        p = sess.STORE.plan(msgs, TOOLS, "auto", tab=TAB)
+        self.assertEqual(p.kind, "continue")
+        self.assertNotIn("[Current task]", p.prompt)
+        self.assertNotIn("[Current task]", p.attach_prompt)
+
+    def test_disabled_by_config(self):
+        CONFIG["session_task_anchor"] = False
+        p = self._plan()
+        self.assertNotIn("[Current task]", p.prompt)
+        CONFIG["session_task_anchor"] = True
+        CONFIG["session_task_anchor_chars"] = 0
+        sess.STORE.reset("again")
+        self.assertNotIn("[Current task]", self._plan().prompt)
+
+    def test_long_request_is_truncated(self):
+        CONFIG["session_task_anchor_chars"] = 20
+        msgs = self.M[:3] + [{"role": "user", "content": "A" * 100}]
+        p = self._plan(msgs=msgs)
+        self.assertIn('"' + "A" * 20 + ' ..."', p.prompt)
+        self.assertNotIn("A" * 21, p.prompt)
+
+    def test_hash_ignore_patterns_stripped_from_anchor(self):
+        msgs = self.M[:3] + [{"role": "user", "content":
+                              "<task>do X</task>\n<environment_details>NOISE</environment_details>"}]
+        p = self._plan(msgs=msgs)
+        self.assertIn("do X", p.prompt)
+        self.assertNotIn("NOISE", p.prompt)
+
+    def test_prompt_override_without_task_has_no_anchor(self):
+        CONFIG["session_prompts"] = {"tool_results": "RES: {results}{user_part}"}
+        p = self._plan()
+        self.assertNotIn("[Current task]", p.prompt)
+        self.assertIn("RES:", p.prompt)
+
+    def test_task_anchor_prompt_override(self):
+        CONFIG["session_prompts"] = {"task_anchor": "TASK={text}"}
+        p = self._plan()
+        self.assertIn("TASK=now fix the parser bug", p.prompt)
+
+    def test_no_user_message_means_no_anchor(self):
+        msgs = [{"role": "system", "content": "sys"}, {"role": "user", "content": "   "}]
+        p = self._plan(msgs=msgs)
+        self.assertNotIn("[Current task]", p.prompt)
+
+    def test_anchor_does_not_break_hash_chain(self):
+        p = self._plan()
+        self.assertEqual(p.kind, "continue")
+        p.delta_chars = 10
+        p.out.update({"nonce": "N1", "chat_id": "C1", "parent_id": "", "sent": True})
+        self.assertIsNotNone(sess.STORE.commit(p, "", [call("c2")]))
+        msgs = self.M + [asst_calls("c1"), tool("c1", "FILE BODY"), asst_calls("c2"),
+                         tool("c2", "R2")]
+        p2 = sess.STORE.plan(msgs, TOOLS, "auto", tab=TAB)
+        self.assertEqual(p2.kind, "continue")
+        self.assertIn('"now fix the parser bug"', p2.prompt)
+
+
 if __name__ == "__main__":
     unittest.main()

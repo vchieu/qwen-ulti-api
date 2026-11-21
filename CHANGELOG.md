@@ -380,3 +380,16 @@ và override `server_bind()` set `SO_EXCLUSIVEADDRUSE=1` TRƯỚC khi bind, ch�
 `OSError [WinError 10048]`; tắt server cũ rồi bind lại đúng port đó vẫn thành công (restart sau
 crash).
 Test: `TestSocketExclusiveAddr` (bind trùng port ở cả hai server + restart sau `server_close`).
+
+
+## Session: lượt continue trả lời chủ đề cũ (neo yêu cầu hiện tại)
+Triệu chứng: ở `bridge_session_mode`, sau lượt `new` bị tách (history vào file đính kèm, câu hỏi
+hiện tại ở composer), lượt `continue` chỉ mang tool result trả lời theo chủ đề cũ trong file.
+Nguyên nhân (suy ra từ code + mô phỏng prompt, chưa có log runtime): prompt continue chỉ có
+`[Tool results] … Continue the task from where you left off` — không nhắc yêu cầu hiện tại; chat
+chứa file chủ đề cũ nên "where you left off" bị hiểu là chủ đề cuối trong file.
+Sửa: `session._task_anchor` thêm `[Current task] …` (tin user thật gần nhất trước delta, bỏ
+`session_hash_ignore`, cắt `session_task_anchor_chars`) qua `{task}` của `tool_results`,
+`tool_results_file`, `attach_results`; không thêm khi delta đã có tin user. Config mới
+`session_task_anchor` (true), `session_task_anchor_chars` (500); hai key có trong `/debug`.
+Test: `TestTaskAnchor` (test_session.py).

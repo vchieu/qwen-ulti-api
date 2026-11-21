@@ -819,7 +819,8 @@ class _Handler(BaseHTTPRequestHandler):
                          "models", "qwen_builtin_tools", "log_session_file", "log_dir",
                          "log_save_prompt_files", "attachment_usage_warn_ratio",
                          "bridge_session_mode", "session_max_chars", "session_max_turns",
-                         "session_idle_ttl", "session_file_threshold", "session_fork")
+                         "session_idle_ttl", "session_file_threshold", "session_fork",
+                         "session_task_anchor", "session_task_anchor_chars")
             cfg_snapshot = {k: CONFIG[k] for k in safe_keys if k in CONFIG}
             return self._json({
                 "config": cfg_snapshot,
