@@ -2427,6 +2427,11 @@
       }
       await sleep(200);
     }
+    if (job) {   // F4-B
+      job._composerTimeouts = (job._composerTimeouts || 0) + 1;
+      send(job.id, { kind: "warn", message: "waitComposer het han lan "
+        + job._composerTimeouts + " (limit " + limitMs + "ms)" });
+    }
     throw new Error("khong tim thay o nhap chat (composer) sau "
       + Math.round((Date.now() - t0) / 1000) + "s | " + (typeof pageDiagFull === "function" ? pageDiagFull(null) : ""));
   }
@@ -2902,6 +2907,7 @@
   // Prompt quá dài: paste để Qwen tự tạo document txt; nếu UI bỏ qua paste thì
   // thử upload file, cuối cùng mới gửi nguyên text.
   async function attachLongPrompt(composer, fileInfo, companionPrompt, job) {
+    if (job && typeof job === "object") job._lastClickAt = 0;   // F4-A: dang dinh kem file -> khong tinh la 'da bam Send'
     const promptText = companionPrompt || attachmentPrompt || ATTACHMENT_COMPANION_PROMPT;
     const RAW_FALLBACK_MAX = 125000;   // Qwen gioi han ~131072 ky tu / message
     const text = await fetchPromptText(fileInfo);
