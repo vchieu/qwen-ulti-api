@@ -73,5 +73,7 @@
       "thinking_mode": "Fast",
       "thinking_format": null
     }
-  }
+  },
+  "inline_prompt_max_chars": 0,
+  "inline_prompt_use_learned": false
 }

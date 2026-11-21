@@ -30,8 +30,14 @@ _MAX_CHECKPOINTS = 200
 # assistant o luot sau (xem _plan) thay vi reset.
 INTERRUPTED = "interrupted-reply"
 # Cac thong diep loi cho biet CLIENT chu dong huy (server.py/bridge.py): bridge ghi tieng Viet
-# "client da ngat ket noi", duong non-stream ghi "client disconnected; job cancelled".
-_CLIENT_CANCEL_MARKERS = ("client disconnected", "client da ngat ket noi")
+# "client da ngat ket noi", duong non-stream ghi "client disconnected; job cancelled". Duong
+# stream (ghi SSE vao socket da dong) nem ConnectionError cua he dieu hanh -> str(e) la thong
+# diep cua OS, khong co hai cum tren: Windows "[WinError 10054] ... forcibly closed by the remote
+# host" / "[WinError 10053] ... aborted by the software ...", Linux/macOS "Broken pipe" /
+# "Connection reset by peer".
+_CLIENT_CANCEL_MARKERS = ("client disconnected", "client da ngat ket noi",
+                          "winerror 10054", "winerror 10053", "forcibly closed",
+                          "aborted by the software", "broken pipe", "connection reset by peer")
 
 
 def _client_cancelled(reason):

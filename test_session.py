@@ -1458,6 +1458,48 @@ class TestReplayStubHead(unittest.TestCase):
         self.assertTrue(replay._stub(only).startswith("warning: one\n[... "))
 
 
+class TestSocketErrorCountsAsClientCancel(_Sandbox):
+    """Client dong stream giua chung -> server.py ghi SSE nem ConnectionResetError; str(e) la
+    thong diep OS (log that: `turn_failed: [WinError 10054] ...` -> session bi reset thay vi
+    INTERRUPTED)."""
+
+    Q0 = [{"role": "user", "content": "q0"}]
+
+    def _interrupted_with(self, reason):
+        _commit_new(sess.STORE, self.Q0, "a0", None, tools=None)
+        msgs = self.Q0 + [{"role": "assistant", "content": "a0"},
+                          {"role": "user", "content": "q1"}]
+        plan = sess.STORE.plan(msgs, None, "auto", tab=TAB)
+        plan.out.update({"nonce": "N1", "chat_id": "C1", "parent_id": "A0", "sent": True})
+        sess.STORE.fail(plan, reason)
+
+    def test_os_socket_messages_keep_session_as_interrupted(self):
+        for reason in (
+                "[WinError 10054] An existing connection was forcibly closed by the remote host",
+                "[WinError 10053] An established connection was aborted by the software in "
+                "your host machine",
+                "[Errno 32] Broken pipe", "[Errno 104] Connection reset by peer"):
+            sess.STORE.reset("test")
+            self._interrupted_with(reason)
+            s = sess.STORE.get()
+            self.assertIsNotNone(s, reason)
+            self.assertEqual(s.hashes[-1], sess.INTERRUPTED, reason)
+
+    def test_other_errors_still_reset(self):
+        for reason in ("upstream error: 500", "browser bridge: job timeout"):
+            sess.STORE.reset("test")
+            self._interrupted_with(reason)
+            self.assertIsNone(sess.STORE.get(), reason)
+
+    def test_not_sent_yet_keeps_session_untouched(self):
+        _commit_new(sess.STORE, self.Q0, "a0", None, tools=None)
+        msgs = self.Q0 + [{"role": "assistant", "content": "a0"}, {"role": "user", "content": "q1"}]
+        plan = sess.STORE.plan(msgs, None, "auto", tab=TAB)
+        plan.out.update({"nonce": "N1", "chat_id": "C1"})        # chua gui (khong co sent)
+        sess.STORE.fail(plan, "[WinError 10054] forcibly closed")
+        self.assertEqual(sess.STORE.get().hashes[-1] != sess.INTERRUPTED, True)
+
+
 if __name__ == "__main__":
     unittest.main()
     
