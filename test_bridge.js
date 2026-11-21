@@ -39,7 +39,8 @@ const skipIfMissing = (fns, what) => (fns ? {} : { skip: what + " chua co trong 
 
 // ------------------------------------------------------------------ jobAlive ----
 function aliveEnv(getJSON) {
-  return loadFns(["jobDead", "jobAlive"], { ALIVE_CACHE_MS: 1500, getJSON });
+  return loadFns(["jobDead", "jobIdleLimitMs", "touchJob", "jobStale", "jobAlive"],
+    { ALIVE_CACHE_MS: 1500, getJSON });
 }
 
 test("jobAlive: job null/settled/cancelled -> false, khong goi mang", async () => {
@@ -766,6 +767,7 @@ function sendPromptEnv(opts = {}) {
     Date: { now: () => state.now },
     sleep: async (ms) => { state.now += ms; },
     jobAlive: async () => true,
+    touchJob: (j) => { if (j) j._touches = (j._touches || 0) + 1; },
     findSendButton: () => (state.btn ? {
       click: () => { state.clicks++; if (opts.onClick) opts.onClick(state, job); },
     } : null),
@@ -1101,4 +1103,118 @@ test("waitPageReady: tempDom chi xong TRONG luc sleep -> lay mau lai, khong warn
   assert.deepEqual(env.state.warns, []);    // khong warn nham nua
   assert.match(m, /loop=3000ms\/\d+ rounds/);
   assert.match(m, /total=4000ms/);
+});
+
+
+// ================= findings: inactivity deadline (job chay lau) =================
+// Python coi bridge_job_timeout la thoi gian IM LANG; job mang idle_timeout (giay) va
+// extension gia han moi lan co activity. deadline tuyet doi chi con la fallback Python cu.
+function aliveEnvIdle(getJSON) {
+  return loadFns(["jobDead", "jobIdleLimitMs", "touchJob", "jobStale", "jobAlive"],
+    { ALIVE_CACHE_MS: 1500, getJSON });
+}
+
+test("jobIdleLimitMs: giay -> ms, gia tri rac -> 0", () => {
+  const { jobIdleLimitMs } = aliveEnvIdle(async () => ({ alive: true }));
+  assert.equal(jobIdleLimitMs({ idle_timeout: 600 }), 600000);
+  assert.equal(jobIdleLimitMs({ idle_timeout: 0 }), 0);
+  assert.equal(jobIdleLimitMs({ idle_timeout: "abc" }), 0);
+  assert.equal(jobIdleLimitMs({}), 0);
+  assert.equal(jobIdleLimitMs(null), 0);
+});
+
+test("jobAlive: idle_timeout + con activity -> deadline tuyet doi bi bo qua", async () => {
+  const { jobAlive } = aliveEnvIdle(async () => ({ alive: true }));
+  const job = { id: "a", idle_timeout: 600, deadline: Date.now() - 1,
+                _lastActivity: Date.now() };
+  assert.equal(await jobAlive(job, true), true);
+  assert.notEqual(job.cancelled, true);
+});
+
+test("jobAlive: im lang qua idle_timeout -> cancelled + false", async () => {
+  const { jobAlive } = aliveEnvIdle(async () => ({ alive: true }));
+  const job = { id: "a", idle_timeout: 1, _lastActivity: Date.now() - 5000 };
+  assert.equal(await jobAlive(job, true), false);
+  assert.equal(job.cancelled, true);
+});
+
+test("touchJob gia han: stream dai khong bi coi la chet", async () => {
+  const { jobAlive, touchJob } = aliveEnvIdle(async () => ({ alive: true }));
+  const job = { id: "a", idle_timeout: 1, _lastActivity: Date.now() - 900 };
+  touchJob(job);
+  assert.equal(await jobAlive(job, true), true);
+  assert.notEqual(job.cancelled, true);
+});
+
+test("jobAlive: Python cu (khong idle_timeout) -> van dung deadline tuyet doi", async () => {
+  const { jobAlive } = aliveEnvIdle(async () => ({ alive: true }));
+  const job = { id: "a", deadline: Date.now() - 1 };
+  assert.equal(await jobAlive(job, true), false);
+  assert.equal(job.cancelled, true);
+});
+
+test("jobAlive: idle_timeout nhung chua co activity -> khong ket luan chet", async () => {
+  const { jobAlive } = aliveEnvIdle(async () => ({ alive: true }));
+  assert.equal(await jobAlive({ id: "a", idle_timeout: 1 }, true), true);
+});
+
+
+// ============ findings v2: cac diem gia han (touchJob) khong duoc bi go mat ============
+// Fix "job dai bi giet" nam o cac loi goi touchJob; test jobStale/jobAlive o tren khong
+// bat duoc viec ai do xoa chung. Moi diem gia han co 1 test hanh vi (hoac guard nguon).
+test("send(): event cua job hien tai -> gia han; job khac -> khong", async (t) => {
+  const job = { id: "a", _lastActivity: 1 };
+  const fns = loadFns(["touchJob", "send"],
+    { current: job, post: async () => ({}), settle: () => {} });
+  if (!fns) return t.skip("send/touchJob chua co trong bridge.js");
+  await fns.send("b", { kind: "debug" });
+  assert.equal(job._lastActivity, 1);
+  await fns.send("a", { kind: "debug" });
+  assert.ok(job._lastActivity > 1);
+});
+
+test("handleData(): chunk upstream (ke ca rong) -> gia han", async (t) => {
+  const fns = loadFns(["touchJob", "handleData"], {});
+  if (!fns) return t.skip("handleData/touchJob chua co trong bridge.js");
+  const job = { id: "a", _lastActivity: 1 };
+  await fns.handleData(job, "");
+  assert.ok(job._lastActivity > 1);
+});
+
+test("saveJobState(): moi buoc UI -> gia han", (t) => {
+  const fns = loadFns(["touchJob", "saveJobState"],
+    { sessionStorage: { setItem() {} }, ACTIVE_JOB_KEY: "k" });
+  if (!fns) return t.skip("saveJobState/touchJob chua co trong bridge.js");
+  const job = { id: "a", _lastActivity: 1 };
+  fns.saveJobState(job, "attach", "");
+  assert.ok(job._lastActivity > 1);
+});
+
+test("waitCaptchaClear(): moi vong cho -> gia han (cho captcha khong phai job chet)", async (t) => {
+  const st = { now: 1000, sig: "captcha" };
+  const fns = loadFns(["touchJob", "waitCaptchaClear"], {
+    captchaWaitMs: 5000,
+    captchaSignal: () => st.sig,
+    send: () => {},
+    sleep: async () => { st.now += 1000; if (st.now >= 3000) st.sig = ""; },
+    jobAlive: async () => true,
+    settle: () => {},
+    Date: { now: () => st.now },
+  });
+  if (!fns) return t.skip("waitCaptchaClear/touchJob chua co trong bridge.js");
+  const job = { id: "a", _lastActivity: 1 };
+  assert.equal(await fns.waitCaptchaClear(job, "test"), true);
+  assert.ok(job._lastActivity >= 2000, "phai gia han nhieu lan trong luc cho");
+});
+
+test("sendPrompt(): vong cho nut Send -> gia han", async (t) => {
+  const env = sendPromptEnv({ prompt: "hello", onClick: (st) => { st.text = ""; } });
+  if (!env.fns) return t.skip("sendPrompt chua co trong bridge.js");
+  await env.fns.sendPrompt({}, 60000, null, env.job);
+  assert.ok(env.job._touches >= 1, "sendPrompt phai goi touchJob");
+});
+
+test("job init (guard nguon): copy idle_timeout + khoi tao _lastActivity", () => {
+  assert.match(SRC,
+    /idle_timeout: Number\(r\.job\.idle_timeout\) \|\| 0,\s*_lastActivity: Date\.now\(\),/);
 });

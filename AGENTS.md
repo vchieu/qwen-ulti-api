@@ -377,3 +377,31 @@ Cách A/B: `bridge_session_mode=false` + `temporary_chat=true` + `temporary_chat
 chế độ, đếm stall bằng `composerAfter=0` / `composerLens=[0:N,1000:0]` / thiếu dòng
 `completion request`. Chỉ dọn `waitPageReady` khi `off` không stall **và** probe cho thấy
 composer/tempDom/reactProps đều sẵn ở t≈0.
+
+
+## Thời hạn job: im lặng, không phải tổng thời gian (`idle_timeout`)
+`bridge_job_timeout` là thời gian IM LẶNG ở CẢ hai phía. Job mang `deadline` (mốc tuyệt đối,
+fallback cho extension cũ) **và** `idle_timeout` (giây). Extension: `jobIdleLimitMs` /
+`touchJob` / `jobStale`; `_lastActivity` được gia hạn lúc tạo job, mỗi `send()` về proxy,
+mỗi `handleData`, mỗi `saveJobState`, mỗi vòng `sendPrompt` và `waitCaptchaClear`. Job đang
+stream/attach/chờ captcha lâu không còn bị giết ở mốc 600s; im lặng quá `idle_timeout` mới
+bị coi là chết (Python hết chờ thì `cancel_job` → job rời `_jobs` nên `/alive` trả
+`alive=false`). Thêm điểm chờ lâu mới trong extension thì phải gọi `touchJob(job)` trong vòng
+chờ (các điểm hiện có có test trong `test_bridge.js`). Sửa `bridge_job_timeout` giờ có tác
+dụng đúng nghĩa ở cả hai bên, không cần đổi thêm hằng số trong `bridge.js`.
+
+## `/poll` không được làm mất job
+Ba lớp: (1) thread `/poll` chia lát 1s và **thoát sớm** khi socket chết (`_poll_client_gone`),
+không dequeue job của request kế tiếp; (2) trước khi giao job, kiểm tra lại socket
+(select + `recv(1, MSG_PEEK)`), chết → trả job lại `_pending`; (3) `_json` lỗi ghi → cũng trả
+job lại `_pending`. Log `[orphan] poll client gone: requeued job …` /
+`[orphan] poll write failed …: requeued job …`. Chỉ try/except là không đủ vì gói TCP đầu sau
+FIN có thể gửi thành công. Test: `TestPollDeliverySafety` (ghi lỗi, socket chết),
+`TestPollEarlyExit`.
+
+## Bind port: hai server không được cùng sống
+`bridge._Server` và `server.ThreadedServer` để `allow_reuse_address = False` và set
+`SO_EXCLUSIVEADDRUSE=1` trong `server_bind()` khi hằng số tồn tại (Windows). Bật server thứ hai
+trên port đang dùng → `OSError [WinError 10048]` ngay lúc khởi động, thay vì cướp port âm thầm
+như `SO_REUSEADDR` trên Windows. Không có hằng số này (Linux/macOS) → hành vi như cũ; đóng
+server cũ xong bind lại đúng port đó vẫn được. Test: `TestSocketExclusiveAddr`.

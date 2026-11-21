@@ -339,3 +339,44 @@ Thêm (mặc định giữ nguyên hành vi):
 
 Test: `TestPageReadyMode` (Python) + 4 test `waitPageReady` mới (3 chế độ, gate pageSent,
 log tách) + 3 test `hydrationProbe`; `pageReadyEnv` cập nhật theo ctx mới.
+
+
+## Job dài bị extension giết giữa chừng + job mất khi tab reload lúc long-poll
+Vấn đề 1: `bridge.generate_stream` gửi `deadline = ts + bridge_job_timeout` (mốc tuyệt đối
+kể từ lúc XẾP job), trong khi vòng lặp Python lại reset deadline theo MỖI event
+(`bridge_job_timeout` = thời gian IM LẶNG). Extension `jobAlive` coi `job.deadline` là hạn
+tuyệt đối → job Thinking/agent chạy quá 600s bị `job.cancelled = true` + `settle(...)`
+(ping 5s gọi `jobAlive(j, true)`), client nhận 502 sau khi đã có một phần nội dung nên
+Python không retry (`emitted=True`).
+Sửa: job mang thêm `idle_timeout` (giây). Extension có `jobIdleLimitMs`/`touchJob`/`jobStale`:
+có `idle_timeout` thì hạn là *im lặng* tính từ `_lastActivity` (gia hạn lúc tạo job, mỗi
+`send()` về proxy, mỗi `handleData`, mỗi `saveJobState`, mỗi vòng `sendPrompt` và
+`waitCaptchaClear`); `deadline` tuyệt đối chỉ còn là fallback cho Python cũ.
+Vấn đề 2: `/poll` giữ kết nối tới `bridge_poll_wait` (20s). Tab reload/crash trong lúc block
+→ job tiếp theo bị thread cũ dequeue, `self._json` ghi vào socket chết (BrokenPipeError) →
+job biến mất, caller chờ hết `bridge_job_timeout` mới 504. Chỉ try/except là KHÔNG đủ: gói
+TCP đầu tiên sau FIN vẫn có thể ghi "thành công".
+Sửa (3 lớp): (a) thread `/poll` chia lát 1s (`_pending.get(timeout=min(remaining, 1.0))`) và
+thoát sớm khi socket chết, không dequeue job của request kế tiếp; (b)
+`_Handler._poll_client_gone()` (select + `recv(1, MSG_PEEK)`, best-effort) kiểm tra socket
+TRƯỚC khi giao, chết → trả job lại `_pending`; (c) bọc `_json` trong try/except, lỗi ghi → trả
+job lại `_pending`. Giữ nguyên `ts` để TTL không bị reset. Log
+`[orphan] poll client gone: requeued job …` / `[orphan] poll write failed …: requeued job …`.
+Test: `TestJobIdleTimeout`, `TestPollDeliverySafety`, `TestPollEarlyExit`
+(test_qwen_web2api.py) + 12 test Node (`aliveEnvIdle` và 6 test khoá các điểm gọi `touchJob`);
+`sendPromptEnv` có stub `touchJob` đếm `_touches`.
+Chưa sửa (cần capture thật): SSE đứt không `[DONE]` vẫn `settle(null)` → câu trả lời cụt;
+`_stringify_raw` bỏ part `image_url` im lặng.
+
+
+## Server thứ hai cướp port của server đang chạy (Windows)
+Triệu chứng: script A/B bật server mới trong khi server cũ vẫn sống mà không báo lỗi gì; request
+rơi vào process ngẫu nhiên, server cũ "chết lạ". Trên Windows `SO_REUSEADDR=1`
+(`allow_reuse_address = True` mặc định của `HTTPServer`) cho phép bind đè lên port ĐANG có người
+nghe — khác Linux, nơi nó chỉ nới điều kiện TIME_WAIT.
+Sửa: `bridge._Server` (8083) và `server.ThreadedServer` (API) đặt `allow_reuse_address = False`
+và override `server_bind()` set `SO_EXCLUSIVEADDRUSE=1` TRƯỚC khi bind, chỉ khi hằng số tồn tại
+(`hasattr`) nên Linux/macOS giữ hành vi cũ. Server thứ hai trên cùng port giờ fail ngay
+`OSError [WinError 10048]`; tắt server cũ rồi bind lại đúng port đó vẫn thành công (restart sau
+crash).
+Test: `TestSocketExclusiveAddr` (bind trùng port ở cả hai server + restart sau `server_close`).

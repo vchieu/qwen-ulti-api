@@ -3090,5 +3090,222 @@ class TestPageReadyMode(_Sandbox):
                          ["extension warn: w"])
 
 
+# ------------- findings: job dai (inactivity) + /poll khong duoc mat job -------------
+class TestJobIdleTimeout(_Sandbox):
+    """bridge_job_timeout la thoi gian IM LANG -> job phai mang idle_timeout (giay) de
+    extension gia han theo activity, khong coi deadline la han tuyet doi nua."""
+
+    def _job(self, timeout):
+        CONFIG["bridge_job_timeout"] = timeout
+        pending = _fake_pending([{"kind": "delta", "text": "ok"}, {"kind": "done"}])
+        with mock.patch.object(bridge, "worker_alive", return_value=True), \
+                mock.patch.object(bridge, "_pending", pending):
+            list(bridge.generate_stream("p", "m", False))
+        return pending.jobs[0]
+
+    def test_job_carries_idle_timeout_in_seconds(self):
+        job = self._job(123)
+        self.assertEqual(job["idle_timeout"], 123.0)
+        self.assertAlmostEqual(job["deadline"] - job["ts"], 123.0, places=2)
+
+    def test_idle_timeout_tracks_config(self):
+        self.assertEqual(self._job(0.5)["idle_timeout"], 0.5)
+        self.assertEqual(self._job(3600)["idle_timeout"], 3600.0)
+
+
+class TestPollDeliverySafety(_Sandbox):
+    """/poll phai tra job lai _pending khi tab poll chet / ghi response that bai."""
+
+    def _drain(self):
+        while True:
+            try:
+                bridge._pending.get_nowait()
+            except queue.Empty:
+                return
+
+    def _serve(self, handler):
+        srv = bridge._Server(("127.0.0.1", 0), handler)
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        return srv, th
+
+    def _wait_requeue(self, jid, logs, timeout=8):
+        end = time.time() + timeout
+        while time.time() < end:
+            if any(jid in m and "requeued" in m for m in logs):
+                return True
+            time.sleep(0.05)
+        return False
+
+    def test_write_failure_requeues_job(self):
+        class BrokenWrite(bridge._Handler):
+            def _json(self, obj, code=200):
+                if isinstance(obj, dict) and obj.get("job"):
+                    raise BrokenPipeError(32, "broken pipe (test)")
+                return super()._json(obj, code)
+
+        self._drain()
+        srv, th = self._serve(BrokenWrite)
+        logs = []
+        try:
+            CONFIG["bridge_poll_wait"] = 3
+            with mock.patch.object(bridge, "_log", side_effect=logs.append):
+                bridge._pending.put({"job_id": "poll_write_fail", "ts": time.time()})
+                c = http.client.HTTPConnection("127.0.0.1", srv.server_address[1],
+                                               timeout=6)
+                try:
+                    c.request("POST", "/poll", json.dumps({"worker": "w"}),
+                              {"Content-Type": "application/json",
+                               "Origin": "chrome-extension://x",
+                               "Connection": "close"})
+                    try:
+                        c.getresponse().read()
+                    except Exception:
+                        pass          # server dong ket noi ma khong tra response
+                finally:
+                    c.close()
+                self.assertTrue(self._wait_requeue("poll_write_fail", logs), logs)
+            job = bridge._pending.get(timeout=3)
+            self.assertEqual(job["job_id"], "poll_write_fail")
+        finally:
+            srv.shutdown()
+            srv.server_close()
+            th.join(2)
+            self._drain()
+
+    def test_dead_poll_socket_requeues_job(self):
+        """Tab reload giua luc long-poll: job den SAU khi socket chet -> khong giao,
+        tra lai queue (goi TCP dau van co the ghi thanh cong nen phai check socket)."""
+        import socket as _socket
+        self._drain()
+        srv, th = self._serve(bridge._Handler)
+        logs = []
+        sock = None
+        try:
+            CONFIG["bridge_poll_wait"] = 8
+            body = json.dumps({"worker": "w"}).encode()
+            sock = _socket.create_connection(("127.0.0.1", srv.server_address[1]),
+                                             timeout=6)
+            sock.sendall(b"POST /poll HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                         b"Content-Type: application/json\r\n"
+                         b"Origin: chrome-extension://x\r\nConnection: close\r\n"
+                         b"Content-Length: " + str(len(body)).encode()
+                         + b"\r\n\r\n" + body)
+            time.sleep(0.4)                     # thread /poll dang block cho job
+            sock.close()                        # tab reload / crash
+            sock = None
+            time.sleep(0.2)
+            with mock.patch.object(bridge, "_log", side_effect=logs.append):
+                bridge._pending.put({"job_id": "poll_dead_tab", "ts": time.time()})
+                self.assertTrue(self._wait_requeue("poll_dead_tab", logs), logs)
+            job = bridge._pending.get(timeout=3)
+            self.assertEqual(job["job_id"], "poll_dead_tab")
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            srv.shutdown()
+            srv.server_close()
+            th.join(2)
+            self._drain()
+
+
+class TestPollEarlyExit(_Sandbox):
+    """Thread /poll cua tab da chet phai tu thoat som (lat 1s) va KHONG dequeue job den
+    sau do (khong dua vao requeue luc giao)."""
+
+    def test_dead_poll_thread_exits_without_taking_job(self):
+        import socket as _socket
+        while True:
+            try:
+                bridge._pending.get_nowait()
+            except queue.Empty:
+                break
+        srv = bridge._Server(("127.0.0.1", 0), bridge._Handler)
+        th = threading.Thread(target=srv.serve_forever, daemon=True)
+        th.start()
+        logs = []
+        sock = None
+        try:
+            CONFIG["bridge_poll_wait"] = 20
+            body = json.dumps({"worker": "w"}).encode()
+            sock = _socket.create_connection(("127.0.0.1", srv.server_address[1]),
+                                             timeout=6)
+            sock.sendall(b"POST /poll HTTP/1.1\r\nHost: 127.0.0.1\r\n"
+                         b"Content-Type: application/json\r\n"
+                         b"Origin: chrome-extension://x\r\nConnection: close\r\n"
+                         b"Content-Length: " + str(len(body)).encode()
+                         + b"\r\n\r\n" + body)
+            time.sleep(0.4)                     # thread /poll dang block cho job
+            sock.close()                        # tab reload / crash
+            sock = None
+            time.sleep(2.5)                     # > 1 lat: thread chet phai da thoat
+            with mock.patch.object(bridge, "_log", side_effect=logs.append):
+                bridge._pending.put({"job_id": "poll_early_exit", "ts": time.time()})
+                time.sleep(0.6)
+            self.assertFalse(any("requeued" in m for m in logs), logs)
+            job = bridge._pending.get(timeout=3)
+            self.assertEqual(job["job_id"], "poll_early_exit")
+        finally:
+            if sock is not None:
+                try:
+                    sock.close()
+                except Exception:
+                    pass
+            srv.shutdown()
+            srv.server_close()
+            th.join(2)
+            while True:
+                try:
+                    bridge._pending.get_nowait()
+                except queue.Empty:
+                    break
+
+
+class TestSocketExclusiveAddr(_Sandbox):
+    """allow_reuse_address=False + SO_EXCLUSIVEADDRUSE chan bind trung port."""
+
+    def _assert_second_bind_fails(self, server_cls, handler_cls):
+        srv1 = server_cls(("127.0.0.1", 0), handler_cls)
+        port = srv1.server_address[1]
+        srv2 = None
+        try:
+            try:
+                srv2 = server_cls(("127.0.0.1", port), handler_cls)
+            except OSError as exc:
+                msg = str(exc).lower()
+                self.assertTrue(
+                    "address already in use" in msg or "10048" in str(exc),
+                    f"Expected address in use or 10048, got: {exc}",
+                )
+            else:
+                self.fail(f"second bind to port {port} succeeded; expected OSError")
+        finally:
+            if srv2 is not None:
+                srv2.server_close()
+            srv1.server_close()
+
+    def test_second_bridge_server_fails_with_oserror(self):
+        self._assert_second_bind_fails(bridge._Server, bridge._Handler)
+
+    def test_second_api_server_fails_with_oserror(self):
+        self._assert_second_bind_fails(server.ThreadedServer, server.QwenHandler)
+
+    def test_bridge_server_can_restart_after_close(self):
+        srv1 = bridge._Server(("127.0.0.1", 0), bridge._Handler)
+        port = srv1.server_address[1]
+        srv1.server_close()
+        # Server cu dong han -> bind lai chinh port do phai thanh cong.
+        srv2 = None
+        try:
+            srv2 = bridge._Server(("127.0.0.1", port), bridge._Handler)
+            self.assertEqual(srv2.server_address[1], port)
+        finally:
+            if srv2 is not None:
+                srv2.server_close()
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

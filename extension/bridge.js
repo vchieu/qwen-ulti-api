@@ -98,6 +98,8 @@
     const t0 = Date.now();
     let clearSince = 0;
     while (Date.now() - t0 < captchaWaitMs) {
+      touchJob(job);
+
       await sleep(1000);
       /* job huy/het han luc dang cho captcha ->
          thoat NGAY (khong giu worker toi het captcha_wait_seconds). */
@@ -444,6 +446,7 @@
   }
 
   async function send(jobId, ev) {
+    if (current && current.id === jobId) touchJob(current);
     try {
       const r = await post("/event", Object.assign({ job_id: jobId }, ev));
       /* proxy bao job da chet -> dung UI ngay.
@@ -466,6 +469,27 @@
   let navSince = 0;           // N1: watchdog cho co `navigating`
   const ALIVE_CACHE_MS = 1500;
 
+  // bridge_job_timeout cua Python la thoi gian IM LANG (reset moi event), KHONG phai tong
+  // thoi gian job. Truoc day extension coi job.deadline (epoch ms ke tu luc XEP job) la han
+  // tuyet doi -> job Thinking/agent chay > bridge_job_timeout bi settle giua chung du dang
+  // stream (ping 5s goi jobAlive(j, true)). Gio: co idle_timeout (Python moi) -> han tinh tu
+  // _lastActivity, gia han bang touchJob; deadline tuyet doi chi con la fallback Python cu.
+  function jobIdleLimitMs(job) {
+    const s = Number(job && job.idle_timeout);
+    return s > 0 ? s * 1000 : 0;
+  }
+  function touchJob(job) {
+    if (job) job._lastActivity = Date.now();
+  }
+  function jobStale(job) {
+    const idle = jobIdleLimitMs(job);
+    if (idle > 0) {
+      const last = Number(job._lastActivity) || 0;
+      return !!(last && Date.now() - last > idle);
+    }
+    return !!(job.deadline && Date.now() > job.deadline);
+  }
+
   function jobDead(job) {
     return !job || job.settled || job.cancelled;
   }
@@ -475,7 +499,7 @@
   // ngay truoc thao tac UI (sau sleep, job co the vua bi huy).
   async function jobAlive(job, force) {
     if (jobDead(job)) return false;
-    if (job.deadline && Date.now() > job.deadline) { job.cancelled = true; return false; }
+    if (jobStale(job)) { job.cancelled = true; return false; }
     const now = Date.now();
     if (!force && job._aliveAt && now - job._aliveAt < ALIVE_CACHE_MS) return job._alive !== false;
     job._aliveAt = now;
@@ -500,6 +524,7 @@
   }
 
   function saveJobState(job, stage, details) {
+    touchJob(job);
     if (!job) return;
     job._stage = stage;
     try {
@@ -1541,6 +1566,7 @@
   }
 
   async function handleData(job, data) {
+    touchJob(job);
     if (!job || job.settled) return;
     if (!data || data === "[DONE]") {
       if (data === "[DONE]" && !(await flushNativeCalls(job))) settle(job, null);
@@ -2881,6 +2907,7 @@
       }
     };
     while (Date.now() < deadline) {
+      touchJob(job);
       if (job && (job.attached || job.settled)) return !!job.attached;
       /* job het hieu luc -> dung, khong bam Send */
       if (job && !(await jobAlive(job, true))) return false;   /* bo cache */
@@ -3268,6 +3295,8 @@
             file_info: r.job.file_info,
             attachment_prompt: r.job.attachment_prompt || "",
             deadline: r.job.deadline ? r.job.deadline * 1000 : 0,
+            idle_timeout: Number(r.job.idle_timeout) || 0,
+            _lastActivity: Date.now(),
             raw: r.job,
             mode_retries: r.job.mode_retries || 0,
             fresh_reloads: r.job.fresh_reloads || 0,

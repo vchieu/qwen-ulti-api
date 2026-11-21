@@ -507,7 +507,7 @@ def generate_stream(prompt, model, think, usage_out=None, file_info=None, mode=N
                       if isinstance(file_info, dict) else "") + ")")
         job = {"job_id": jid, "model": model, "prompt": prompt,
                "think": bool(think), "ts": now,
-               "deadline": now + timeout, "attempt": attempt,
+               "deadline": now + timeout, "idle_timeout": timeout, "attempt": attempt,
                "mode": mode if mode in ("auto", "thinking", "fast") else None,
                "file_info": file_info,
                "attachment_prompt": att_prompt,
@@ -731,6 +731,28 @@ class _Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _poll_client_gone(self):
+        """Tab long-poll co the da reload/chet trong luc /poll dang block. Socket da dong ->
+        KHONG giao job: neu khong, job bi dequeue roi mat (caller cho het bridge_job_timeout
+        moi 504). Chi try/except quanh _json la KHONG du: goi TCP dau tien sau FIN van co the
+        ghi "thanh cong". Best-effort: khong xac dinh duoc -> False (giu hanh vi cu)."""
+        sock = getattr(self, "connection", None)
+        if sock is None:
+            return False
+        try:
+            import select
+            import socket as _socket
+            r, _w, _x = select.select([sock], [], [], 0)
+            if not r:
+                return False
+            return not sock.recv(1, _socket.MSG_PEEK)
+        except (BlockingIOError, InterruptedError, TimeoutError):
+            return False
+        except (OSError, ValueError):
+            return True
+        except Exception:
+            return False
+
     def do_OPTIONS(self):
         self.send_response(204)
         self._cors()
@@ -894,9 +916,14 @@ class _Handler(BaseHTTPRequestHandler):
                 if remaining <= 0:
                     return self._json({"job": None})
                 try:
-                    job = _pending.get(timeout=remaining)
+                    job = _pending.get(timeout=min(remaining, 1.0))
                 except queue.Empty:
-                    return self._json({"job": None})
+                    # Lat 1s: tab poll da chet (reload/crash) thi thoat ngay, khong de thread
+                    # mo coi cho het bridge_poll_wait roi dequeue mat job cua request ke tiep.
+                    # Het han that su -> vong while tren tra {"job": None}.
+                    if self._poll_client_gone():
+                        return
+                    continue
                 jid = job.get("job_id")
                 age = time.time() - job.get("ts", 0)
                 if age > ttl:
@@ -915,7 +942,20 @@ class _Handler(BaseHTTPRequestHandler):
                     continue
                 _debug_log(f"worker '{worker}' polled job {jid} "
                            f"(model={job.get('model')}, age={age:.1f}s)")
-                return self._json({"job": job})
+                # Tab poll co the da chet trong luc long-poll block: kiem tra socket TRUOC khi giao
+                # job (ghi vao socket da dong co the van thanh cong o goi TCP dau tien).
+                if self._poll_client_gone():
+                    _pending.put(job)
+                    _log(f"[orphan] poll client gone: requeued job {jid}")
+                    return
+                try:
+                    self._json({"job": job})
+                except Exception as e:
+                    # Ghi response that bai: job DA dequeue nhung chua toi duoc tab -> tra lai queue,
+                    # khong de caller cho den bridge_job_timeout. Giu nguyen ts de TTL khong bi reset.
+                    _pending.put(job)
+                    _log(f"[orphan] poll write failed ({e!r}): requeued job {jid}")
+                return
         if path == "/event":
             jid = data.get("job_id")
             kind = data.get("kind")
@@ -943,7 +983,19 @@ class _Handler(BaseHTTPRequestHandler):
 
 class _Server(ThreadingMixIn, HTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # allow_reuse_address = False -> tat SO_REUSEADDR mac dinh, thay bang
+    # SO_EXCLUSIVEADDRUSE (Windows) de bind that phai khi port da duoc dung boi
+    # process khac. TIME_WAIT cua cung process van duoc cho rebind (Windows tu xu li).
+    allow_reuse_address = False
+
+    def server_bind(self):
+        import socket
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            except OSError:
+                pass
+        super().server_bind()
 
 
 def start_server():

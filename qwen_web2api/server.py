@@ -1453,4 +1453,16 @@ class QwenHandler(BaseHTTPRequestHandler):
 
 class ThreadedServer(ThreadingMixIn, HTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # allow_reuse_address = False -> tat SO_REUSEADDR mac dinh, thay bang
+    # SO_EXCLUSIVEADDRUSE (Windows) de bind that phai khi port da duoc dung boi
+    # process khac. TIME_WAIT cua cung process van duoc cho rebind (Windows tu xu li).
+    allow_reuse_address = False
+
+    def server_bind(self):
+        import socket
+        if hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            try:
+                self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+            except OSError:
+                pass
+        super().server_bind()
