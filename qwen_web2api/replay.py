@@ -74,8 +74,23 @@ def _first_line(text, limit=300):
     return ""
 
 
+def _stub_head(text, limit=300):
+    """Dong dau co nghia cua tool output cu: bo qua dong `warning:` (vd canh bao CRLF cua git
+    dung truoc `diff --git ...`); neu toan canh bao thi dung dong dau."""
+    first = ""
+    for ln in text[:20000].split("\n"):
+        s = ln.strip()
+        if not s:
+            continue
+        if not first:
+            first = s[:limit]
+        if not s.lower().startswith("warning:"):
+            return s[:limit]
+    return first
+
+
 def _stub(text):
-    head = _first_line(text)
+    head = _stub_head(text)
     marker = (f"[... {len(text)} chars of old tool output elided to save context; "
               "re-run the tool if you need it ...]")
     return (head + "\n" if head else "") + marker

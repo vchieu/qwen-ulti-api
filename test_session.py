@@ -1447,5 +1447,17 @@ class TestReplayAdaptiveBudget(_Sandbox):
         self.assertEqual(replay.target_chars(), 200000)
 
 
+class TestReplayStubHead(unittest.TestCase):
+    def test_stub_skips_git_crlf_warnings(self):
+        from qwen_web2api import replay
+        t = ("warning: in the working copy of 'a.js', LF will be replaced by CRLF\n"
+             "warning: in the working copy of 'b.js', LF will be replaced by CRLF\n"
+             "diff --git a/a.js b/a.js\n" + "+x\n" * 500)
+        self.assertTrue(replay._stub(t).startswith("diff --git a/a.js b/a.js\n[... "))
+        only = "warning: one\nwarning: two\n" * 300
+        self.assertTrue(replay._stub(only).startswith("warning: one\n[... "))
+
+
 if __name__ == "__main__":
     unittest.main()
+    
