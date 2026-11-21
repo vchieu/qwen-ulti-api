@@ -588,6 +588,36 @@ const forkBody = () => JSON.stringify({
   messages: [{ role: "user", content: "x", user_action: "chat", parent_id: "OLD", parentId: "OLD" }],
 });
 
+test("forkUiProbe: chi log, khong nem loi du DOM rong/loi", () => {
+  const sent = [];
+  const mk = (qsa, qs) => loadFns(["forkUiProbe"], {
+    fwd: (job, kind, message) => sent.push([kind, message]),
+    visible: () => true,
+    document: { querySelectorAll: qsa, querySelector: qs },
+  });
+  const fns = mk(() => [], () => null);
+  assert.ok(fns, "forkUiProbe chua co trong bridge.js");
+  fns.forkUiProbe({ id: "j", session: { mode: "fork", fork_parent_id: "abcdef12-0000" } });
+  const text = sent.map((x) => x[1]).join("\n");
+  assert.match(text, /fork-ui probe: parent=abcdef12/);
+  assert.match(text, /KHONG thay id cha/);
+  assert.match(text, /khong thay user bubble/);
+  sent.length = 0;
+  const bubble = { tagName: "DIV", id: "", className: "user-message x", attributes: [{ name: "class" }, { name: "data-a" }],
+    innerText: "hello   world", outerHTML: "<div>hello</div>", parentElement: null,
+    querySelectorAll: () => [{ getAttribute: (k) => (k === "aria-label" ? "Edit" : null), innerText: "", className: "btn" }] };
+  bubble.parentElement = bubble;
+  mk((s) => (/user/.test(s) ? [bubble] : []), () => null)
+    .forkUiProbe({ id: "j", session: { mode: "fork", fork_parent_id: "p1" } });
+  const t2 = sent.map((x) => x[1]).join("\n");
+  assert.match(t2, /user bubble cuoi div\.user-message\.x \[data-a\] text=hello world/);
+  assert.match(t2, /"Edit\{btn\}"/);
+  sent.length = 0;   // loi bat ngo (querySelectorAll nem) -> van khong nem ra ngoai
+  assert.doesNotThrow(() => mk(() => { throw new Error("boom"); }, () => null)
+    .forkUiProbe({ id: "j", session: { mode: "fork", fork_parent_id: "p" } }));
+  assert.doesNotThrow(() => mk(() => [], () => null).forkUiProbe(null));
+});
+
 test("applyForkParent: ghi de du 4 cho parent_id + user_action, giu phan con lai", (t) => {
   const { fns } = sessEnv();
   if (!fns) return t.skip("ham session chua co trong bridge.js");

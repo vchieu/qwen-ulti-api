@@ -1038,6 +1038,63 @@
     } catch (e) { /* khong anh huong app */ }
   }
 
+  // Chan doan UI cho fork (session_fork). Extension chi ghi de parent_id trong BODY; cay tin nhan
+  // cua UI Qwen van gan tin moi vao CUOI chat nen UI hien tin noi tiep thay vi nhanh <2/2>
+  // (model van thay dung nhanh vi context server theo parent_id). Muon UI tu tao nhanh thi phai
+  // di qua nut sua tin cua UI. Ham nay chi LOG cau truc DOM (id tin co nam trong DOM khong, nut
+  // hanh dong tren tin user) de viet selector, khong tuong tac UI, loi nao cung bi nuot.
+  function forkUiProbe(job) {
+    try {
+      const pid = String((job && job.session && job.session.fork_parent_id) || "");
+      const cut = (s, n) => String(s == null ? "" : s).replace(/\s+/g, " ").trim().slice(0, n);
+      const desc = (el) => {
+        if (!el) return "-";
+        const attrs = Array.from(el.attributes || []).map((a) => a.name)
+          .filter((n) => n !== "class" && n !== "id").slice(0, 8).join(",");
+        const cls = typeof el.className === "string" ? cut(el.className, 80).replace(/ /g, ".") : "";
+        return String(el.tagName || "?").toLowerCase() + (el.id ? "#" + cut(el.id, 48) : "")
+          + (cls ? "." + cls : "") + " [" + attrs + "]";
+      };
+      const sels = {
+        "id^=message-": '[id^="message-"]',
+        "data-message-id": "[data-message-id]",
+        "user-bubble": '[class*="user" i][class*="message" i]',
+        "assistant-bubble": '[class*="assistant" i][class*="message" i], [class*="response" i][class*="message" i]',
+        "edit-btn": '[aria-label*="edit" i], [title*="edit" i], [class*="edit" i]',
+      };
+      const counts = {};
+      for (const k of Object.keys(sels)) {
+        try { counts[k] = document.querySelectorAll(sels[k]).length; } catch (e) { counts[k] = "err"; }
+      }
+      fwd(job, "debug", "fork-ui probe: parent=" + pid.slice(0, 8) + " counts=" + JSON.stringify(counts));
+      if (pid) {
+        let hit = null, how = "";
+        for (const s of ['[id="message-' + pid + '"]', '[data-message-id="' + pid + '"]',
+          '[id*="' + pid + '"]', '[data-id="' + pid + '"]']) {
+          try { hit = document.querySelector(s); } catch (e) { hit = null; }
+          if (hit) { how = s; break; }
+        }
+        fwd(job, "debug", hit ? "fork-ui probe: node cha tim thay bang " + how + " -> " + desc(hit)
+          : "fork-ui probe: KHONG thay id cha trong DOM (DOM khong lo id tin)");
+      }
+      const users = Array.from(document.querySelectorAll(sels["user-bubble"])).filter((el) => visible(el));
+      const last = users.length ? users[users.length - 1] : null;
+      if (last) {
+        fwd(job, "debug", "fork-ui probe: user bubble cuoi " + desc(last) + " text=" + cut(last.innerText, 60));
+        const scope = last.parentElement || last;
+        const btns = Array.from(scope.querySelectorAll("button,[role=button]")).slice(0, 12)
+          .map((b) => cut(b.getAttribute("aria-label") || b.getAttribute("title") || b.innerText, 24)
+            + "{" + cut(b.className, 40) + "}");
+        fwd(job, "debug", "fork-ui probe: nut trong bubble/cha: " + JSON.stringify(btns));
+        fwd(job, "debug", "fork-ui probe: html bubble cuoi: " + cut(last.outerHTML, 700));
+      } else {
+        fwd(job, "debug", "fork-ui probe: khong thay user bubble nao bang selector user+message");
+      }
+    } catch (e) {
+      try { fwd(job, "debug", "fork-ui probe loi: " + e.message); } catch (e2) { /* best-effort */ }
+    }
+  }
+
   // ---- Che do Thinking / Auto / Fast (dropdown canh o prompt) ----
   const MODE_LABELS = ["auto", "thinking", "fast"];
 
@@ -3188,6 +3245,7 @@
         }
         fwd(job, "debug", "session " + job.session.mode + ": dung tiep chat "
           + (job.session.chat_id || "(temporary)") + " path=" + location.pathname);
+        if (job.session.mode === "fork") forkUiProbe(job);
       } else {
         if ((await tryNewChat(job)) === false) return;  // dang reload; job da requeue
         saveJobState(job, "new_chat_done", "New chat step finished");

@@ -254,6 +254,44 @@ def _roles_summary(messages):
     return ",".join(f"{r}:{n}" for r, n in counts.items()) or "-"
 
 
+def _request_shape(messages, tools=None, tool_choice=None):
+    """1 dong chan doan HINH DANG request cua client (khong lo noi dung).
+
+    seq: s=system u=user A=assistant co tool_calls a=assistant text t=tool, `tx3` = lap 3 lan.
+    sys: hash ngan cua system dau tien. Dung de nhan ra client compaction (opencode: system cua
+    agent compaction khac, tools=0, sau do danh sach doi thanh [system u(compaction) a(summary)
+    ...tail giu nguyen...]) ma khong can xem log day du.
+    """
+    seq = []
+    for m in messages or []:
+        r = m.get("role") if isinstance(m, dict) else None
+        if r in ("system", "developer"):
+            c = "s"
+        elif r == "user":
+            c = "u"
+        elif r == "tool":
+            c = "t"
+        elif r == "assistant":
+            c = "A" if m.get("tool_calls") else "a"
+        else:
+            c = "?"
+        if seq and seq[-1][0] == c:
+            seq[-1][1] += 1
+        else:
+            seq.append([c, 1])
+    txt = " ".join(c if n == 1 else f"{c}x{n}" for c, n in seq)
+    if len(txt) > 240:
+        txt = txt[:240] + "..."
+    sys_h = "-"
+    for m in messages or []:
+        if isinstance(m, dict) and m.get("role") in ("system", "developer"):
+            raw = _msg_text(m.get("content")).encode("utf-8", "ignore")
+            sys_h = hashlib.sha1(raw).hexdigest()[:8]
+            break
+    return (f"msgs={len(messages or [])} tools={len(tools) if tools else 0} "
+            f"choice={tool_choice} sys={sys_h} seq={txt}")
+
+
 def _fingerprint_prompt_file(file_info, content, layout=""):
     """Dau van tay cua file prompt (bytes/sha256/lines/truncated) -> luu vao file_info de
     extension doi chieu voi file no that su dinh kem, va ghi log de so voi dong
@@ -1090,6 +1128,9 @@ class QwenHandler(BaseHTTPRequestHandler):
         tools_active = bool(tools) and tool_choice != "none"
         all_messages = messages
         plan = self._session_plan("chat", all_messages, tools, tool_choice, tools_active)
+        if plan is not None:
+            log(f"[session] request {_request_shape(all_messages, tools, tool_choice)} "
+                f"-> plan={plan.kind} ({plan.reason})")
 
         # Detect prompt lớn và tạo file tạm nếu cần (prepare_large_prompt tự check ngưỡng)
         rf = build_response_format_instruction(req.get("response_format"))

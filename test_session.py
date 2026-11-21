@@ -1394,5 +1394,24 @@ class TestReplayCompactBreaksResetLoop(_Sandbox):
         self.assertEqual(p2.base_n, len(msgs) + 1)
 
 
+class TestRequestShape(unittest.TestCase):
+    def test_shape_run_length_and_system_hash(self):
+        msgs = [{"role": "system", "content": "S"}, {"role": "user", "content": "u"},
+                asst_calls("1"), tool("1", "r"), asst_calls("2"), tool("2", "r"), tool("2", "r"),
+                {"role": "assistant", "content": "done"}, {"role": "user", "content": "n"}]
+        s = server._request_shape(msgs, TOOLS, "auto")
+        self.assertIn("msgs=9 tools=1 choice=auto sys=", s)
+        self.assertIn("seq=s u A t A tx2 a u", s)
+        # system doi (vd agent compaction) -> hash doi; khong tools -> tools=0
+        other = [dict(msgs[0], content="S2")] + msgs[1:]
+        s2 = server._request_shape(other, None, "auto")
+        self.assertIn("tools=0", s2)
+        self.assertNotEqual(s.split("sys=")[1][:8], s2.split("sys=")[1][:8])
+
+    def test_shape_never_raises_on_odd_messages(self):
+        self.assertIn("msgs=0", server._request_shape([], None, None))
+        self.assertIn("seq=? s", server._request_shape(["junk", {"role": "developer", "content": [{"text": "x"}]}], None, None))
+
+
 if __name__ == "__main__":
     unittest.main()

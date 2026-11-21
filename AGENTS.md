@@ -314,6 +314,19 @@ arguments sai kiểu thay vì biến thành `{}`. Chi tiết lịch sử ở `CH
   `Tool X does not exist` / reply sai format nằm lại trong chat (không tránh được). Harness đổi
   system/env mỗi lượt → `history_diverged@0` liên tục (xem log `[session] reset`; thêm regex vào
   `session_hash_ignore`). Selector/URL `/c/<id>` của app là capture, đổi → `session_lost`.
+- Fork + UI: `session_fork` chỉ ghi đè `parent_id` trong body request; cây tin nhắn trong UI Qwen
+  (temporary chat là state phía client, `/c/local`) vẫn gắn tin mới vào cuối chat → UI hiện tin
+  nối tiếp, không có nhánh `<2/2>`, và các tin cũ của nhánh bị bỏ vẫn hiện phía trên dù model không
+  thấy chúng. Context của model vẫn đúng (server đi theo `parent_id`). Muốn UI tự tạo nhánh phải
+  đi qua nút sửa tin của UI (chưa có selector thật). `forkUiProbe` log cấu trúc DOM (dòng
+  `fork-ui probe: ...`, cần `debug=true`) để viết selector. Muốn transcript UI nhất quán thì để
+  `session_fork=false` (edit/undo → `new`, chat mới + replay đã thu gọn).
+- Client compaction (opencode): request compact = toàn bộ history + prompt tóm tắt, system của
+  agent compaction, không có tools → `new` (hash lệch ở message 0). Request sau compact =
+  `[system, compaction-user, summary, ...tail giữ nguyên..., continue-user]` → lại `new`. Tail
+  (`tail_turns`/`preserve_recent_tokens` của opencode) có thể là gần như TOÀN BỘ hội thoại nếu
+  hội thoại ngắn, nên "gửi lên vẫn đủ history" có thể là hành vi của client, không phải proxy. Log
+  `[session] request msgs=.. tools=.. sys=.. seq=..` cho biết đúng hình dạng từng request.
 - `extension/bridge.js` hardcode bridge port 8083.
 - DOM heuristics chưa có test UI thật: model picker, mode dropdown, captcha selector, nút Send.
   Qwen đổi layout → sửa `findModelTrigger` / `selectModel` / `findModeTrigger` / `captchaSignal`.

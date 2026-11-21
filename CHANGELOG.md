@@ -417,3 +417,17 @@ Sửa: `session._task_anchor` thêm `[Current task] …` (tin user thật gần 
 `tool_results_file`, `attach_results`; không thêm khi delta đã có tin user. Config mới
 `session_task_anchor` (true), `session_task_anchor_chars` (500); hai key có trong `/debug`.
 Test: `TestTaskAnchor` (test_session.py).
+
+## Session: chẩn đoán compaction của client + fork không tạo nhánh trong UI
+
+Triệu chứng 1: sau compact (opencode) tin kế tiếp vẫn mang gần như toàn bộ history. Chưa có log
+runtime của đoạn compact nên chưa kết luận; code proxy không tự thêm/bớt history ngoài
+`replay.compact_messages` (thu gọn tool output cũ) và đường continue/fork (chỉ gửi delta, chat
+Qwen giữ nguyên history cũ). Thêm log 1 dòng mỗi request session `[session] request msgs= tools=
+choice= sys= seq=... -> plan=<kind> (<reason>)` (`server._request_shape`) để lần sau thấy ngay
+system có đổi không, có tools không, tail giữ lại dài bao nhiêu.
+Triệu chứng 2: `session_fork=true` làm tin mới hiện nối tiếp cuối chat thay vì nhánh `<2/2>`.
+Nguyên nhân (từ code + log): extension chỉ ghi đè `parent_id` trong body completion, UI đã tự gắn
+tin user mới vào cuối cây của nó trước đó. Model vẫn đi đúng nhánh, UI thì không. Thêm
+`forkUiProbe` (log DOM khi job fork, không tương tác UI) để lấy dữ liệu viết selector nút sửa tin.
+Test: `TestRequestShape` (test_session.py), `forkUiProbe` (test_bridge.js).
